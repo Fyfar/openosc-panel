@@ -67,7 +67,9 @@ The stock firmware has no remote control, so the panel can't connect to it. Two 
 > Independent project, not affiliated with ZOYI or ZOTEK, and separate from the OpenOSC
 > firmware project. Product names are used only to identify the hardware.
 
-## Run it locally
+## Run it yourself
+
+The quickest way is the [live app](https://fyfar.github.io/openosc-panel/). To run it locally:
 
 ```sh
 npm install
@@ -75,8 +77,10 @@ npm run dev
 ```
 
 Open [http://localhost:5173](http://localhost:5173) and click **Connect device**.
-`npm run build` writes a static site to `dist/`; host it anywhere with HTTPS. Every push to
-`main` publishes it to [GitHub Pages](https://fyfar.github.io/openosc-panel/).
+
+To host your own copy, run `npm run build` and serve `dist/` from any static host with HTTPS.
+On GitHub: fork the repo, set *Settings → Pages → Source* to **GitHub Actions**, then run
+*Actions → Deploy to GitHub Pages → Run workflow*.
 
 ## Contributing
 
