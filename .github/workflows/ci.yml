@@ -1,0 +1,42 @@
+name: CI
+
+# Build and verify every push to main and every pull request. No deploy here.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same branch/PR.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22 # engines: >=22.18 (type stripping, module.registerHooks)
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build (typecheck + Vite)
+        run: npm run build
+
+      - name: Self-checks
+        run: npm run check
+
+      # Dead code, duplication and layer boundaries block; complexity only warns (.fallowrc.json).
+      - name: Code quality (fallow)
+        run: npx fallow

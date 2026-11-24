@@ -1,0 +1,62 @@
+{
+  "name": "openosc-panel",
+  "version": "0.5.0",
+  "description": "Browser control panel for ZOYI ZT703S / ZT706S on OpenOSC firmware over Web Serial: oscilloscope, signal generator, Bode plotter and multimeter.",
+  "private": true,
+  "license": "MIT",
+  "author": "Fyfar (https://github.com/Fyfar)",
+  "homepage": "https://github.com/Fyfar/openosc-panel#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Fyfar/openosc-panel.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Fyfar/openosc-panel/issues"
+  },
+  "keywords": [
+    "zoyi",
+    "zt703s",
+    "zt706s",
+    "openosc",
+    "oscilloscope",
+    "multimeter",
+    "signal-generator",
+    "bode-plot",
+    "web-serial",
+    "scpi",
+    "react",
+    "typescript"
+  ],
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "fallow": "fallow",
+    "typecheck": "tsc --noEmit",
+    "check": "node --import ./scripts/ts-resolve.mjs scripts/check-logic.mts && node --import ./scripts/ts-resolve.mjs scripts/check-link.mts"
+  },
+  "dependencies": {
+    "@fontsource-variable/geist": "^5.3.0",
+    "@fontsource-variable/geist-mono": "^5.3.0",
+    "clsx": "^2.1.1",
+    "lucide-react": "^1.78.0",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "uplot": "^1.6.32",
+    "zustand": "^5.1.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.5",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "@vitejs/plugin-react": "^6.3.0",
+    "fallow": "3.39.0",
+    "tailwindcss": "^4.3.5",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.8"
+  }
+}

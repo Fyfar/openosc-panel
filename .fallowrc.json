@@ -1,0 +1,48 @@
+{
+  "$schema": "https://raw.githubusercontent.com/fallow-rs/fallow/main/schema.json",
+  "minimumVersion": "3.39.0",
+  "duplicates": {
+    // Any clone fails: 0.01% is under one 5-line block of this repo.
+    "threshold": 0.01
+  },
+  "health": {
+    // Cognitive 15 is SonarQube's ceiling; `fallow audit` reports only what a change makes worse.
+    "maxCyclomatic": 15,
+    "maxCognitive": 15,
+    "maxUnitSize": 60,
+    // Pairs with "complexity-crap": "off" (see rules).
+    "maxCrap": 1000000,
+    "thresholdOverrides": [
+      {
+        "files": ["src/**/*.tsx"],
+        "maxCognitive": 25,
+        "maxUnitSize": 150,
+        "reason": "JSX && and ?: score as cognitive branches; a cohesive view reads as one unit up to ~150 lines"
+      }
+    ]
+  },
+  "rules": {
+    // Complexity advises; dead code and duplication block (their default severity).
+    "complexity-cyclomatic": "warn",
+    "complexity-cognitive": "warn",
+    // CRAP needs coverage data; this repo has no tests.
+    "complexity-crap": "off",
+    "prop-drilling": "warn",
+    "duplicate-prop-shape": "warn",
+    "thin-wrapper": "warn"
+  },
+  // Layering: core (device facts, store, waveform maths) knows nothing about SCPI or React;
+  // io (src/io/*, link.ts) never imports UI. First matching zone wins.
+  "boundaries": {
+    "zones": [
+      { "name": "io", "patterns": ["src/io/**", "src/link.ts"] },
+      { "name": "core", "patterns": ["src/device.ts", "src/store.ts", "src/dsp.ts"] },
+      { "name": "ui", "patterns": ["src/**/*.tsx"] }
+    ],
+    "rules": [
+      { "from": "ui", "allow": ["ui", "io", "core"] },
+      { "from": "io", "allow": ["io", "core"] },
+      { "from": "core", "allow": ["core"] }
+    ]
+  }
+}

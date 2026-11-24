@@ -1,0 +1,39 @@
+@import "tailwindcss";
+@import "uplot/dist/uPlot.min.css";
+
+/* Same neutrals as multimeter-live; ch1/ch2 follow bench-scope convention (yellow/cyan). */
+@theme {
+  --color-accent: #3b82f6;
+  --color-panel: #161b22;
+  --color-surface: #21262d;
+  --color-border: #30363d;
+  --color-success: #22c55e;
+  --color-danger: #ef4444;
+  --color-amber: #f59e0b;
+  --color-muted: #8b949e;
+  --color-canvas: #0d1117;
+  --color-fg: #f0f6fc;
+  --color-ch1: #facc15;
+  --color-ch2: #22d3ee;
+  --font-sans: "Geist Variable", system-ui, sans-serif;
+  --font-mono: "Geist Mono Variable", ui-monospace, monospace;
+}
+
+:root { color-scheme: dark; }
+
+body {
+  background: var(--color-canvas);
+  color: var(--color-fg);
+  font-family: var(--font-sans);
+}
+
+@layer base {
+  @media (pointer: coarse) {
+    button, input, select { min-height: 44px; }
+  }
+}
+
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-thumb { background: var(--color-border); border-radius: 3px; }
+
+.u-legend { display: none; }

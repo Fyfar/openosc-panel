@@ -1,0 +1,16 @@
+node_modules
+dist
+.fallow/
+
+# AI assistant, agent and planning files: kept local, not published
+AGENTS.md
+CLAUDE.md
+.claude/
+.remember/
+docs/
+openspec/
+
+# Local environment and OS files
+.env*
+*.local
+.DS_Store
