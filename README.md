@@ -32,6 +32,8 @@ install, no backend. Your data never leaves your machine.
   multimeter; the panel switches it for you in about a second.
 - **Full control when you need it:** a SCPI console, device screenshots and a remote lock for
   the device's keys.
+- **Install it as an app** from the browser's address bar if you like. It opens in its own
+  window and works offline once you've opened it online.
 
 ## What you need
 
@@ -62,6 +64,8 @@ The stock firmware has no remote control, so the panel can't connect to it. Two 
 - Scope and multimeter can't run at the same time: they are separate USB profiles on the
   device. The generator keeps running across the switch.
 - Nothing is saved between visits. Export what you want to keep.
+- Each online launch loads the latest version. If a new one comes out while the panel is open,
+  it asks first (**Update** / **Later**) and never reloads on its own, so an unsaved log is safe.
 - One device, one tab: the serial port is exclusive.
 
 > Independent project, not affiliated with ZOYI or ZOTEK, and separate from the OpenOSC

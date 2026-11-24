@@ -1,6 +1,8 @@
 {
   "$schema": "https://raw.githubusercontent.com/fallow-rs/fallow/main/schema.json",
   "minimumVersion": "3.39.0",
+  // Loaded by the browser (serviceWorker.register in src/pwa.ts), never imported. Owner-approved 2026-11-24.
+  "entry": ["public/sw.js"],
   "duplicates": {
     // Any clone fails: 0.01% is under one 5-line block of this repo.
     "threshold": 0.01

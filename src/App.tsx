@@ -1,13 +1,13 @@
 import { clsx } from 'clsx';
 import {
   Activity, AudioWaveform, Camera, ChartSpline, Download, Gauge, Info, Loader2, Lock, LockOpen, LogOut,
-  MoreVertical, RotateCcw, ShieldAlert, SquareTerminal, TriangleAlert, Usb, X,
+  MoreVertical, RefreshCw, RotateCcw, ShieldAlert, SquareTerminal, TriangleAlert, Usb, X,
 } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 import { fmtHz, SHAPES, SWITCH_MS, type Mode } from './device';
 import * as io from './io';
-import { useDev } from './store';
+import { unsavedData, useDev } from './store';
 import { Btn } from './ui';
 import version from '../VERSION?raw';
 import { Dmm } from './views/Dmm';
@@ -28,7 +28,7 @@ export function App() {
   const shot = useDev((s) => s.shot);
   const consoleOpen = useDev((s) => s.console);
 
-  if (link === 'disconnected' || link === 'connecting') return <><ConnectScreen /><ErrorToast /></>;
+  if (link === 'disconnected' || link === 'connecting') return <><ConnectScreen /><ErrorToast /><UpdateToast /></>;
 
   return (
     <div className="flex h-dvh flex-col">
@@ -46,6 +46,7 @@ export function App() {
       <StatusBar />
       {shot && <ScreenshotDialog />}
       <ErrorToast />
+      <UpdateToast />
     </div>
   );
 }
@@ -162,6 +163,28 @@ function ErrorToast() {
       <TriangleAlert size={14} className="mt-0.5 shrink-0 text-danger" />
       <span className="break-words">{error}</span>
       <button aria-label="Dismiss" onClick={() => useDev.getState().set({ error: null })} className="text-muted hover:text-fg"><X size={13} /></button>
+    </div>
+  );
+}
+
+// Never reloads on its own: an open session may hold an unexported DMM log or Bode result.
+function UpdateToast() {
+  const update = useDev((s) => s.update);
+  const unsaved = useDev(unsavedData);
+  if (!update) return null;
+  return (
+    <div role="status" className="fixed right-4 bottom-8 z-40 flex max-w-sm items-start gap-2 rounded-md border border-accent/50 bg-panel px-3 py-2 text-xs text-fg shadow-xl">
+      <RefreshCw size={14} className="mt-0.5 shrink-0 text-accent" />
+      <div className="space-y-2">
+        <p>
+          A new version is available. Updating reloads the panel and drops the USB connection.
+          {unsaved && <span className="text-amber"> Export your DMM log / Bode result first, it will be lost.</span>}
+        </p>
+        <div className="flex gap-2">
+          <Btn tone="accent" onClick={() => location.reload()}>Update</Btn>
+          <Btn onClick={() => useDev.getState().set({ update: false })}>Later</Btn>
+        </div>
+      </div>
     </div>
   );
 }

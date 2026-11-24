@@ -4,6 +4,7 @@ import '@fontsource-variable/geist';
 import '@fontsource-variable/geist-mono';
 import './index.css';
 import { App } from './App';
+import './pwa';
 
 // A render error would otherwise blank the page while the device keeps running (generator on).
 class Crash extends Component<{ children: ReactNode }, { error: Error | null }> {
