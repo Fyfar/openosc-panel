@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import type { DmmFunc, HoldMode, Mode, Model, Profile, Shape } from './device';
+import { emptyStats, type DmmStats } from './dsp';
 
 export type LinkState = 'disconnected' | 'connecting' | 'connected' | 'switching';
 
@@ -30,8 +31,10 @@ export type State = {
   dmm: { func: DmmFunc; auto: boolean; range: number; hold: boolean; holdMode: HoldMode; rel: boolean; cj: number | null };
   ranges: number[]; // SI maxima from SYST:DMM:RANG:LIST?
   reading: { v: number | null; over: boolean; blank: boolean; sec: number | null; seq: number } | null;
-  hist: { t: number[]; v: number[] };
+  hist: { t: number[]; v: (number | null)[] }; // null = OL/blank gap, breaks the trend line
+  dstats: DmmStats; // since Reset or function change, not capped like `hist`
   logged: number;
+  junctionNeeded: boolean; // CONF:TEMP was refused: Type K has no cold junction configured
 
   scope: {
     sweep: Sweep;
@@ -77,6 +80,8 @@ export const useDev = create<State>((set) => ({
   ranges: [],
   reading: null,
   hist: { t: [], v: [] },
+  dstats: emptyStats(),
+  junctionNeeded: false,
   logged: 0,
 
   scope: {
