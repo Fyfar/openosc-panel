@@ -49,7 +49,6 @@ export const MODELS: Record<Model, {
   duty: { min: number; max: number; step: number };
   levels: boolean; // ZT703S: DAC level profiles / codes / square drive
   amplitude: boolean; // ZT706S: SOUR:VOLT, 0.1 V steps
-  interleaveAuto: boolean;
   counts: number;
 }> = {
   ZT703S: {
@@ -57,15 +56,42 @@ export const MODELS: Record<Model, {
     maxHz: { SIN: 343_999, SQU: 1_000_000, TRI: 100_000, HALF: 129_000, POS: 294_000, RAMP: 100_000 },
     minHz: 0.001,
     duty: { min: 0, max: 100, step: 0.5 },
-    levels: true, amplitude: false, interleaveAuto: false, counts: 25000,
+    levels: true, amplitude: false, counts: 25000,
   },
   ZT706S: {
     maxHz: { SIN: 10_000_000, SQU: 2_000_000, TRI: 2_000_000, HALF: 2_000_000, POS: 2_000_000, RAMP: 200_000 },
     minHz: 1,
     duty: { min: 1, max: 100, step: 0.1 },
-    levels: false, amplitude: true, interleaveAuto: true, counts: 66000,
+    levels: false, amplitude: true, counts: 66000,
   },
 };
+
+// "0.21.9" ≥ "0.21.8"; an unknown version counts as old.
+export function fwAtLeast(fw: string | undefined, min: string): boolean {
+  const a = (fw ?? '').match(/\d+/g)?.map(Number) ?? [], b = min.split('.').map(Number);
+  for (let i = 0; i < b.length; i++) if ((a[i] ?? -1) !== b[i]) return (a[i] ?? -1) > b[i];
+  return true;
+}
+// WAV:FRAM?, WAV:POIN:MODE PEAK, WAV:MEAS?, MMEM (firmware docs/SCPI_DESKTOP.md).
+export const DESKTOP_FW = '0.21.9';
+
+// ZT703S from 0.21.8: on the 200 MHz profile (the only one with USB) a DAC update takes ≥ 32 timer
+// ticks, so a DAC shape plays at most 200 MHz / 32 / 28 points = 223.2 kHz (waveform.hpp
+// SlowProfileTimerTicks, maximumMillihertz). Older firmware keeps the measured 0.21.4/0.21.5 limits.
+const ZT703S_DAC_MAX = 223_214;
+export function genMaxHz(model: Model, fw: string | undefined): Record<Shape, number> {
+  const m = MODELS[model].maxHz;
+  if (model !== 'ZT703S' || !fwAtLeast(fw, '0.21.8')) return m;
+  return { ...m, SIN: Math.min(m.SIN, ZT703S_DAC_MAX), POS: Math.min(m.POS, ZT703S_DAC_MAX) };
+}
+
+// ACQ:INT:STAT? blocker bits: why a requested interleave is not in force.
+// Names follow InterleaveConditions::Blocker (acquisition/interleave.hpp).
+const INTERLEAVE_BLOCKERS: [number, string][] = [
+  [1, 'board'], [2, 'performance profile'], [4, 'timebase'], [8, 'not CH1 alone'], [16, 'Roll'],
+  [32, 'internal capture'], [64, 'generator DAC'], [128, 'option off'],
+];
+export const interleaveBlockers = (bits: number) => INTERLEAVE_BLOCKERS.filter(([b]) => bits & b).map(([, name]) => name);
 
 // ZT706S module: highest amplitude (V) for a shape at a frequency (module_wave.cpp limitMillivolts).
 export function ampLimit(shape: Shape, hz: number): number {
@@ -87,7 +113,8 @@ export function genHalvesScope(model: Model, g: { out: boolean; shape: Shape; pr
 export const HALVED_NOTE = 'Generator on: scope max sample rate is halved while it runs (the DAC shares the bus with the capture).';
 
 // Top of a Bode sweep: the sine limit, on the ZT706S also capped by the amplitude set.
-export const bodeMaxHz = (model: Model, volts: number) => Math.min(MODELS[model].maxHz.SIN, MODELS[model].amplitude ? sineMaxAt(volts) : Infinity);
+export const bodeMaxHz = (model: Model, volts: number, fw: string | undefined) =>
+  Math.min(genMaxHz(model, fw).SIN, MODELS[model].amplitude ? sineMaxAt(volts) : Infinity);
 
 // Log-spaced sweep frequencies, both ends included. Shared by the Bode preview and the sweep.
 export function bodePlan(start: number, stop: number, ppd: number): number[] {
@@ -137,6 +164,23 @@ export function fmtVolt(v: number): string {
 export function fmtHz(f: number, compact = false): string {
   const [v, u] = f >= 1e6 ? [f / 1e6, 'MHz'] : f >= 1e3 ? [f / 1e3, 'kHz'] : [f, 'Hz'];
   return `${compact ? +v.toPrecision(3) : v.toPrecision(5)} ${u}`;
+}
+
+const SI_PREFIX = ['p', 'n', 'µ', 'm', '', 'k', 'M', 'G']; // 10^-12 … 10^9
+
+// A live readout that doesn't jump: `digits` significant digits with trailing zeros kept, and a
+// sticky prefix that changes only when the value leaves [0.95, 1000) of the current one, so a
+// reading hovering at an edge (999.8 Hz ↔ 1.0002 kHz) keeps its unit. Pass `exp` back next time.
+export function fmtStable(v: number, unit: string, digits: number, prev?: number): { text: string; exp: number } {
+  if (!Number.isFinite(v)) return { text: '—', exp: prev ?? 0 };
+  const a = Math.abs(v), r = prev === undefined ? NaN : a / 10 ** prev;
+  const natural = a ? Math.floor(Math.log10(a) / 3) * 3 : (prev ?? 0);
+  const exp = Math.min(9, Math.max(-12, (r >= 0.95 && r < 1000) || a === 0 ? (prev ?? natural) : natural));
+  const x = v / 10 ** exp;
+  const dp = x ? Math.min(digits - 1, Math.max(0, digits - 1 - Math.floor(Math.log10(Math.abs(x))))) : digits - 1;
+  const s = x.toFixed(dp);
+  if (Math.abs(+s) >= 1000 && exp < 9) return fmtStable(v, unit, digits, exp + 3); // 999.996 rounds to 1000.0
+  return { text: `${s} ${SI_PREFIX[(exp + 12) / 3]}${unit}`, exp };
 }
 
 // Typed frequency: "10k", "10 kHz", "2.5MHz", "1e3", "500 mHz". k/K is kilo; m is milli and

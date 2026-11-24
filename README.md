@@ -22,7 +22,9 @@ install, no backend. Your data never leaves your machine.
 ## Features
 
 - **The scope on your monitor.** Both channels live, edge trigger, Run/Stop/Single, Auto
-  setup, measurements, cursors and FFT. Export the full capture record as CSV.
+  setup, Roll, time and level cursors, FFT with four windows. The same measurements as the
+  device's own readouts (frequency, Vpp, amplitude, RMS, duty and more), plus the hardware
+  frequency counter on each channel. Export the full capture record as CSV.
 - **Bode plots in one click.** The panel sweeps the generator, re-ranges each channel as the
   gain changes, reads off the −3 dB corner and roll-off, then puts your settings back.
 - **A generator you can type into.** `10k`, `2.5 MHz`, `500 mHz`. Six shapes, duty cycle,
@@ -38,8 +40,11 @@ install, no backend. Your data never leaves your machine.
 
 ## What you need
 
-- A **ZOYI ZT703S** with **OpenOSC 0.21 or newer** (tested on 0.21.4 to 0.21.7). The
+- A **ZOYI ZT703S** with **OpenOSC 0.21 or newer** (tested on 0.21.4 to 0.21.9). The
   **ZT706S** should work too, but nobody has tried it on real hardware yet. Reports welcome.
+- **OpenOSC 0.21.9 or newer is recommended:** the scope updates about three times faster,
+  short glitches stay visible on long captures, and the measurements come from the device
+  itself. Older firmware still works, with measurements computed in the browser.
 - On the device: USB on in *Settings → Files & USB*, and performance profile 200/100 (faster
   profiles switch USB off).
 - **Chrome, Edge, Opera or Firefox 151+ on desktop.** Safari and iOS have no Web Serial.

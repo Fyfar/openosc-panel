@@ -1,7 +1,9 @@
-// Waveform maths on captured frames: Bode tone detection and the scope's browser-side
-// measurements (the firmware only offers the frequency counter), plus DMM statistics and the
-// trend's Y floor. Pure, no device access.
-export type Frame = { ch: 0 | 1; seq: number; xinc: number; xorig: number; volts: Float32Array };
+// Waveform maths on captured frames: Bode tone detection, the scope's browser-side
+// measurements (the fallback before firmware 0.21.9's WAV:MEAS?) and FFT, plus DMM statistics and
+// the trend's Y floor. Pure, no device access.
+// PEAK frames (WAV:POIN:MODE PEAK) carry each bucket's min and max in lo/hi; volts is then their
+// midpoint, good for drawing levels but not for spectra.
+export type Frame = { ch: 0 | 1; seq: number; xinc: number; xorig: number; volts: Float32Array; lo?: Float32Array; hi?: Float32Array };
 
 export function extent(v: Float32Array) {
   let mn = Infinity, mx = -Infinity;
@@ -32,7 +34,12 @@ export function gainPhase(inp: Frame, out: Frame, f: number) {
   return { db: 20 * Math.log10(y.amp / x.amp), ph };
 }
 
-export type Meas = { vpp: number; mean: number; rms: number; freq: number; duty: number; rise: number };
+// The device's readout set (WAV:MEAS? order, SCPI_DESKTOP.md) plus rise time, which only the
+// browser computes. NaN = not measured. src: EDGE/SPEC/CNT from the device, HOST when computed here.
+export type Meas = {
+  freq: number; period: number; vpp: number; amp: number; top: number; base: number; max: number; min: number;
+  mean: number; rms: number; acRms: number; duty: number; edges: number; rise: number; clipped: boolean; src: string;
+};
 
 // Rising crossings of `mid`, with hysteresis so noise on a slow edge counts once.
 function risingEdges(v: Float32Array, mid: number, hyst: number): number[] {
@@ -68,7 +75,63 @@ export function measure(f: Frame): Meas {
     for (let i = a; i < b; i++) if (v[i] > mid) high++;
     duty = (100 * high) / (b - a);
   }
-  return { vpp: span, mean: s / n, rms: Math.sqrt(s2 / n), freq, duty, rise };
+  const mean = s / n, rms = Math.sqrt(s2 / n);
+  return {
+    freq, period: 1 / freq, vpp: span, amp: NaN, top: NaN, base: NaN, max: mx, min: mn, mean, rms,
+    acRms: Math.sqrt(Math.max(0, rms * rms - mean * mean)), duty, edges: rises.length, rise, clipped: false, src: 'HOST',
+  };
+}
+
+// --- FFT ------------------------------------------------------------------------------------
+
+export const FFT_WINDOWS = ['RECT', 'HANN', 'HAMM', 'BLACK'] as const;
+export type FftWindow = (typeof FFT_WINDOWS)[number];
+const WINDOW_FN: Record<FftWindow, (x: number) => number> = { // x = 2πi/(N−1)
+  RECT: () => 1,
+  HANN: (x) => 0.5 - 0.5 * Math.cos(x),
+  HAMM: (x) => 0.54 - 0.46 * Math.cos(x),
+  BLACK: (x) => 0.42 - 0.5 * Math.cos(x) + 0.08 * Math.cos(2 * x),
+};
+
+// Peak amplitude (V) per bin 0..N/2 of the largest power-of-two prefix of `v`, corrected for the
+// window's coherent gain so a sine of amplitude A reads ≈ A at its bin.
+export function spectrum(v: Float32Array, win: FftWindow): Float32Array {
+  let N = 1;
+  while (N * 2 <= v.length) N *= 2;
+  const re = new Float64Array(N), im = new Float64Array(N), w = WINDOW_FN[win];
+  let gain = 0;
+  for (let i = 0; i < N; i++) {
+    const k = w((2 * Math.PI * i) / (N - 1));
+    re[i] = v[i] * k;
+    gain += k;
+  }
+  fftInPlace(re, im);
+  const amp = new Float32Array(N / 2);
+  for (let k = 0; k < N / 2; k++) amp[k] = ((k ? 2 : 1) * Math.hypot(re[k], im[k])) / gain; // ×2: one-sided, not DC
+  return amp;
+}
+
+// Radix-2 decimation in time; N a power of two.
+function fftInPlace(re: Float64Array, im: Float64Array) {
+  const N = re.length;
+  for (let i = 1, j = 0; i < N; i++) {
+    let bit = N >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) { [re[i], re[j]] = [re[j], re[i]]; [im[i], im[j]] = [im[j], im[i]]; }
+  }
+  for (let len = 2; len <= N; len <<= 1) {
+    const ang = (-2 * Math.PI) / len;
+    for (let i = 0; i < N; i += len) {
+      for (let k = 0; k < len / 2; k++) {
+        const wr = Math.cos(ang * k), wi = Math.sin(ang * k);
+        const a = i + k, b = a + len / 2;
+        const tr = re[b] * wr - im[b] * wi, ti = re[b] * wi + im[b] * wr;
+        re[b] = re[a] - tr; im[b] = im[a] - ti;
+        re[a] += tr; im[a] += ti;
+      }
+    }
+  }
 }
 
 // --- DMM: running statistics and the value histogram, O(1) per reading (never a rescan) -----
