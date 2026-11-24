@@ -10,7 +10,7 @@ install, no backend. Your data never leaves your machine.
 ![Firmware: OpenOSC 0.21+ only](https://img.shields.io/badge/firmware-OpenOSC%200.21%2B%20only-f59e0b)
 ![Stack: Vite · React · TypeScript · Tailwind](https://img.shields.io/badge/stack-Vite%20·%20React%2019%20·%20TypeScript%20·%20Tailwind%20v4-3b82f6)
 
-![OpenOSC Panel: the multimeter, oscilloscope and generator views](./images/hero.jpg)
+![OpenOSC Panel: oscilloscope, generator, Bode and multimeter for the ZOYI ZT703S on OpenOSC firmware, shown as the multimeter, oscilloscope and generator views](./images/hero.jpg)
 
 > [!IMPORTANT]
 > This panel works **only with the [OpenOSC](https://github.com/bve/OpenOSC) firmware**. The
