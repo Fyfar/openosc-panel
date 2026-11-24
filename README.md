@@ -12,6 +12,8 @@ install, no backend. Your data never leaves your machine.
 
 ![OpenOSC Panel: oscilloscope, generator, Bode and multimeter for the ZOYI ZT703S on OpenOSC firmware, shown as the multimeter, oscilloscope and generator views](./images/hero.jpg)
 
+### **[Open the app →](https://fyfar.github.io/openosc-panel/)**
+
 > [!IMPORTANT]
 > This panel works **only with the [OpenOSC](https://github.com/bve/OpenOSC) firmware**. The
 > stock ZOYI firmware has no remote control over USB. Still on stock firmware? See
@@ -73,7 +75,8 @@ npm run dev
 ```
 
 Open [http://localhost:5173](http://localhost:5173) and click **Connect device**.
-`npm run build` writes a static site to `dist/`; host it anywhere with HTTPS.
+`npm run build` writes a static site to `dist/`; host it anywhere with HTTPS. Every push to
+`main` publishes it to [GitHub Pages](https://fyfar.github.io/openosc-panel/).
 
 ## Contributing
 
