@@ -1,8 +1,9 @@
 // Self-check for the pure logic: typed frequency, DMM scaling, Bode maths/plan/restore,
 // scope measurements and generator command order. Run: `npm run check`.
 import assert from 'node:assert/strict';
-import { bodePlan, parseHz, scaleFor, seenRef, VDIV_MV } from '../src/device.ts';
-import { addStat, emptyStats, gainPhase, histogram, measure, stdDev, yFloor, type Frame } from '../src/dsp.ts';
+import { bodePlan, fmtStable, fwAtLeast, genMaxHz, interleaveBlockers, parseHz, scaleFor, seenRef, VDIV_MV } from '../src/device.ts';
+import { addStat, emptyStats, FFT_WINDOWS, gainPhase, histogram, measure, spectrum, stdDev, yFloor, type Frame } from '../src/dsp.ts';
+import { parseFrame, parseMeas, screenWindow } from '../src/io/scope.ts';
 import { pointCmds, rerange, scopeRestore, SWEEP_SCOPE } from '../src/io/bode.ts';
 import { dmmDiff } from '../src/io/dmm.ts';
 import { genDiff } from '../src/io/gen.ts';
@@ -110,6 +111,90 @@ const frame = (ch: 0 | 1, n: number, xinc: number, fn: (t: number) => number): F
   near(m.duty, 30, 1, 'square duty');
   near(m.vpp, 3.3, 1e-6, 'square vpp');
   near(m.mean, 0.99, 0.05, 'square mean');
+  near(m.max, 3.3, 1e-6, 'square max');
+  near(m.acRms, 3.3 * Math.sqrt(0.3 * 0.7), 0.05, 'square AC RMS');
+  near(m.edges, 4, 0, 'square rising edges (4 periods)');
+}
+
+// --- spectrum: a bin-centred 1.5 V sine reads 1.5 V at its bin with every window ------------
+{
+  const N = 2048, bin = 64, v = Float32Array.from({ length: N }, (_, i) => 1.5 * Math.sin((2 * Math.PI * bin * i) / N) + 0.2);
+  for (const w of FFT_WINDOWS) {
+    const amp = spectrum(v, w);
+    assert.equal(amp.length, N / 2);
+    near(amp[bin], 1.5, 0.02, `${w} sine amplitude`);
+    near(amp[0], 0.2, 0.02, `${w} DC bin (not doubled)`);
+  }
+}
+
+// --- fmtStable: a reading hovering at a prefix edge keeps its unit and its width --------------
+{
+  const seq = (vals: number[], unit: string, digits: number) => {
+    let exp: number | undefined;
+    return vals.map((v) => { const r = fmtStable(v, unit, digits, exp); exp = r.exp; return r.text; });
+  };
+  assert.deepEqual(seq([1000.2, 999.8, 1000, 951, 940, 1000.1], 'Hz', 5),
+    ['1.0002 kHz', '0.9998 kHz', '1.0000 kHz', '0.9510 kHz', '940.00 Hz', '1.0001 kHz']);
+  assert.deepEqual(seq([0.1, 0.10004, 1.2, 0, -0.05], 'V', 4), ['100.0 mV', '100.0 mV', '1.200 V', '0.000 V', '-50.00 mV']);
+  assert.equal(fmtStable(999.996, 'Hz', 5).text, '1.0000 kHz', 'rounding up to 1000 moves the prefix');
+  assert.equal(fmtStable(NaN, 'V', 4, -3).text, '—');
+  assert.equal(fmtStable(0, 'V', 4).text, '0.000 V', 'zero on the first call (grounded input, cursors together)');
+  assert.equal(fmtStable(2e-7, 's', 4).text, '200.0 ns');
+  checks += 6;
+}
+
+// --- firmware gating: version compare and the ZT703S DAC limit from 0.21.8 -------------------
+for (const [fw, min, want] of [
+  ['0.21.9', '0.21.9', true], ['0.21.10', '0.21.9', true], ['0.21.8', '0.21.9', false], ['0.22.0', '0.21.9', true],
+  ['0.21.9-dirty', '0.21.9', true], ['', '0.21.9', false], [undefined, '0.21.8', false],
+] as const) {
+  assert.equal(fwAtLeast(fw, min), want, `fwAtLeast(${fw}, ${min})`);
+  checks++;
+}
+assert.equal(genMaxHz('ZT703S', '0.21.8').SIN, 223_214);
+assert.equal(genMaxHz('ZT703S', '0.21.8').POS, 223_214);
+assert.equal(genMaxHz('ZT703S', '0.21.8').HALF, 129_000);
+assert.equal(genMaxHz('ZT703S', '0.21.7').SIN, 343_999);
+assert.equal(genMaxHz('ZT706S', '0.21.9').SIN, 10_000_000);
+assert.deepEqual(interleaveBlockers(4 | 8 | 64), ['timebase', 'not CH1 alone', 'generator DAC']);
+checks += 6;
+
+// --- screenWindow: 10 div around the trigger; untriggered (origin 0 or rounding dust) uses TRIG:POS
+{
+  const tb = 10; // TIMEBASES[10] = 20 µs/div → 200 µs screen = 2000 samples at 100 MSa/s
+  const s = { tb, trig: { src: 1, slope: 'POS', level: 0, nrej: false, pos: 50 } } as const;
+  assert.deepEqual(screenWindow(65536, 1e-7, -1e-7 * 30000, s), { first: 29000, end: 31000 }, 'triggered at 30000');
+  assert.deepEqual(screenWindow(65536, 1e-7, 0, s), { first: 31768, end: 33768 }, 'untriggered: record centre');
+  assert.deepEqual(screenWindow(65536, 1e-7, -1e-21, s), { first: 31768, end: 33768 }, 'origin rounding dust is untriggered');
+  assert.deepEqual(screenWindow(1000, 1e-7, 0, s), { first: 0, end: 1000 }, 'record shorter than the screen');
+  checks += 4;
+}
+
+// --- parseFrame: WAV:FRAM? block with a STR channel and a PEAK channel (bytes may be 0x0a) -----
+{
+  const enc = new TextEncoder();
+  const head = enc.encode('42,2\nCHAN1,0,0,3,1,1e-6,-2e-6,0,0.1,0,128\nCHAN2,0,1,2,1,2e-6,0,0,0.5,-28,128\n');
+  const data = Uint8Array.from([128, 138, 10, /* CH2 pairs */ 10, 120, 100, 110]);
+  const fr = parseFrame(Uint8Array.from([...head, ...data]));
+  assert.equal(fr.length, 2);
+  assert.deepEqual([fr[0].ch, fr[0].seq, fr[0].xinc, fr[0].xorig], [0, 42, 1e-6, -2e-6]);
+  assert.deepEqual([...fr[0].volts].map((v) => +v.toFixed(3)), [0, 1, -11.8]);
+  assert.equal(fr[0].lo, undefined, 'STR frame has no envelope');
+  assert.deepEqual([...fr[1].lo!], [-45, 0], 'PEAK min: (code − 128 − (−28)) × 0.5');
+  assert.deepEqual([...fr[1].hi!], [10, 5]);
+  assert.deepEqual([...fr[1].volts], [-17.5, 2.5], 'PEAK volts = bucket midpoint');
+  assert.throws(() => parseFrame(Uint8Array.from([...head, 1, 2])), /cut short/);
+  checks += 7;
+}
+
+// --- parseMeas: WAV:MEAS? field order; NAN stays NaN ----------------------------------------
+{
+  const m = parseMeas('1000,3.3,1.8,0.001,0.99,0,3.3,1.5,30,10,NAN,1000.2,3.28,3.29,0.01,1,EDGE')!;
+  assert.deepEqual([m.freq, m.vpp, m.rms, m.period, m.mean, m.min, m.max, m.acRms, m.duty, m.edges], [1000, 3.3, 1.8, 0.001, 0.99, 0, 3.3, 1.5, 30, 10]);
+  assert.deepEqual([m.amp, m.top, m.base, m.clipped, m.src], [3.28, 3.29, 0.01, true, 'EDGE']);
+  assert.ok(Number.isNaN(parseMeas('NAN,1,1,NAN,0,0,0,0,NAN,0,NAN,NAN,NAN,NAN,NAN,0,NONE')!.freq));
+  assert.equal(parseMeas('NAN'), null, 'a failed query (-230) gives no readouts');
+  checks += 4;
 }
 
 // --- genDiff: SOUR:FUNC must never be sent while the frequency is over the new shape's limit

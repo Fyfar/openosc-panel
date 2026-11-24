@@ -1,7 +1,7 @@
 import { clsx } from 'clsx';
 import { Info, Power } from 'lucide-react';
 import { useState } from 'react';
-import { ampLimit, fmtHz, genHalvesScope, HALVED_NOTE, MODELS, parseHz, SHAPES, type Model, type Shape } from '../device';
+import { ampLimit, fmtHz, genHalvesScope, genMaxHz, HALVED_NOTE, MODELS, parseHz, SHAPES, type Model, type Shape } from '../device';
 import { useDev, type State } from '../store';
 import { Panel, Row, Seg, Toggle } from '../ui';
 
@@ -43,7 +43,8 @@ export function Generator() {
   const model = useDev((s) => s.model);
   const patch = useDev((s) => s.patch);
   const set: SetGen = (p) => patch('gen', p);
-  const spec = MODELS[model];
+  const fw = useDev((s) => s.idn?.fw);
+  const spec = { ...MODELS[model], maxHz: genMaxHz(model, fw) };
   const shape = SHAPES.find((s) => s.id === g.shape)!;
   const max = spec.maxHz[g.shape];
   const [note, setNote] = useState<string | null>(null);

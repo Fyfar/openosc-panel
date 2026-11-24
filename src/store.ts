@@ -1,11 +1,13 @@
 import { create } from 'zustand';
 import type { DmmFunc, HoldMode, Mode, Model, Profile, Shape } from './device';
-import { emptyStats, type DmmStats } from './dsp';
+import { emptyStats, type DmmStats, type FftWindow } from './dsp';
 
 export type LinkState = 'disconnected' | 'connecting' | 'connected' | 'switching';
 
 export type Channel = { on: boolean; coup: 'DC' | 'AC'; probe: number; vdivMv: number; offsetDiv: number };
 export type Sweep = 'AUTO' | 'NORM' | 'SING';
+export type CursorMode = 'OFF' | 'T' | 'V' | 'TV'; // the device's Off / Time / Level / Time+Level
+export type FftScale = 'DBV' | 'DBFS' | 'LIN';
 
 // Mirrors the device. io.ts writes device state here and turns user edits of the
 // `dmm` / `scope` / `gen` settings into SCPI (diff-based, see io.ts sync()).
@@ -23,8 +25,11 @@ export type State = {
   shot: boolean;
   stats: string;
   // View-only flags: kept out of the dmm/scope slices so toggling them sends no SCPI.
-  cursors: boolean;
+  cursors: CursorMode;
   fft: boolean;
+  fftWin: FftWindow;
+  fftScale: FftScale;
+  fftSrc: 0 | 1;
   logging: boolean;
   update: boolean; // a newer deploy exists (src/pwa.ts); the user decides when to reload
 
@@ -44,9 +49,15 @@ export type State = {
     trig: { src: 1 | 2; slope: 'POS' | 'NEG'; level: number; nrej: boolean; pos: number };
     mdepth: number;
     roll: boolean;
-    interleave: 'OFF' | 'ON' | 'AUTO'; // AUTO: ZT706S only
+    interleave: 'OFF' | 'ON' | 'AUTO'; // AUTO: the firmware's rule (both boards, measured ZT703S 0.21.9)
   };
-  scopeStatus: { stat: string; srate: number; fcnt: [number, number]; qual: string; lastSweep: 'AUTO' | 'NORM' };
+  scopeStatus: {
+    stat: string; srate: number; lastSweep: 'AUTO' | 'NORM';
+    fcnt: [number, number]; // hardware counter per channel (CHANn:FCNT?), NaN when not settled
+    qual: string; // counter quality, trigger channel only (MEAS:FCNT:QUAL?)
+    interleave: { active: boolean; blockers: number } | null; // ACQ:INT:STAT?
+    capture: { active: boolean; seq: number; since: number }; // ACQ:PROG?; since = host time this record started
+  };
 
   gen: { shape: Shape; freq: number; duty: number; prof: 'DED' | 'LOW' | 'HIGH' | 'CUST'; low: number; high: number; drive: 'FACT' | 'PWM'; amp: number; out: boolean; startup: boolean };
   bode: { start: number; stop: number; ppd: number; running: boolean; progress: number; points: { f: number; db: number; ph: number }[] };
@@ -72,8 +83,11 @@ export const useDev = create<State>((set) => ({
   shot: false,
   update: false,
   stats: '',
-  cursors: false,
+  cursors: 'OFF',
   fft: false,
+  fftWin: 'HANN',
+  fftScale: 'DBV',
+  fftSrc: 0,
   logging: false,
 
   dmm: { func: 'VDC', auto: true, range: 0, hold: false, holdMode: 'MAN', rel: false, cj: null },
@@ -97,7 +111,7 @@ export const useDev = create<State>((set) => ({
     roll: false,
     interleave: 'OFF',
   },
-  scopeStatus: { stat: '—', srate: NaN, fcnt: [NaN, NaN], qual: '', lastSweep: 'AUTO' },
+  scopeStatus: { stat: '—', srate: NaN, lastSweep: 'AUTO', fcnt: [NaN, NaN], qual: '', interleave: null, capture: { active: false, seq: NaN, since: 0 } },
 
   gen: { shape: 'SIN', freq: 1000, duty: 50, prof: 'DED', low: 0, high: 4095, drive: 'FACT', amp: 3, out: false, startup: false },
   bode: { start: 10, stop: 100_000, ppd: 10, running: false, progress: 0, points: [] },

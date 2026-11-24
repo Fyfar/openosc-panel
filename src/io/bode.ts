@@ -1,5 +1,5 @@
 // Bode: host-side sweep. Generator sine → DUT; CH1 = DUT input, CH2 = DUT output.
-import { bodeMaxHz, bodePlan, MODELS, TIMEBASES, VDIV_MV, type Model } from '../device';
+import { bodeMaxHz, bodePlan, genMaxHz, TIMEBASES, VDIV_MV, type Model } from '../device';
 import { extent, gainPhase, type Frame } from '../dsp';
 import { sleep } from '../link';
 import type { State } from '../store';
@@ -37,7 +37,7 @@ export function scopeRestore(s: Saved): string[] {
 
 const genRestore = (g: State['gen'], model: Model) => [
   // SOUR:FUNC is refused above the shape's limit, so bring the frequency under it first.
-  `OUTP ${g.out ? 'ON' : 'OFF'}`, `SOUR:FREQ ${Math.min(g.freq, MODELS[model].maxHz[g.shape])}`, `SOUR:FUNC ${SHAPE_CMD[g.shape]}`, `SOUR:FREQ ${g.freq}`,
+  `OUTP ${g.out ? 'ON' : 'OFF'}`, `SOUR:FREQ ${Math.min(g.freq, genMaxHz(model, get().idn?.fw)[g.shape])}`, `SOUR:FUNC ${SHAPE_CMD[g.shape]}`, `SOUR:FREQ ${g.freq}`,
 ];
 
 // Next V/div per channel: a step up when it clips (> ±3.8 div), a step down when it is tiny
@@ -82,7 +82,7 @@ async function sweepPoint(f: number, vdiv: number[], probe: number[]) {
 export async function bodeSweep() {
   if (get().profile !== 'DS1052') return fail('Bode needs the scope profile.');
   const { model, gen: g0, bode: b } = get();
-  const freqs = bodePlan(b.start, Math.min(b.stop, bodeMaxHz(model, g0.amp)), b.ppd);
+  const freqs = bodePlan(b.start, Math.min(b.stop, bodeMaxHz(model, g0.amp, get().idn?.fw)), b.ppd);
   get().patch('bode', { running: true, progress: 0, points: [] });
   let restore: string[] = [];
   let skipped = 0;

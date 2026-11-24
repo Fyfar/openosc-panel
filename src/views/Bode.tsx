@@ -13,7 +13,8 @@ export function Bode() {
   const model = useDev((s) => s.model);
   const amp = useDev((s) => s.gen.amp);
   const pts = b.points;
-  const sineMax = bodeMaxHz(model, amp); // same ceiling as io.bodeSweep
+  const fw = useDev((s) => s.idn?.fw);
+  const sineMax = bodeMaxHz(model, amp, fw); // same ceiling as io.bodeSweep
   const plan = useMemo(() => bodePlan(b.start, Math.min(b.stop, sineMax), b.ppd), [b.start, b.stop, b.ppd, sineMax]);
 
   const opts = useMemo<Omit<uPlot.Options, 'width' | 'height'>>(() => ({
