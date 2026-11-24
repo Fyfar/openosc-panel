@@ -5,7 +5,7 @@ import { bodePlan, parseHz, scaleFor, VDIV_MV } from '../src/device.ts';
 import { gainPhase, measure, type Frame } from '../src/dsp.ts';
 import { pointCmds, rerange, scopeRestore, SWEEP_SCOPE } from '../src/io/bode.ts';
 import { genDiff } from '../src/io/gen.ts';
-import { useDev } from '../src/store.ts';
+import { unsavedData, useDev } from '../src/store.ts';
 
 let checks = 0;
 const near = (got: number, want: number, tol: number, what: string) => {
@@ -99,6 +99,19 @@ const frame = (ch: 0 | 1, n: number, xinc: number, fn: (t: number) => number): F
   assert.ok(scopeRestore({ ...saved, swe: 'SINGle', stat: 'WAIT' }).at(-1) === 'SING', 'single is restored with SING');
   assert.ok(!scopeRestore({ ...saved, s1: '' }).some((c) => c.startsWith('CHAN1:SCAL')), 'missing value is skipped');
   checks += 4;
+}
+
+// --- unsavedData: the reload/close guard fires exactly when a log or Bode result would be lost
+const s0 = useDev.getInitialState();
+for (const [s, want, what] of [
+  [s0, false, 'fresh state'],
+  [{ ...s0, logging: true }, false, 'logging armed, no rows yet'],
+  [{ ...s0, logged: 1 }, true, 'DMM log rows'],
+  [{ ...s0, bode: { ...s0.bode, running: true } }, true, 'Bode sweep running'],
+  [{ ...s0, bode: { ...s0.bode, points: [{ f: 1, db: 0, ph: 0 }] } }, true, 'Bode result'],
+] as const) {
+  assert.equal(unsavedData(s), want, `unsavedData: ${what}`);
+  checks++;
 }
 
 console.log(`check-logic: ${checks} checks passed`);

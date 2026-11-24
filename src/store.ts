@@ -25,6 +25,7 @@ export type State = {
   cursors: boolean;
   fft: boolean;
   logging: boolean;
+  update: boolean; // a newer deploy exists (src/pwa.ts); the user decides when to reload
 
   dmm: { func: DmmFunc; auto: boolean; range: number; hold: boolean; holdMode: HoldMode; rel: boolean; cj: number | null };
   ranges: number[]; // SI maxima from SYST:DMM:RANG:LIST?
@@ -51,6 +52,9 @@ export type State = {
   patch: <K extends 'dmm' | 'scope' | 'gen' | 'bode'>(k: K, p: Partial<State[K]>) => void;
 };
 
+// What a reload or close would lose: the DMM log and Bode results exist only in memory.
+export const unsavedData = (s: State) => s.logged > 0 || s.bode.running || s.bode.points.length > 0;
+
 export const useDev = create<State>((set) => ({
   link: 'disconnected',
   error: null,
@@ -63,6 +67,7 @@ export const useDev = create<State>((set) => ({
   console: false,
   consoleLog: [],
   shot: false,
+  update: false,
   stats: '',
   cursors: false,
   fft: false,
