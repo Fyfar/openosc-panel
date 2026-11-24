@@ -1,5 +1,6 @@
 // Waveform maths on captured frames: Bode tone detection and the scope's browser-side
-// measurements (the firmware only offers the frequency counter). Pure, no device access.
+// measurements (the firmware only offers the frequency counter), plus DMM statistics and the
+// trend's Y floor. Pure, no device access.
 export type Frame = { ch: 0 | 1; seq: number; xinc: number; xorig: number; volts: Float32Array };
 
 export function extent(v: Float32Array) {
@@ -68,4 +69,55 @@ export function measure(f: Frame): Meas {
     duty = (100 * high) / (b - a);
   }
   return { vpp: span, mean: s / n, rms: Math.sqrt(s2 / n), freq, duty, rise };
+}
+
+// --- DMM: running statistics and the value histogram, O(1) per reading (never a rescan) -----
+
+// `lsd` is the coarsest resolution seen (auto-range can change it); counts are keyed by the
+// LSD-snapped value, so the map is bounded by distinct displayed values, not by session length.
+export type DmmStats = { n: number; mean: number; m2: number; min: number; max: number; lsd: number; counts: Map<number, number> };
+export const emptyStats = (): DmmStats => ({ n: 0, mean: 0, m2: 0, min: Infinity, max: -Infinity, lsd: 0, counts: new Map() });
+
+// Welford. Returns a new object (store identity moves) sharing the same counts Map.
+export function addStat(s: DmmStats, v: number, lsd: number): DmmStats {
+  const n = s.n + 1, d = v - s.mean, mean = s.mean + d / n, k = Math.round(v / lsd) * lsd;
+  s.counts.set(k, (s.counts.get(k) ?? 0) + 1);
+  return { n, mean, m2: s.m2 + d * (v - mean), min: Math.min(s.min, v), max: Math.max(s.max, v), lsd: Math.max(s.lsd, lsd), counts: s.counts };
+}
+
+export const stdDev = (s: DmmStats) => (s.n ? Math.sqrt(s.m2 / s.n) : 0); // population σ
+
+export type Bin = { value: number; count: number; kind: 'under' | 'in' | 'over' };
+
+// One bin per displayable value, centred on the most-counted one (or `center` when empty).
+// Shows ±10 bins at least, grows to include data within ±100 bins; anything further collects
+// into edge bins one step outside (`under` = ≤ its value, `over` = ≥) so a lone outlier doesn't
+// flatten the distribution. Values stay unique and ascending, as an ordinal axis needs.
+export function histogram(counts: Map<number, number>, width: number, center = 0): Bin[] {
+  let best = -1;
+  for (const [v, n] of counts) if (n > best) { best = n; center = v; }
+  const cb = Math.round(center / width);
+  let lo = cb - 10, hi = cb + 10;
+  for (const [v] of counts) {
+    const b = Math.round(v / width);
+    if (Math.abs(b - cb) <= 100) { lo = Math.min(lo, b); hi = Math.max(hi, b); }
+  }
+  const inRange = new Array<number>(hi - lo + 1).fill(0);
+  let under = 0, over = 0;
+  for (const [v, n] of counts) {
+    const b = Math.round(v / width);
+    if (b < lo) under += n; else if (b > hi) over += n; else inRange[b - lo] += n;
+  }
+  const bins: Bin[] = inRange.map((count, i) => ({ value: (lo + i) * width, count, kind: 'in' }));
+  if (under) bins.unshift({ value: (lo - 1) * width, count: under, kind: 'under' });
+  if (over) bins.push({ value: (hi + 1) * width, count: over, kind: 'over' });
+  return bins;
+}
+
+// Auto Y floor: the data extent, never narrower than ±20 counts around its middle, so a steady
+// reading's ±1-count dither doesn't fill the plot. Real spread still widens it.
+export function yFloor(min: number, max: number, lsd: number): [number, number] {
+  if (!Number.isFinite(min) || !Number.isFinite(max)) return [-20 * lsd, 20 * lsd];
+  const mid = (min + max) / 2, half = Math.max(20 * lsd, (max - min) / 2);
+  return [mid - half, mid + half];
 }

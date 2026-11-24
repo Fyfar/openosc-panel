@@ -2,7 +2,9 @@ import { useEffect, useRef } from 'react';
 import uPlot from 'uplot';
 
 // Thin uPlot host: rebuilds on `opts` identity change, pushes `data` without rebuilding.
-export function Plot({ opts, data, className }: { opts: Omit<uPlot.Options, 'width' | 'height'>; data: uPlot.AlignedData; className?: string }) {
+// `x` pins the x window via setScale (pair it with `scales.x.auto: false`): uPlot then finds the
+// visible slice and fits auto-ranged y to it, so callers pass whole arrays, never a slice.
+export function Plot({ opts, data, x, className }: { opts: Omit<uPlot.Options, 'width' | 'height'>; data: uPlot.AlignedData; x?: readonly [number, number]; className?: string }) {
   const box = useRef<HTMLDivElement>(null);
   const plot = useRef<uPlot | null>(null);
 
@@ -16,6 +18,9 @@ export function Plot({ opts, data, className }: { opts: Omit<uPlot.Options, 'wid
   }, [opts]);
 
   useEffect(() => { plot.current?.setData(data); }, [data]);
+
+  const [x0, x1] = x ?? [];
+  useEffect(() => { if (x0 !== undefined && x1 !== undefined) plot.current?.setScale('x', { min: x0, max: x1 }); }, [x0, x1, opts]);
 
   return <div ref={box} className={className} />;
 }

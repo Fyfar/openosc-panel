@@ -32,7 +32,8 @@ install, no backend. Your data never leaves your machine.
   multimeter; the panel switches it for you in about a second.
 - **Full control when you need it:** a SCPI console, device screenshots and a remote lock for
   the device's keys.
-- **Install it as an app** from the browser's address bar if you like. It opens in its own
+- **Install it as an app** from the browser's address bar if you like. Nothing to download:
+  no `.exe`, `.dmg` or installer file. The browser adds it in one click, it opens in its own
   window and works offline once you've opened it online.
 
 ## What you need

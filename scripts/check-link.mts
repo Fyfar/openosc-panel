@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict';
 import { Link, sleep } from '../src/link.ts';
 import { link, runLoop, stopLoop } from '../src/io/core.ts';
-import { dmmLogCsv, dmmLoop } from '../src/io/dmm.ts';
+import { dmmLogCsv, dmmLoop, flushDmm } from '../src/io/dmm.ts';
 import { useDev } from '../src/store.ts';
 
 const enc = new TextEncoder();
@@ -97,15 +97,20 @@ let checks = 0;
   await l.close();
 }
 
-// --- the DMM loop keeps polling after a query times out (it used to die silently) --------
+// --- the DMM loop keeps polling after a query times out (it used to die silently), and turns
+// on the secondary reading: the firmware reports it only after FUNC2 FREQ (session flag, off at boot)
 {
-  let seq = 0;
-  const res = () => `1,1.234,0,0,0,1,1,0,0,${++seq},0`;
+  let seq = 0, func2 = false;
+  const res = () => `1,1.234,0,${func2 ? '50.02' : 'NAN'},${func2 ? 4 : 0},1,1,0,0,${++seq},0`;
   const cfg: Record<string, string> = {
     'FUNC?': '"VOLT"', 'SYST:DMM:RANG:LIST?': '3,2.5,25,250', 'AUTO?': '1', 'SYST:DMM:HOLD?': '0',
-    'SYST:DMM:REL?': '0', 'SYST:DMM:HOLD:MODE?': 'MAN', '*IDN?': IDN,
+    'SYST:DMM:REL?': '0', 'SYST:DMM:HOLD:MODE?': 'MAN', '*IDN?': IDN, 'SYST:ERR?': '0,"No error"',
+    'SYST:DMM:TEMP:CJUN?': '22.5',
   };
-  const dev = fakePort((c) => (c === 'SYST:DMM:RES?' ? (seq === 2 ? { after: 3500, reply: res() } : res()) : cfg[c] ?? null));
+  const dev = fakePort((c) => {
+    if (c === 'FUNC2 FREQ') func2 = true;
+    return c === 'SYST:DMM:RES?' ? (seq === 2 ? { after: 3500, reply: res() } : res()) : cfg[c] ?? null;
+  });
   useDev.setState({ logging: true });
   await link.open(dev.port);
   runLoop('dmm', dmmLoop);
@@ -113,12 +118,41 @@ let checks = 0;
   await stopLoop();
   await link.close();
   assert.ok((useDev.getState().reading?.seq ?? 0) >= 6, `loop stopped at seq ${useDev.getState().reading?.seq}`);
-  checks++;
+  assert.equal(useDev.getState().reading?.sec, 50.02, 'secondary (AC frequency) reaches the reading');
+  assert.equal(useDev.getState().dmm.cj, 22.5, 'stored manual junction is read back');
+  checks += 3;
 
   const csv = dmmLogCsv().trim().split('\n');
   assert.equal(csv[0], 'time,function,value,unit');
   assert.match(csv[1], /^\d{4}-\d\d-\d\dT[\d:.]+Z,DC Voltage,1\.234,V$/);
   checks++;
+}
+
+// --- Type K hint: set only by a refused CONF:TEMP (no cold junction), cleared by a function change
+{
+  let func = '"VOLT"', err = '0,"No error"';
+  const dev = fakePort((c) => {
+    if (c === 'CONF:TEMP') err = '-221,"Settings conflict"';
+    if (c === '*CLS') err = '0,"No error"';
+    const cfg: Record<string, string> = {
+      'FUNC?': func, 'SYST:DMM:RANG:LIST?': '3,2.5,25,250', 'AUTO?': '1', 'SYST:DMM:HOLD?': '0', 'SYST:DMM:REL?': '0',
+      'SYST:DMM:HOLD:MODE?': 'MAN', 'SYST:DMM:TEMP:CJUN?': 'NAN', 'SYST:ERR?': err, '*IDN?': IDN,
+    };
+    return cfg[c] ?? null;
+  });
+  await link.open(dev.port);
+  const v = { ...useDev.getState().dmm, func: 'VDC' as const, cj: null };
+  await flushDmm({ ...v, cj: 21 }, { ...v, func: 'TEMP', cj: 21 });
+  assert.equal(useDev.getState().junctionNeeded, false, 'with a manual junction stored, -221 is not about the junction');
+  useDev.setState({ hist: { t: [1, 2], v: [1.5, 1.6] } });
+  await flushDmm(v, { ...v, func: 'TEMP' });
+  assert.equal(useDev.getState().junctionNeeded, true, 'refused CONF:TEMP asks for a junction');
+  assert.equal(useDev.getState().hist.v.length, 2, 'a refused CONF keeps the current trend');
+  func = '"RES"'; // the user turns the meter's own keys
+  await flushDmm(v, { ...v, func: 'RES' });
+  assert.equal(useDev.getState().junctionNeeded, false, 'any other function change clears it');
+  await link.close();
+  checks += 4;
 }
 
 console.log(`check-link: ${checks} checks passed`);

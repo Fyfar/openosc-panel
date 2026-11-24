@@ -1,17 +1,30 @@
 import { clsx } from 'clsx';
 import { Download, Pause, Play, Trash2 } from 'lucide-react';
-import { useMemo, useState } from 'react';
-import type uPlot from 'uplot';
-import { DMM_FUNCS, HOLD_MODES, scaleFor, type DmmFunc } from '../device';
+import { useEffect, useMemo, useState } from 'react';
+import uPlot from 'uplot';
+import { DMM_FUNCS, HOLD_MODES, scaleFor, seenRef, type DmmFunc } from '../device';
+import { histogram, stdDev, yFloor } from '../dsp';
 import * as io from '../io';
 import { AXIS, Plot } from '../Plot';
 import { useDev } from '../store';
 import { Btn, Panel, Seg, Stat, Toggle } from '../ui';
 
-// One button per group; the second entry is reached by clicking the active button again.
-const GROUPS: DmmFunc[][] = [['VDC', 'MVDC'], ['VAC', 'MVAC'], ['ADC', 'MADC'], ['AAC', 'MAAC'], ['RES'], ['CONT'], ['DIOD'], ['CAP'], ['TEMP']];
+// In the meter's key order: F1 V, F2 Ω → •)) → →| → ⊣⊢, F3 A, F4 mV → Type K (mA with the probe in
+// the mA jack). A pair is one button: clicking it again flips DC ⇄ AC.
+const GROUPS: DmmFunc[][] = [['VDC', 'VAC'], ['RES'], ['CONT'], ['DIOD'], ['CAP'], ['ADC', 'AAC'], ['MVDC', 'MVAC'], ['TEMP'], ['MADC', 'MAAC']];
 
-const WINDOWS = [{ id: 60, label: '1m' }, { id: 600, label: '10m' }, { id: 3600, label: '1h' }, { id: 0, label: 'all' }];
+const WINDOWS = [{ id: 10, label: '10s' }, { id: 60, label: '1m' }, { id: 600, label: '10m' }, { id: 3600, label: '1h' }, { id: 0, label: 'all' }];
+const KINDS = [{ id: 'line' as const, label: 'Line' }, { id: 'hist' as const, label: 'Histogram' }];
+// A reading holds until the next one: the meter never shows the values a sloped segment would claim.
+const STEPPED = uPlot.paths.stepped!({ align: 1 });
+const BARS = uPlot.paths.bars!({ size: [0.92, 100] });
+// uPlot picks the tick step from these (whole seconds: readings come ~3/s) and formats with its
+// template table: [min step, format, year, month, day, hour, min, sec, mode]; day shown on change.
+const TIME_INCRS = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400];
+const TIME_FMT: uPlot.Axis.Values = [
+  [60, '{HH}:{mm}', null, null, '\n{D}.{MM}', null, null, null, 1],
+  [1, '{HH}:{mm}:{ss}', null, null, '\n{D}.{MM}', null, null, null, 1],
+];
 
 const siLabel = (v: number, base: string) => {
   const s = scaleFor(v, base);
@@ -24,42 +37,18 @@ export function Dmm() {
   const ranges = useDev((s) => s.ranges);
   const reading = useDev((s) => s.reading);
   const logging = useDev((s) => s.logging);
-  const hist = useDev((s) => s.hist);
+  const dstats = useDev((s) => s.dstats);
   const f = DMM_FUNCS.find((x) => x.id === dmm.func)!;
-  const [win, setWin] = useState(60);
+  const junctionNeeded = useDev((s) => s.junctionNeeded);
 
-  const ref = ranges[dmm.range] ?? (reading?.v ? Math.abs(reading.v) : 1);
+  const ref = ranges[dmm.range] ?? seenRef(reading?.v ?? 0, dstats);
   const sc = scaleFor(ref, f.base);
-  const fmt = (x: number) => (x / sc.div).toFixed(sc.dp);
+  const fmt = (x: number, extra = 0) => `${(x / sc.div).toFixed(sc.dp + extra)} ${sc.unit}`;
   const ac = dmm.func.endsWith('AC');
 
-  const stats = useMemo(() => {
-    const v = hist.v;
-    if (!v.length) return null;
-    let min = Infinity, max = -Infinity, sum = 0;
-    for (const x of v) { if (x < min) min = x; if (x > max) max = x; sum += x; }
-    return { n: v.length, min, max, avg: sum / v.length, pp: max - min };
-  }, [hist]);
-
-  const opts = useMemo<Omit<uPlot.Options, 'width' | 'height'>>(() => ({
-    legend: { show: false },
-    cursor: { y: false },
-    scales: { x: { time: false, range: (_u, min, max) => (win ? [max - win, max] : [min, max]) } },
-    axes: [
-      { ...AXIS, values: (u, t) => t.map((v) => (v == null ? '' : ago(u.scales.x.max! - v))) },
-      { ...AXIS, size: 70, values: (_u, t) => t.map((v) => (v == null ? '' : `${+(v / sc.div).toFixed(sc.dp)}`)) },
-    ],
-    series: [{}, { stroke: '#3b82f6', width: 1.5, fill: 'rgba(59,130,246,0.08)' }],
-  }), [sc.div, sc.dp, win]);
-
-  const data = useMemo<uPlot.AlignedData>(() => {
-    const cut = win ? Date.now() / 1000 - win : 0;
-    const i = hist.t.findIndex((t) => t >= cut);
-    return i < 0 ? [[], []] : [hist.t.slice(i), hist.v.slice(i)];
-  }, [hist, win]);
-
-  const shown = reading === null ? '- - - -' : reading.over ? 'OL' : reading.blank || reading.v === null ? '----' : fmt(reading.v);
+  const shown = reading === null ? '- - - -' : reading.over ? 'OL' : reading.blank || reading.v === null ? '----' : (reading.v / sc.div).toFixed(sc.dp);
   const live = reading !== null && !reading.blank && !reading.over;
+  const n = dstats.n;
 
   return (
     <div className="grid gap-4 xl:grid-cols-[1fr_320px]">
@@ -92,80 +81,29 @@ export function Dmm() {
             <Meta label="Range" value={ranges.length ? `${dmm.auto ? 'Auto · ' : ''}${ranges[dmm.range] !== undefined ? siLabel(ranges[dmm.range], f.base) : '?'}` : '—'} />
             <Meta label="Secondary" value={reading?.sec != null ? (ac ? siLabel(reading.sec, 'Hz') : String(reading.sec)) : '—'} />
             <Meta label="Resolution" value={`${(10 ** -sc.dp).toFixed(sc.dp)} ${sc.unit}`} />
-            <Meta label="Seq" value={reading ? String(reading.seq) : '—'} />
+            <Meta label="Samples" value={n.toLocaleString('en')} />
           </div>
         </Panel>
 
-        <Panel title="Trend" right={<Seg size="xs" value={win} options={WINDOWS} onChange={setWin} />}>
-          <Plot opts={opts} data={data} className="h-64" />
-        </Panel>
+        <Trend sc={sc} />
 
         <Panel title="Statistics" right={<Btn onClick={() => void io.resetDmmStats()} title="SYST:DMM:STAT:RES">Reset</Btn>}>
-          <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
-            <Stat label="Average" value={stats ? `${fmt(stats.avg)} ${sc.unit}` : '—'} />
-            <Stat label="Minimum" value={stats ? `${fmt(stats.min)} ${sc.unit}` : '—'} tone="text-success" />
-            <Stat label="Maximum" value={stats ? `${fmt(stats.max)} ${sc.unit}` : '—'} tone="text-danger" />
-            <Stat label="Peak to peak" value={stats ? `${fmt(stats.pp)} ${sc.unit}` : '—'} />
-            <Stat label="Count" value={stats ? stats.n.toLocaleString('en') : '—'} />
+          {/* Average and σ resolve below one display count, so they get two extra decimals. */}
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 2xl:grid-cols-6">
+            <Stat label="Average" value={n ? fmt(dstats.mean, 2) : '—'} />
+            <Stat label="Minimum" value={n ? fmt(dstats.min) : '—'} tone="text-success" />
+            <Stat label="Maximum" value={n ? fmt(dstats.max) : '—'} tone="text-danger" />
+            <Stat label="Peak to peak" value={n ? fmt(dstats.max - dstats.min) : '—'} />
+            <Stat label="Std dev σ" value={n ? fmt(stdDev(dstats), 2) : '—'} />
+            <Stat label="Count" value={n ? n.toLocaleString('en') : '—'} />
           </div>
         </Panel>
       </div>
 
       <aside className="space-y-4">
-        <Panel title="Function">
-          <div className="grid grid-cols-3 gap-1.5">
-            {GROUPS.map((g) => {
-              const active = g.includes(dmm.func);
-              const cur = DMM_FUNCS.find((x) => x.id === (active ? dmm.func : g[0]))!;
-              const alt = g.length > 1 ? DMM_FUNCS.find((x) => x.id === g[active ? 1 - g.indexOf(dmm.func) : 1])! : null;
-              return (
-                <button
-                  key={g[0]}
-                  title={alt ? `${cur.label} · click again for ${alt.label}` : cur.label}
-                  // Clicking the active paired button flips V⇄mV / A⇄mA.
-                  onClick={() => patch('dmm', { func: active && alt ? alt.id : g[0], range: 0, auto: true, rel: false, hold: false })}
-                  className={clsx(
-                    'flex min-h-14 flex-col items-center justify-center gap-0.5 rounded-md border font-mono text-sm font-semibold transition-colors',
-                    active ? 'border-accent bg-accent/15 text-fg' : 'border-border bg-canvas text-muted hover:text-fg',
-                  )}
-                >
-                  {cur.short}
-                  {alt && (
-                    <span className="flex gap-1.5 text-xs">
-                      {g.map((id) => {
-                        const unit = DMM_FUNCS.find((x) => x.id === id)!.short.replace(/[⎓~]/, '');
-                        return <span key={id} className={id === dmm.func ? 'font-bold text-accent' : 'font-normal text-muted'}>{unit}</span>;
-                      })}
-                    </span>
-                  )}
-                </button>
-              );
-            })}
-          </div>
-        </Panel>
+        <FunctionPanel />
 
-        <Panel title="Range">
-          <div className="space-y-3">
-            <Toggle label="Auto range" on={dmm.auto} disabled={!ranges.length} onChange={(auto) => patch('dmm', { auto })} />
-            {ranges.length > 0 && (
-              <div className="flex flex-wrap gap-1">
-                {ranges.map((r, i) => (
-                  <button
-                    key={i}
-                    disabled={dmm.auto}
-                    onClick={() => patch('dmm', { range: i })}
-                    className={clsx(
-                      'rounded border px-2 py-1 font-mono text-[11px] disabled:opacity-40',
-                      i === dmm.range ? 'border-accent bg-accent/15 text-fg' : 'border-border text-muted hover:text-fg',
-                    )}
-                  >
-                    {siLabel(r, f.base)}
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
-        </Panel>
+        <RangePanel />
 
         <Panel title="Hold & Relative">
           <div className="space-y-3">
@@ -178,16 +116,31 @@ export function Dmm() {
           </div>
         </Panel>
 
-        {dmm.func === 'TEMP' && (
+        {(dmm.func === 'TEMP' || junctionNeeded) && (
           <Panel title="Thermocouple">
             <div className="space-y-2">
-              <Toggle label="Cold-junction override" on={dmm.cj !== null} onChange={(v) => patch('dmm', { cj: v ? 25 : null })} />
-              {dmm.cj !== null && (
-                <label className="flex items-center justify-between text-xs">
-                  <span className="text-muted">Junction °C</span>
-                  <input type="number" step="0.1" defaultValue={dmm.cj} onBlur={(e) => patch('dmm', { cj: +e.target.value })} className="w-20 rounded border border-border bg-canvas px-2 py-1 text-right font-mono" />
-                </label>
-              )}
+              <label className="flex items-center justify-between text-xs">
+                <span className="text-muted">Manual junction °C</span>
+                <input
+                  key={dmm.cj ?? 'unset'}
+                  type="number"
+                  step="0.1"
+                  min={-50}
+                  max={100}
+                  placeholder="—"
+                  defaultValue={dmm.cj ?? ''}
+                  onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur(); }}
+                  onBlur={(e) => {
+                    const v = e.target.value.trim() === '' ? NaN : +e.target.value;
+                    // Firmware range and step: −50.0 … 100.0 °C in 0.1 °C (else -222).
+                    const cj = Number.isFinite(v) ? Math.min(100, Math.max(-50, Math.round(v * 10) / 10)) : dmm.cj;
+                    if (cj !== dmm.cj) patch('dmm', { cj });
+                    e.target.value = cj === null ? '' : String(cj); // show what was sent (clamped/rounded)
+                  }}
+                  className="w-20 rounded border border-border bg-canvas px-2 py-1 text-right font-mono"
+                />
+              </label>
+              <p className="text-[11px] text-muted">Entering a value switches the meter to this manual junction. Back to the built-in sensor: MENU → Measurement → Junction source on the meter.</p>
             </div>
           </Panel>
         )}
@@ -195,6 +148,211 @@ export function Dmm() {
         <LogPanel />
       </aside>
     </div>
+  );
+}
+
+type Scale = ReturnType<typeof scaleFor>;
+
+function Trend({ sc }: { sc: Scale }) {
+  const hist = useDev((s) => s.hist);
+  const dstats = useDev((s) => s.dstats);
+  const center = useDev((s) => s.reading?.v ?? 0);
+  const func = useDev((s) => s.dmm.func);
+  const [kind, setKind] = useState<'line' | 'hist'>('line');
+  const [win, setWin] = useState(60);
+  const [yMan, setYMan] = useState<{ func: DmmFunc; lo: number; hi: number } | null>(null);
+  const manual = yMan?.func === func ? yMan : null; // units change with the function
+  const now = useNow(1000); // the axis keeps rolling while HOLD stops new readings
+
+  // A bounded window starts at the first reading while it fills (the trace grows rightward),
+  // then rolls with the clock.
+  const end = Math.max(now, hist.t.at(-1) ?? 0), t0 = hist.t[0] ?? end;
+  const x0 = win ? Math.max(t0, end - win) : t0, x1 = win ? x0 + win : Math.max(end, t0 + 10);
+  const width = dstats.lsd || sc.lsd;
+  const bins = useMemo(() => (kind === 'hist' ? histogram(dstats.counts, width, center) : []), [kind, dstats, width, center]);
+  const hdp = Math.max(0, Math.round(-Math.log10(width / sc.div)));
+
+  // Rebuilt only when the axis format changes: `sc` is a new object on every reading.
+  const opts = useMemo(() => trendOpts(kind, sc, manual, hdp), [kind, sc.div, sc.dp, sc.lsd, manual, hdp]);
+  const data = useMemo<uPlot.AlignedData>(
+    () => (kind === 'hist'
+      ? [bins.map((b) => b.value), bins.map((b) => (b.kind === 'in' ? b.count : null)), bins.map((b) => (b.kind === 'in' ? null : b.count))]
+      // The last reading holds until now: a stepped line ends at its last point, so without this tail
+      // HOLD or a slow function (large CAP) scrolls the trace out of a short window.
+      : hist.v.at(-1) != null && end > hist.t.at(-1)! ? [[...hist.t, end], [...hist.v, hist.v.at(-1)!]] : [hist.t, hist.v]),
+    [kind, bins, hist, end],
+  );
+
+  const setY = (lo: number, hi: number) => { if (lo < hi) setYMan({ func, lo, hi }); };
+  return (
+    <Panel
+      title={kind === 'line' ? 'Trend' : 'Distribution'}
+      right={
+        <div className="flex flex-wrap justify-end gap-1.5">
+          <Seg size="xs" value={kind} options={KINDS} onChange={setKind} />
+          {kind === 'line' && <Seg size="xs" value={win} options={WINDOWS} onChange={setWin} />}
+        </div>
+      }
+    >
+      <Plot opts={opts} data={data} x={kind === 'line' ? [x0, x1] : undefined} className="h-64" />
+      {kind === 'line' ? (
+        <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2">
+          <div className="w-36"><Toggle label="Auto Y" on={!manual} onChange={(auto) => setYMan(auto ? null : { func, ...range(yAuto(...visibleExtent(hist, x0, x1), sc.lsd)) })} /></div>
+          {manual && <YInput label="Min" v={manual.lo} sc={sc} onCommit={(lo) => setY(lo, manual.hi)} />}
+          {manual && <YInput label="Max" v={manual.hi} sc={sc} onCommit={(hi) => setY(manual.lo, hi)} />}
+        </div>
+      ) : (
+        <p className="mt-3 text-[11px] text-muted">{dstats.n.toLocaleString('en')} readings since Reset, one bar per display count{bins.some((b) => b.kind !== 'in') ? ' · amber: beyond ±100 counts' : ''}.</p>
+      )}
+    </Panel>
+  );
+}
+
+const yAuto = (mn: number, mx: number, lsd: number) => uPlot.rangeNum(...yFloor(mn, mx, lsd), 0.1, true) as [number, number];
+
+// Line: time axis, x window set by Plot's `x`; Histogram: ordinal x over the bin values.
+function trendOpts(kind: 'line' | 'hist', sc: Scale, manual: { lo: number; hi: number } | null, hdp: number): Omit<uPlot.Options, 'width' | 'height'> {
+  const base = { legend: { show: false }, cursor: { y: false, drag: { x: false } } };
+  if (kind === 'hist') return {
+    ...base,
+    scales: { x: { time: false, distr: 2 }, y: { range: { min: { pad: 0, soft: 0, mode: 1 }, max: { pad: 0.1, soft: 0, mode: 3 } } } },
+    axes: [
+      {
+        ...AXIS,
+        // Edge bins (series 2) hold everything beyond the window: ≤ / ≥ their value.
+        values: (u, t) => t.map((v) => {
+          const i = u.data[0].indexOf(v), edge = u.data[2][i] != null ? (i === 0 ? '≤' : '≥') : '';
+          return edge + (v / sc.div).toFixed(hdp);
+        }),
+      },
+      { ...AXIS, size: 56 },
+    ],
+    series: [{}, { stroke: '#3b82f6', fill: 'rgba(59,130,246,0.6)', paths: BARS, points: { show: false } }, { stroke: '#f59e0b', fill: 'rgba(245,158,11,0.7)', paths: BARS, points: { show: false } }],
+  };
+  return {
+    ...base,
+    scales: {
+      x: { time: true, auto: false },
+      y: { range: manual ? [manual.lo, manual.hi] : (_u, mn, mx) => yAuto(mn, mx, sc.lsd) },
+    },
+    axes: [
+      { ...AXIS, space: 70, incrs: TIME_INCRS, values: TIME_FMT },
+      { ...AXIS, size: 70, values: (_u, t) => t.map((v) => (v == null ? '' : (v / sc.div).toFixed(sc.dp))) },
+    ],
+    series: [{}, { stroke: '#3b82f6', width: 1.5, fill: 'rgba(59,130,246,0.08)', paths: STEPPED, points: { show: false } }],
+  };
+}
+
+const range = ([lo, hi]: [number, number]) => ({ lo, hi });
+
+// Min/max of the readings inside [x0, x1]: what Auto Y is showing when the user switches to manual.
+function visibleExtent(hist: { t: number[]; v: (number | null)[] }, x0: number, x1: number): [number, number] {
+  let lo = Infinity, hi = -Infinity;
+  hist.t.forEach((t, i) => {
+    const v = hist.v[i];
+    if (t >= x0 && t <= x1 && v != null) { lo = Math.min(lo, v); hi = Math.max(hi, v); }
+  });
+  return [lo, hi];
+}
+
+// Typed in the display unit; an unparseable or crossing value snaps back to the current one.
+function YInput({ label, v, sc, onCommit }: { label: string; v: number; sc: Scale; onCommit: (x: number) => void }) {
+  const shown = (v / sc.div).toFixed(sc.dp);
+  return (
+    <label className="flex items-center gap-2 text-xs">
+      <span className="text-muted">{label}</span>
+      <input
+        key={shown}
+        type="number"
+        step={10 ** -sc.dp}
+        defaultValue={shown}
+        onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur(); }}
+        onBlur={(e) => {
+          const x = e.target.value.trim() === '' ? NaN : +e.target.value * sc.div;
+          if (Number.isFinite(x)) onCommit(x);
+          e.target.value = shown;
+        }}
+        className="w-24 rounded border border-border bg-canvas px-2 py-1 text-right font-mono"
+      />
+      <span className="text-muted">{sc.unit}</span>
+    </label>
+  );
+}
+
+function useNow(ms: number) {
+  const [t, setT] = useState(() => Date.now() / 1000);
+  useEffect(() => {
+    const id = setInterval(() => setT(Date.now() / 1000), ms);
+    return () => clearInterval(id);
+  }, [ms]);
+  return t;
+}
+
+function FunctionPanel() {
+  const func = useDev((s) => s.dmm.func);
+  const junctionNeeded = useDev((s) => s.junctionNeeded);
+  const patch = useDev((s) => s.patch);
+  return (
+    <Panel title="Function">
+      <div className="grid grid-cols-3 gap-1.5">
+        {GROUPS.map((g) => {
+          const active = g.includes(func);
+          const cur = DMM_FUNCS.find((x) => x.id === (active ? func : g[0]))!;
+          const next = active && g.length > 1 ? g[1 - g.indexOf(func)] : g[0];
+          return (
+            <button
+              key={g[0]}
+              title={g.length > 1 ? `${cur.label} · click again for ${DMM_FUNCS.find((x) => x.id === g[1 - g.indexOf(cur.id)])!.label}` : cur.label}
+              onClick={() => patch('dmm', { func: next, range: 0, auto: true, rel: false, hold: false })}
+              className={clsx(
+                'flex min-h-14 flex-col items-center justify-center gap-0.5 rounded-md border font-mono text-sm font-semibold transition-colors',
+                active ? 'border-accent bg-accent/15 text-fg' : 'border-border bg-canvas text-muted hover:text-fg',
+              )}
+            >
+              {g.length > 1 ? cur.short.replace(/[⎓~]/, '') : cur.short}
+              {g.length > 1 && (
+                <span className="flex gap-1.5 text-xs">
+                  {g.map((id) => <span key={id} className={id === func ? 'font-bold text-accent' : 'font-normal text-muted'}>{id.endsWith('AC') ? 'AC' : 'DC'}</span>)}
+                </span>
+              )}
+            </button>
+          );
+        })}
+      </div>
+      {junctionNeeded && (
+        <p className="mt-2 text-[11px] text-amber">Type K needs a cold junction: enter a manual junction below, or pick MCU in MENU → Measurement → Junction source on the meter. Then press °C again.</p>
+      )}
+    </Panel>
+  );
+}
+
+function RangePanel() {
+  const dmm = useDev((s) => s.dmm);
+  const ranges = useDev((s) => s.ranges);
+  const patch = useDev((s) => s.patch);
+  const base = DMM_FUNCS.find((x) => x.id === dmm.func)!.base;
+  if (!ranges.length) return null; // RANG:LIST? is empty for continuity, diode and Type K: nothing to choose
+  return (
+    <Panel title="Range">
+      <div className="space-y-3">
+        <Toggle label="Auto range" on={dmm.auto} onChange={(auto) => patch('dmm', { auto })} />
+        <div className="flex flex-wrap gap-1">
+          {ranges.map((r, i) => (
+            <button
+              key={i}
+              disabled={dmm.auto}
+              onClick={() => patch('dmm', { range: i })}
+              className={clsx(
+                'rounded border px-2 py-1 font-mono text-[11px] disabled:opacity-40',
+                i === dmm.range ? 'border-accent bg-accent/15 text-fg' : 'border-border text-muted hover:text-fg',
+              )}
+            >
+              {siLabel(r, base)}
+            </button>
+          ))}
+        </div>
+      </div>
+    </Panel>
   );
 }
 
@@ -216,11 +374,6 @@ function LogPanel() {
       </div>
     </Panel>
   );
-}
-
-function ago(s: number) {
-  if (s < 0.5) return 'now';
-  return s < 120 ? `-${Math.round(s)}s` : `-${Math.round(s / 60)}m`;
 }
 
 function Badge({ tone, pulse, children }: { tone: 'muted' | 'accent' | 'amber' | 'danger' | 'success'; pulse?: boolean; children: React.ReactNode }) {

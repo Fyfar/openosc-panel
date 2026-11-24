@@ -154,10 +154,16 @@ const PREFIX: [number, string][] = [[1e6, 'M'], [1e3, 'k'], [1, ''], [1e-3, 'm']
 const DIGITS = 5;
 
 // DMM display prefix and decimals from a reference magnitude (the active range's maximum).
+// Scale reference when a function has no ranges (continuity, diode): the largest |reading| so far,
+// so the scale only coarsens instead of flipping prefix/decimals on every reading.
+export const seenRef = (v: number, s: { n: number; min: number; max: number }) =>
+  Math.max(Math.abs(v), s.n ? Math.max(Math.abs(s.min), Math.abs(s.max)) : 0) || 1;
+
 export function scaleFor(ref: number, base: string) {
-  if (base === '°C') return { div: 1, unit: '°C', dp: 1 };
+  if (base === '°C') return { div: 1, unit: '°C', dp: 1, lsd: 0.1 };
   const r = Math.abs(ref) || 1;
   const [div, p] = PREFIX.find(([d]) => r / d >= 0.999) ?? PREFIX.at(-1)!;
   const digits = base === 'F' ? 4 : DIGITS; // capacitance ranges are 4-digit (9.999 nF … 99.99 mF) on both models
-  return { div, unit: p + base, dp: Math.max(0, digits - 1 - Math.floor(Math.log10(r / div) + 1e-9)) };
+  const dp = Math.max(0, digits - 1 - Math.floor(Math.log10(r / div) + 1e-9));
+  return { div, unit: p + base, dp, lsd: div * 10 ** -dp };
 }

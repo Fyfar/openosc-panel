@@ -1,9 +1,10 @@
 // Self-check for the pure logic: typed frequency, DMM scaling, Bode maths/plan/restore,
 // scope measurements and generator command order. Run: `npm run check`.
 import assert from 'node:assert/strict';
-import { bodePlan, parseHz, scaleFor, VDIV_MV } from '../src/device.ts';
-import { gainPhase, measure, type Frame } from '../src/dsp.ts';
+import { bodePlan, parseHz, scaleFor, seenRef, VDIV_MV } from '../src/device.ts';
+import { addStat, emptyStats, gainPhase, histogram, measure, stdDev, yFloor, type Frame } from '../src/dsp.ts';
 import { pointCmds, rerange, scopeRestore, SWEEP_SCOPE } from '../src/io/bode.ts';
+import { dmmDiff } from '../src/io/dmm.ts';
 import { genDiff } from '../src/io/gen.ts';
 import { unsavedData, useDev } from '../src/store.ts';
 
@@ -29,7 +30,54 @@ for (const [ref, base, unit, dp] of [
 ] as const) {
   const s = scaleFor(ref, base);
   assert.deepEqual([s.unit, s.dp], [unit, dp], `scaleFor(${ref}, ${base})`);
+  near(s.lsd, s.div * 10 ** -dp, 1e-18, `scaleFor(${ref}, ${base}).lsd`);
   checks++;
+}
+
+// --- seenRef: no ranges (continuity, diode) → scale from the largest reading so far, never shrinking
+assert.equal(seenRef(0.2, { n: 3, min: 0, max: 5 }), 5, 'seenRef keeps the largest seen');
+assert.equal(seenRef(-7, { n: 3, min: 0, max: 5 }), 7, 'seenRef grows with |v|');
+assert.equal(seenRef(0, { n: 0, min: Infinity, max: -Infinity }), 1, 'seenRef with nothing seen');
+checks += 3;
+
+// --- DMM running stats: match a full rescan, counts keyed by display count -----------------
+{
+  const vals = [1.2344, 1.2345, 1.2345, 1.2346, 1.2345, 1.2391], lsd = 1e-4;
+  let st = emptyStats();
+  for (const v of vals) st = addStat(st, v, lsd);
+  const mean = vals.reduce((a, b) => a + b) / vals.length;
+  near(st.mean, mean, 1e-12, 'stats mean');
+  near(stdDev(st), Math.sqrt(vals.reduce((a, v) => a + (v - mean) ** 2, 0) / vals.length), 1e-12, 'stats σ (population)');
+  assert.deepEqual([st.n, st.min, st.max, st.counts.size], [6, 1.2344, 1.2391, 4], 'stats n/min/max/distinct');
+  checks++;
+  // 1.2345 ×3 is the centre, ±10 bins shown; 1.2391 is 46 counts out, still inside ±100.
+  const bins = histogram(st.counts, lsd);
+  const at = (v: number) => bins.find((b) => Math.round(b.value / lsd) === Math.round(v / lsd));
+  assert.deepEqual([at(1.2345)?.count, at(1.2391)?.count, bins.reduce((a, b) => a + b.count, 0)], [3, 1, 6], 'histogram counts');
+  near(bins[0].value, 1.2335, 1e-9, 'histogram left edge = centre − 10 counts');
+  st = addStat(st, 1.3, lsd); // 655 counts out: an over-range edge bin, the window doesn't stretch
+  const wide = histogram(st.counts, lsd);
+  assert.deepEqual([wide.at(-1)?.kind, wide.at(-1)?.count, wide.length], ['over', 1, bins.length + 1], 'histogram over-range bin');
+  near(wide.at(-1)!.value - wide.at(-2)!.value, lsd, 1e-12, 'over bin sits one step past the window (unique ordinal x)');
+  assert.equal(histogram(new Map(), lsd, 5).length, 21, 'empty histogram frames the live value');
+  checks += 4;
+}
+
+// --- dmmDiff cold junction: a value selects Manual on the meter; NONE (back to DC mV) is never sent
+{
+  const base = useDev.getState().dmm;
+  assert.deepEqual(dmmDiff({ ...base, func: 'TEMP', cj: null }, { ...base, func: 'TEMP', cj: 21.5 }), ['SYST:DMM:TEMP:CJUN 21.5'], 'cj set');
+  assert.deepEqual(dmmDiff({ ...base, func: 'TEMP', cj: 21.5 }, { ...base, func: 'TEMP', cj: null }), [], 'cj cleared sends nothing');
+  checks += 2;
+}
+
+// --- yFloor: ±20-count floor on a steady reading, real spread kept as is --------------------
+{
+  const [lo, hi] = yFloor(1.2345, 1.2346, 1e-4);
+  near(hi - lo, 40e-4, 1e-12, 'yFloor on a steady reading');
+  assert.deepEqual(yFloor(0, 1, 1e-4), [0, 1], 'yFloor keeps a real spread');
+  assert.deepEqual(yFloor(Infinity, -Infinity, 1e-4), [-20e-4, 20e-4], 'yFloor with no data');
+  checks += 3;
 }
 
 // --- bodePlan: log-spaced, both ends included ---------------------------------------------
