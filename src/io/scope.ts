@@ -1,6 +1,6 @@
 // Oscilloscope: settings read/write, windowed frame fetch, the live loop, run control, CSV.
 import { DESKTOP_FW, fwAtLeast, TIMEBASES, VDIV_MV } from '../device';
-import type { Frame, Meas } from '../dsp';
+import type { Frame, Meas, RecordWindow } from '../dsp';
 import { sleep } from '../link';
 import type { State } from '../store';
 import { alive, ctl, download, errText, fail, get, link, nearest, now, num, on, remote, set } from './core';
@@ -9,9 +9,13 @@ type Scope = State['scope'];
 type Status = State['scopeStatus'];
 
 // meas: the device's own readouts per channel (WAV:MEAS?, firmware ≥ 0.21.9), null before that.
-export const scopeData = { frames: [] as Frame[], meas: [null, null] as (Meas | null)[], version: 0 };
+// fft: every sample of one channel's screen window, for the spectrum; null with FFT off.
+export const scopeData = { frames: [] as Frame[], meas: [null, null] as (Meas | null)[], fft: null as Frame | null, version: 0 };
 const LIVE_PTS = 1024; // ~screen width
-const FFT_PTS = 2048; // the device's largest FFT; power of two
+// A full-window read takes 44–115 ms; one per frame cut 26 fps to 8 (ZT703S, 0.21.14).
+const FFT_MS = 500;
+// ponytail: a longer screen window ("Higher sample rate" memory) uses its middle: all of 512K takes ~0.9 s a read.
+const FFT_MAX = 65536;
 const MEAS_MS = 300;
 // WAV:FRAM? waits for a fresh record and holds the link meanwhile; longer records use the
 // per-channel path, whose waits end after 1 s, so a settings change never queues behind a record.
@@ -149,14 +153,20 @@ function parsePre(text: string): Pre {
 
 function toFrame(ch: 0 | 1, seq: number, p: Pre, b: Uint8Array): Frame {
   const volt = (x: number) => (x - p.yref - p.zero) * p.yinc;
-  if (p.type !== 1) return { ch, seq, xinc: p.xinc, xorig: p.xorig, volts: Float32Array.from(b, volt) };
+  const head = { ch, seq, xinc: p.xinc, xorig: p.xorig, scale: { yinc: p.yinc, zero: p.zero, yref: p.yref } };
+  if (p.type !== 1) {
+    // A plain loop: Float32Array.from(b, volt) takes 8 ms on a full 65 536-sample window, this 0.3 ms.
+    const volts = new Float32Array(b.length);
+    for (let i = 0; i < b.length; i++) volts[i] = volt(b[i]);
+    return { ...head, volts };
+  }
   const n = b.length >> 1, lo = new Float32Array(n), hi = new Float32Array(n), volts = new Float32Array(n);
   for (let i = 0; i < n; i++) {
     lo[i] = volt(b[2 * i]);
     hi[i] = volt(b[2 * i + 1]);
     volts[i] = (lo[i] + hi[i]) / 2;
   }
-  return { ch, seq, xinc: p.xinc, xorig: p.xorig, volts, lo, hi };
+  return { ...head, volts, lo, hi };
 }
 
 // WAV:FRAM? payload: "seq,count\n", one "CHANn,<preamble of the points sent>\n" per channel, then
@@ -214,7 +224,7 @@ export function fetchChannel(i: 0 | 1, pts: number, timeout: number, full = fals
     const [data, seq] = await run([`WAV:STAR ${w.first + 1}`, `WAV:STOP ${w.end}`, `WAV:POIN ${n}`, ...modeCmd(pk), 'WAV:DATA?', 'WAV:SEQ?'], timeout);
     if (!data.bin) throw new Error(`WAV:DATA? gave "${data.text}"`);
     const p = { ...rec, type: pk ? 1 : 0, xinc: rec.xinc * stride, xorig: rec.xorig + rec.xinc * w.first };
-    return toFrame(i, +(seq.text ?? 0), p, data.bin);
+    return { ...toFrame(i, +(seq.text ?? 0), p, data.bin), win: { ...w, interval: rec.xinc } };
   });
 }
 
@@ -234,15 +244,15 @@ function geoKey() {
 const recordMs = (geo: Geo) => 1000 * Math.max(geo.samples * geo.interval, 10 * TIMEBASES[get().scope.tb]);
 
 // Both channels of one acquisition in one block (firmware ≥ 0.21.9).
-async function fetchFrame(geo: Geo, pts: number, peak: boolean): Promise<Frame[]> {
+async function fetchFrame(geo: Geo): Promise<Frame[]> {
   const w = screenWindow(geo.samples, geo.interval, geo.origin0, get().scope);
-  const stride = strideOf(w.end - w.first, pts), pk = peak && stride > 1;
+  const pk = strideOf(w.end - w.first, LIVE_PTS) > 1;
   const timeout = 1500 + recordMs(geo); // a fresh record: the firmware waits 1 s + its duration
-  const [r] = await link.run([`WAV:STAR ${w.first + 1}`, `WAV:STOP ${w.end}`, `WAV:POIN ${pts}`, ...modeCmd(pk), 'WAV:FRAM?'], timeout);
+  const [r] = await link.run([`WAV:STAR ${w.first + 1}`, `WAV:STOP ${w.end}`, `WAV:POIN ${LIVE_PTS}`, ...modeCmd(pk), 'WAV:FRAM?'], timeout);
   if (!r.bin) throw new Error(`WAV:FRAM? gave "${r.text}"`);
   const frames = parseFrame(r.bin);
   if (frames.length) geo.origin0 = frames[0].xorig - geo.interval * w.first; // exact preamble: origin0 + interval·first
-  return frames;
+  return frames.map((f) => ({ ...f, win: { ...w, interval: geo.interval } }));
 }
 
 // WAV:MEAS? fields (SCPI_DESKTOP.md): freq, Vpp, RMS, period, mean, min, max, AC RMS, duty, rising
@@ -268,14 +278,15 @@ async function measureLive(chans: (0 | 1)[]) {
 
 type Live = {
   ready: boolean; lastSeq: number; seen: number; missed: number; winN: number; winT: number;
-  geo: Geo | null; measDue: number; how: string;
+  geo: Geo | null; measDue: number; how: string; fftCh: number; fftDue: number;
 };
 
 export async function scopeLoop(id: number) {
   scopeData.frames = []; // don't show a previous session's trace as live
   scopeData.meas = [null, null];
+  scopeData.fft = null;
   scopeData.version++;
-  const st: Live = { ready: false, lastSeq: NaN, seen: 0, missed: 0, winN: 0, winT: now(), geo: null, measDue: 0, how: '' };
+  const st: Live = { ready: false, lastSeq: NaN, seen: 0, missed: 0, winN: 0, winT: now(), geo: null, measDue: 0, how: '', fftCh: -1, fftDue: 0 };
   try {
     while (alive(id)) {
       if (paused) { await sleep(50); continue; }
@@ -313,26 +324,27 @@ async function livePass(st: Live) {
   // Still inside the held-frame window: device measurements and settings reads are cheap here.
   if (got.length && desktop() && now() > st.measDue) { await measureLive(chans); st.measDue = now() + MEAS_MS; }
   if (now() > cfgDue) { await readScope(); cfgDue = now() + 500; }
-  if (got.length && got.length === chans.length) publish(got, st);
+  const complete = got.length > 0 && got.length === chans.length;
+  if (complete) publish(got, st);
+  await readSpectrum(st, complete ? got : []);
   if (!chans.length) await sleep(300);
   if (get().scopeStatus.stat === 'STOP') await sleep(250); // nothing new is coming
 }
 
-// FFT needs evenly spaced samples (and up to 2048 of them); otherwise PEAK keeps glitches visible.
+// PEAK keeps glitches visible in the decimated trace (the FFT reads its own full-rate window).
 async function fetchLive(st: Live, chans: (0 | 1)[]): Promise<Frame[]> {
-  const fft = get().fft, pts = fft ? FFT_PTS : LIVE_PTS, peak = !fft;
   // A record short of the configured depth isn't this plan's geometry: Roll right after a change grows
   // from ~800 samples (measured 0.21.9), or it is a capture from before the change.
   const g = st.geo, key = geoKey(); // the settings this pass reads under, before any edit lands mid-pass
   if (desktop() && g && g.key === key && g.samples === get().scope.mdepth && recordMs(g) <= FRAME_MAX_MS) {
-    st.how = `FRAM ${pts} ${peak ? 'peak' : 'pts'}/ch`;
-    return fetchFrame(g, pts, peak);
+    st.how = `FRAM ${LIVE_PTS} peak/ch`;
+    return fetchFrame(g);
   }
-  st.how = `${pts} ${peak && desktop() ? 'peak' : 'pts'}/ch`;
+  st.how = `${LIVE_PTS} ${desktop() ? 'peak' : 'pts'}/ch`;
   const got: Frame[] = [];
   for (const i of chans) {
     if (paused) break;
-    got.push(await fetchChannel(i, pts, 1500, false, peak));
+    got.push(await fetchChannel(i, LIVE_PTS, 1500, false, true));
   }
   st.geo = desktop() && lastRecord ? { ...lastRecord, key } : null;
   return got;
@@ -348,6 +360,44 @@ function publish(got: Frame[], st: Live) {
   }
   st.lastSeq = seq;
   st.winN++;
+}
+
+// The middle FFT_MAX samples of a window, or all of it.
+function fftWindow(w: RecordWindow): RecordWindow {
+  const first = w.first + (Math.max(0, w.end - w.first - FFT_MAX) >> 1);
+  return { ...w, first, end: Math.min(w.end, first + FFT_MAX) };
+}
+
+const readKey = (f: Frame, win: RecordWindow) => JSON.stringify([f.ch, f.seq, win, f.scale]);
+
+// Due 500 ms after the last attempt, at once for another channel; never for a stopped, unchanged read.
+function spectrumDue(st: Live, live: Frame, win: RecordWindow) {
+  if (live.ch === st.fftCh && now() < st.fftDue) return false;
+  const have = scopeData.fft;
+  return get().scopeStatus.stat !== 'STOP' || !have?.win || readKey(have, have.win) !== readKey(live, win);
+}
+
+// The spectrum's own data, read from the record just published. Window, interval and scaling come
+// from that frame, never from another WAV:PRE? (it would release the record). WAV:POIN 0 sends raw
+// samples whatever the points mode. A reply from another record or of another length is dropped.
+async function readSpectrum(st: Live, got: Frame[]) {
+  const { fft, fftSrc } = get();
+  if (!fft) { scopeData.fft = null; return; }
+  const live = got.find((f) => f.ch === fftSrc) ?? got[0];
+  if (paused || !live?.win || !live.scale) return;
+  const win = fftWindow(live.win);
+  if (!spectrumDue(st, live, win)) return;
+  st.fftCh = live.ch;
+  st.fftDue = now() + FFT_MS; // from the attempt: a dropped or failed read can't repeat every pass
+  const [data, seq] = await link.run(
+    [`WAV:SOUR CHAN${live.ch + 1}`, `WAV:STAR ${win.first + 1}`, `WAV:STOP ${win.end}`, 'WAV:POIN 0', 'WAV:DATA?', 'WAV:SEQ?'], 1500);
+  const bytes = data.bin, points = win.end - win.first;
+  if (bytes?.length !== points || Number(seq.text) !== live.seq) return;
+  const xorig = live.xorig + (win.first - live.win.first) * win.interval;
+  scopeData.fft = {
+    ...toFrame(live.ch, live.seq, { type: 0, points, xinc: win.interval, xorig, ...live.scale }, bytes),
+    win, screen: live.win.end - live.win.first, clipped: bytes.includes(0) || bytes.includes(255),
+  };
 }
 
 // Suspends live frame reads (the loop keeps running) for work that must not race them.

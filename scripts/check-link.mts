@@ -157,13 +157,15 @@ let checks = 0;
   checks += 4;
 }
 
-// --- scope loop: 0.21.9 reads both channels with one WAV:FRAM? (PEAK when decimated, STR for the
-// FFT) plus the device's readouts; 0.21.7 never gets a command it doesn't know (-113)
+// --- scope loop: 0.21.9 reads both channels with one WAV:FRAM? (PEAK when decimated) plus the device's readouts; 0.21.7 never gets a command it doesn't know (-113)
 function fakeScope(samples = 65536) { // samples < ACQ:MDEP?: a Roll record still filling
-  const w = { star: 1, stop: 0, poin: 0, peak: false, seq: 0 };
+  const w = { star: 1, stop: 0, poin: 0, peak: false, seq: 0, src: 'CHAN1' };
+  // Full-window reads (WAV:DATA? with WAV:POIN 0): each is logged; the knobs spoil its reply.
+  const reads: { at: number; src: string; star: number; stop: number }[] = [];
+  const knob = { seqSkew: 0, short: 0, rail: 128 };
   const trig = 32768; // 100 MSa/s → 1e-8 s; 20 µs/div → 20 000-sample window
   const cfg: Record<string, string> = {
-    '*IDN?': IDN, 'TIM:SCAL?': '2e-5', 'ACQ:SRAT?': '1e8', 'ACQ:MDEP?': '65536', 'TRIG:POS?': '50',
+    '*IDN?': IDN, 'TIM:SCAL?': '2e-5', 'ACQ:SRAT?': '1e8', 'ACQ:MDEP?': String(Math.max(samples, 65536)), 'TRIG:POS?': '50',
     'CHAN1:DISP?': '1', 'CHAN2:DISP?': '1', 'CHAN1:PROB?': '1', 'CHAN2:PROB?': '1', 'CHAN1:SCAL?': '1', 'CHAN2:SCAL?': '1',
     'CHAN1:OFFS?': '0', 'CHAN2:OFFS?': '0', 'TRIG:STAT?': 'TD', 'TRIG:SWE?': 'AUTO', 'TRIG:EDGE:SOUR?': 'CHAN1',
     'CHAN1:FCNT?': '1000.5', 'CHAN2:FCNT?': 'NAN', 'ACQ:INT:STAT?': '0,12', 'ACQ:PROG?': '0,7,0,0',
@@ -178,22 +180,31 @@ function fakeScope(samples = 65536) { // samples < ACQ:MDEP?: a Roll record stil
     const n = (w.stop || samples) - w.star + 1, stride = w.poin && n > w.poin ? Math.ceil(n / w.poin) : 1;
     return { n: Math.ceil(n / stride), stride, peak: w.peak && w.poin > 0 };
   };
+  const data = () => {
+    const p = points(), bytes = new Uint8Array(p.n * (p.peak ? 2 : 1) - (w.poin ? 0 : knob.short)).fill(128);
+    if (!w.poin) { bytes[7] = knob.rail; reads.push({ at: performance.now(), src: w.src, star: w.star, stop: w.stop }); }
+    return block(bytes);
+  };
+  const frame = () => {
+    const p = points(), pre = `0,${p.peak ? 1 : 0},${p.n},1,${1e-8 * p.stride},${1e-8 * (w.star - 1 - trig)},0,0.01,0,128`;
+    const shown = [1, 2].filter((n) => cfg[`CHAN${n}:DISP?`] === '1');
+    if (cfg['TRIG:STAT?'] !== 'STOP') w.seq++; // a held record keeps its sequence
+    const head = enc.encode(`${w.seq},${shown.length}\n${shown.map((n) => `CHAN${n},${pre}\n`).join('')}`);
+    return block(Uint8Array.from([...head, ...new Uint8Array(shown.length * p.n * (p.peak ? 2 : 1)).fill(128)]));
+  };
+  const setting: Record<string, (arg: string) => void> = {
+    'WAV:SOUR': (a) => (w.src = a), 'WAV:STAR': (a) => (w.star = +a), 'WAV:STOP': (a) => (w.stop = +a),
+    'WAV:POIN': (a) => (w.poin = +a), 'WAV:POIN:MODE': (a) => (w.peak = a === 'PEAK'),
+  };
+  const wave: Record<string, () => Answer> = {
+    'WAV:SEQ?': () => String(w.seq + (w.poin ? 0 : knob.seqSkew)), 'WAV:DATA?': data, 'WAV:FRAM?': frame,
+  };
   const dev = fakePort((c) => {
     const [cmd, arg] = c.split(' ');
-    if (cmd === 'WAV:STAR') w.star = +arg;
-    else if (cmd === 'WAV:STOP') w.stop = +arg;
-    else if (cmd === 'WAV:POIN') w.poin = +arg;
-    else if (cmd === 'WAV:POIN:MODE') w.peak = arg === 'PEAK';
-    else if (c === 'WAV:SEQ?') return String(w.seq);
-    else if (c === 'WAV:DATA?') { const p = points(); return block(new Uint8Array(p.n * (p.peak ? 2 : 1)).fill(128)); }
-    else if (c === 'WAV:FRAM?') {
-      const p = points(), pre = `0,${p.peak ? 1 : 0},${p.n},1,${1e-8 * p.stride},${1e-8 * (w.star - 1 - trig)},0,0.01,0,128`;
-      const head = enc.encode(`${++w.seq},2\nCHAN1,${pre}\nCHAN2,${pre}\n`);
-      return block(Uint8Array.from([...head, ...new Uint8Array(2 * p.n * (p.peak ? 2 : 1)).fill(128)]));
-    }
-    return cfg[c] ?? (c.includes('?') ? 'NAN' : null);
+    setting[cmd]?.(arg);
+    return wave[c]?.() ?? cfg[c] ?? (c.includes('?') ? 'NAN' : null);
   });
-  return { dev, cfg };
+  return { dev, cfg, reads, knob };
 }
 
 // The firmware rule a second WAV:PRE? on a channel breaks: it releases that channel's record and
@@ -233,10 +244,13 @@ async function runScope(fw: string, fft: boolean, samples?: number) {
   assert.equal(sent.at(-1), 'WAV:SNAP', 'held frame released on stop');
   checks += 9;
 
+  const scale = { yinc: 0.01, zero: 0, yref: 128 }, win = { first: 22768, end: 42768, interval: 1e-8 };
+  assert.deepEqual(scopeData.frames.map((x) => [x.win, x.scale]), [[win, scale], [win, scale]], 'WAV:FRAM? frames say where they sit and how they scale');
+
   const fftSent = await runScope('0.21.9', true);
-  assert.ok(fftSent.includes('WAV:POIN 2048') && fftSent.includes('WAV:POIN:MODE STR') && !fftSent.includes('WAV:POIN:MODE PEAK'), 'FFT: 2048 evenly spaced samples');
-  assert.ok(!scopeData.frames[0].lo);
-  checks += 2;
+  assert.ok(fftSent.includes('WAV:POIN 1024') && fftSent.includes('WAV:POIN:MODE PEAK') && !fftSent.includes('WAV:POIN 2048'), 'FFT leaves the trace decimation alone');
+  assert.ok(scopeData.frames[0].lo && scopeData.frames[1].hi, 'trace frames keep their envelope with FFT on');
+  checks += 3;
 
   const filling = await runScope('0.21.9', false, 788);
   assert.ok(!filling.includes('WAV:FRAM?') && filling.includes('WAV:DATA?'), 'a record short of ACQ:MDEP? never sets the WAV:FRAM? geometry');
@@ -247,8 +261,110 @@ async function runScope(fw: string, fft: boolean, samples?: number) {
   assert.ok(scopeData.frames.length === 2 && old.includes('WAV:DATA?'), '0.21.7: per-channel reads');
   assert.ok(!old.some((c) => /FRAM|POIN:MODE|MEAS\?/.test(c)), '0.21.7 never gets 0.21.9 commands');
   assert.equal(scopeData.meas[0], null, '0.21.7: readouts computed in the browser');
-  checks += 3;
+  assert.deepEqual(scopeData.frames[0].win, { first: 22768, end: 42768, interval: 1e-8 }, 'per-channel frames say where they sit');
+  assert.deepEqual(scopeData.frames[0].scale, { yinc: 0.01, zero: 0, yref: 128 });
+  checks += 5;
 }
+
+// --- FFT data: every sample of the screen window, a second read at most every 500 ms ---------
+type Fake = ReturnType<typeof fakeScope>;
+type Setup = { fft: boolean; fw?: string; samples?: number; cfg?: Record<string, string> };
+async function withScope({ fft, fw = '0.21.9', samples, cfg }: Setup, body: (s: Fake) => Promise<void>) {
+  const s = fakeScope(samples);
+  Object.assign(s.cfg, cfg);
+  useDev.setState({ idn: { model: 'DS1052', serial: 'T', fw }, fft, fftSrc: 0 });
+  await link.open(s.dev.port);
+  runLoop('scope', scopeLoop);
+  try {
+    await body(s);
+  } finally {
+    await stopLoop();
+    await link.close();
+  }
+  assert.equal(repeatedPre(s.dev.written), 0, 'no second WAV:PRE? on a channel before its data (FFT runs)');
+  checks++;
+}
+async function until(cond: () => boolean, what: string, ms = 2000) {
+  for (const end = performance.now() + ms; !cond() && performance.now() < end;) await sleep(10);
+  assert.ok(cond(), what);
+  checks++;
+}
+const minGap = (reads: Fake['reads']) => Math.min(...reads.slice(1).map((r, i) => r.at - reads[i].at));
+const MIN_GAP = 450; // 500 ms, less the fake port's jitter on a loaded CI runner (without the limit: ~15 ms)
+
+await withScope({ fft: false }, async (s) => {
+  await sleep(1600);
+  assert.deepEqual([s.reads.length, scopeData.fft], [0, null], 'FFT off: no full-window read');
+  checks++;
+});
+
+scopeData.fft = { ch: 0, seq: 1, xinc: 1, xorig: 0, volts: new Float32Array(1) };
+await withScope({ fft: true }, async (s) => {
+  assert.equal(scopeData.fft, null, 'a new loop forgets the previous spectrum data');
+  await sleep(1600);
+  const f = scopeData.fft!;
+  assert.ok(f, 'spectrum data arrives');
+  assert.ok(s.reads.length >= 3 && minGap(s.reads) >= MIN_GAP, `${s.reads.length} reads, closest ${minGap(s.reads)} ms apart`);
+  assert.ok(scopeData.version > 2 * s.reads.length, 'trace frames keep coming between the reads');
+  assert.deepEqual([f.ch, f.volts.length, f.screen, f.xinc, f.clipped, f.lo, f.volts[0]], [0, 20000, 20000, 1e-8, false, undefined, 0]);
+  assert.ok(Math.abs(f.xorig + 1e-4) < 1e-12, `window starts 10 000 samples before the trigger: ${f.xorig}`);
+  assert.ok(s.dev.written.join('|').includes('WAV:SOUR CHAN1|WAV:STAR 22769|WAV:STOP 42768|WAV:POIN 0|WAV:DATA?|WAV:SEQ?'), 'one batch, no preamble');
+  checks += 7;
+});
+
+await withScope({ fft: true }, async (s) => {
+  await until(() => !!scopeData.fft, 'first read');
+  const good = scopeData.fft;
+  s.knob.seqSkew = 1; // another record answered
+  await sleep(600);
+  s.knob.seqSkew = 0;
+  s.knob.short = 1; // another length
+  await sleep(600);
+  assert.equal(scopeData.fft, good, 'a wrong sequence or length is discarded');
+  assert.ok(s.reads.length >= 3 && minGap(s.reads) >= MIN_GAP, `discarded reads are not retried early: ${minGap(s.reads)} ms`);
+  checks += 2;
+  s.knob.short = 0;
+  const n = s.reads.length;
+  await until(() => s.reads.length > n, 'the next regular read');
+  useDev.setState({ fftSrc: 1 });
+  await until(() => scopeData.fft?.ch === 1, 'a source change reads at once', 300);
+  assert.equal(s.reads.at(-1)!.src, 'CHAN2');
+  checks++;
+  useDev.setState({ fft: false });
+  await until(() => scopeData.fft === null, 'FFT off drops the data');
+});
+
+await withScope({ fft: true, cfg: { 'TRIG:STAT?': 'STOP' } }, async (s) => {
+  await sleep(1600);
+  assert.equal(s.reads.length, 1, 'stopped and unchanged: not read again');
+  checks++;
+  s.cfg['TIM:SCAL?'] = '1e-5';
+  await until(() => scopeData.fft?.volts.length === 10_000, 'stopped, but the window changed: read again');
+});
+
+await withScope({ fft: true, samples: 524_288, cfg: { 'TIM:SCAL?': '1e-3' } }, async (s) => {
+  await until(() => !!scopeData.fft, 'long window read');
+  assert.deepEqual([s.reads[0].star, s.reads[0].stop], [229_377, 294_912], 'the middle 65 536 samples');
+  assert.deepEqual([scopeData.fft!.volts.length, scopeData.fft!.screen], [65_536, 524_288]);
+  checks += 2;
+});
+
+for (const rail of [0, 255]) {
+  await withScope({ fft: true }, async (s) => {
+    s.knob.rail = rail;
+    await until(() => scopeData.fft?.clipped === true, `a byte at ${rail} marks the window clipped`);
+  });
+}
+
+await withScope({ fft: true, cfg: { 'CHAN1:DISP?': '0' } }, async () => {
+  await until(() => scopeData.fft?.ch === 1, 'source off: the other channel');
+});
+
+await withScope({ fft: true, fw: '0.21.7' }, async (s) => {
+  await until(() => scopeData.fft?.volts.length === 20_000, '0.21.7 reads the full window too');
+  assert.ok(!s.dev.written.some((c) => /FRAM|POIN:MODE|MEAS\?/.test(c)), '0.21.7 never gets 0.21.9 commands, FFT on');
+  checks++;
+});
 
 // --- Single, then waiting for a trigger (no frames, so no full settings read): the loop still
 // learns the device is in Single, and Run restores Auto first instead of re-arming another single

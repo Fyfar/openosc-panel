@@ -1,14 +1,13 @@
 import { clsx } from 'clsx';
 import { ChevronRight, Crosshair, Info, Download, ImageDown, Play, Sparkles, Square, StepForward, Waves, Zap } from 'lucide-react';
-import { Children, useEffect, useRef, useState } from 'react';
-import { fmtHz, fmtStable, fmtTime, fmtVolt, genHalvesScope, HALVED_NOTE, interleaveBlockers, MEM_DEPTHS, PROBES, TIMEBASES, VDIV_MV } from '../device';
-import { extent, FFT_WINDOWS, measure, spectrum, type FftWindow, type Frame, type Meas } from '../dsp';
+import { useEffect, useRef, useState } from 'react';
+import { fmtStable, fmtTime, fmtVolt, genHalvesScope, HALVED_NOTE, interleaveBlockers, MEM_DEPTHS, PROBES, TIMEBASES, vdiv, VDIV_MV } from '../device';
+import { extent, measure, type Frame, type Meas } from '../dsp';
 import * as io from '../io';
-import { useDev, type Channel, type CursorMode, type FftScale, type State } from '../store';
-import { Btn, Panel, Row, Seg, Select, Stepper, Toggle } from '../ui';
+import { useDev, type Channel, type CursorMode, type State } from '../store';
+import { Btn, CH_COLOR, Columns, M, Panel, Row, Seg, Select, Stepper, Toggle } from '../ui';
+import { composePng, SpectrumPanel, SpectrumReadout } from './ScopeFft';
 
-const CH_COLOR = ['#facc15', '#22d3ee'];
-const vdiv = (c: Channel) => (c.vdivMv * c.probe) / 1000;
 // Roll runs with Auto sweep from 200 ms/div (wiki: Oscilloscope → Roll mode).
 const isRolling = (s: State['scope']) => s.roll && s.sweep === 'AUTO' && TIMEBASES[s.tb] >= 0.2;
 
@@ -19,9 +18,6 @@ const hasT = (m: CursorMode) => m === 'T' || m === 'TV';
 const hasV = (m: CursorMode) => m === 'V' || m === 'TV';
 const CURSOR_MODES: { id: CursorMode; label: string }[] = [{ id: 'OFF', label: 'Off' }, { id: 'T', label: 'Time' }, { id: 'V', label: 'Level' }, { id: 'TV', label: 'Both' }];
 const CURSOR_CLASS: Record<CursorMode, string | false> = { OFF: false, T: 'cursor-ew-resize', V: 'cursor-ns-resize', TV: 'cursor-crosshair' };
-
-const WINDOW_LABEL: Record<FftWindow, string> = { RECT: 'Rect', HANN: 'Hann', HAMM: 'Hamming', BLACK: 'Blackman' };
-const SCALES: { id: FftScale; label: string }[] = [{ id: 'DBV', label: 'dBV' }, { id: 'DBFS', label: 'dBFS' }, { id: 'LIN', label: 'Linear' }];
 
 function nearestLine(c: Cur, mode: CursorMode, x: number, y: number, w: number, h: number): CurLine {
   const lines: [CurLine, number][] = [];
@@ -40,7 +36,8 @@ export function Scope() {
   const setView = useDev((st) => st.set);
   const [toast, setToast] = useState<string | null>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
-  const cur = useRef<Cur>({ a: 0.3, b: 0.7, ya: 0.3, yb: 0.55, drag: null }); // yb above the FFT strip
+  const cur = useRef<Cur>({ a: 0.3, b: 0.7, ya: 0.3, yb: 0.55, drag: null });
+  const fftCanvas = useRef<HTMLCanvasElement>(null);
   const [, setDragTick] = useState(0); // the cursor readouts follow a drag
 
   const set = (p: Partial<typeof s>) => patch('scope', p);
@@ -93,7 +90,7 @@ export function Scope() {
             <span className="flex items-center gap-1.5 text-xs text-muted"><Crosshair size={13} /><Seg size="xs" value={cursors} options={CURSOR_MODES} onChange={(c) => setView({ cursors: c })} /></span>
             <Btn active={fft} onClick={() => setView({ fft: !fft })}><Waves size={13} /> FFT</Btn>
             <Btn title="Fetch the full record and save CSV" onClick={() => void csv()}><Download size={13} /> CSV</Btn>
-            <Btn title="Save plot as PNG" onClick={() => savePng(canvas.current!)}><ImageDown size={13} /></Btn>
+            <Btn title="Save plot as PNG" onClick={() => savePng(canvas.current!, fftCanvas.current)}><ImageDown size={13} /></Btn>
           </div>
         </div>
 
@@ -112,15 +109,16 @@ export function Scope() {
             onPointerDown={onPointer}
             onPointerMove={onPointer}
             onPointerUp={onPointer}
-            className={clsx('block h-[clamp(320px,58vh,680px)] w-full', CURSOR_CLASS[cursors])}
+            className={clsx('block w-full', fft ? 'h-[clamp(240px,40vh,460px)]' : 'h-[clamp(320px,58vh,680px)]', CURSOR_CLASS[cursors])}
           />
-          {fft && <FftStrip />}
           <div className="pointer-events-none absolute inset-x-0 bottom-0 flex gap-4 px-3 py-1.5 font-mono text-[11px]">
             {s.ch.map((c, i) => c.on && (
               <span key={i} style={{ color: CH_COLOR[i] }}>CH{i + 1} {fmtVolt(vdiv(c))}/div {c.coup} ×{c.probe}</span>
             ))}
           </div>
         </div>
+
+        {fft && <SpectrumPanel canvas={fftCanvas} />}
 
         <Measurements cur={cur} />
       </div>
@@ -171,25 +169,6 @@ function InterleaveState({ requested, state }: { requested: State['scope']['inte
   if (state.active) return <p className="text-[11px] text-success">Interleave in force</p>;
   const why = interleaveBlockers(state.blockers);
   return <p className="text-[11px] text-amber">Not in force{why.length ? `: ${why.join(', ')}` : ''}</p>;
-}
-
-// FFT controls sit on the FFT area itself (top at FFT_TOP, as drawFft), so changes are seen as made.
-function FftStrip() {
-  const win = useDev((st) => st.fftWin);
-  const scale = useDev((st) => st.fftScale);
-  const src = useDev((st) => st.fftSrc);
-  const ch = useDev((st) => st.scope.ch);
-  const setView = useDev((st) => st.set);
-  const shown = ch[src].on ? src : src ? 0 : 1; // draw falls back to the enabled channel too
-  return (
-    <div className="absolute inset-x-2 flex flex-wrap items-center gap-x-3 gap-y-1 rounded-md border border-[#d946ef55] bg-panel/90 px-2 py-1" style={{ top: `${FFT_TOP * 100}%` }}>
-      <span className="font-mono text-[11px] font-semibold text-[#d946ef]">FFT</span>
-      <Seg size="xs" value={shown} options={([0, 1] as const).map((i) => ({ id: i, label: `CH${i + 1}`, disabled: !ch[i].on }))} onChange={(fftSrc) => setView({ fftSrc })} />
-      <Seg size="xs" value={win} options={FFT_WINDOWS.map((id) => ({ id, label: WINDOW_LABEL[id] }))} onChange={(fftWin) => setView({ fftWin })} />
-      <Seg size="xs" value={scale} options={SCALES} onChange={(fftScale) => setView({ fftScale })} />
-      <span className="ml-auto text-[11px] text-muted" title="Up to 2048 evenly spaced points of the screen window; peak decimation is off while the FFT is shown">dBFS: 0 = ±4 div</span>
-    </div>
-  );
 }
 
 function ChannelBody({ i, c, onChange }: { i: 0 | 1; c: Channel; onChange: (p: Partial<Channel>) => void }) {
@@ -335,6 +314,7 @@ function readouts(f: Frame): Meas {
 function Measurements({ cur }: { cur: React.RefObject<Cur> }) {
   const s = useDev((st) => st.scope);
   const cursors = useDev((st) => st.cursors);
+  const fft = useDev((st) => st.fft);
   const st = useDev((x) => x.scopeStatus);
   const [rows, setRows] = useState<{ ch: 0 | 1; m: Meas }[]>([]);
   const exps = useRef(new Map<string, number>()); // sticky SI prefix per readout (fmtStable)
@@ -384,10 +364,11 @@ function Measurements({ cur }: { cur: React.RefObject<Cur> }) {
               <M l="AC RMS" v={volt('ac', m.acRms)} />
               <M l="Duty" v={si(m.duty, (d) => `${d.toFixed(1)} %`)} />
               <M l="Edges" v={si(m.edges, String)} hint="rising edges in the window" />
-              <M l="Rise" v={fmt(`${ch}rise`, m.rise, 's', 4)} hint="10–90 %, computed in the browser from the live frame (≤ 2048 points)" />
+              <M l="Rise" v={fmt(`${ch}rise`, m.rise, 's', 4)} hint="10–90 %, computed in the browser from the live frame (≤ 1024 points)" />
             </Columns>
           );
         })}
+        {fft && <SpectrumReadout />}
         {cursors !== 'OFF' && (
           <Columns className="border-t border-border pt-1.5 text-accent" head={<span className="font-bold" title="drag the lines on the plot">CUR</span>}>
             {hasT(cursors) && [<M key="dt" l="ΔT" v={fmt('dt', Math.abs(dt), 's', 4)} />, <M key="1dt" l="1/ΔT" v={fmt('1dt', dt ? 1 / Math.abs(dt) : NaN, 'Hz', 4)} />]}
@@ -399,32 +380,6 @@ function Measurements({ cur }: { cur: React.RefObject<Cur> }) {
   );
 }
 
-// Readouts in columns of three, after a label column. In each column the labels are as wide as
-// its longest label and every value has a fixed 10ch slot, so a changing value never moves the
-// next column. Scrolls sideways rather than wrapping, so every value keeps its place.
-function Columns({ head, children, className }: { head: React.ReactNode; children: React.ReactNode; className?: string }) {
-  const cells = Children.toArray(children);
-  const cols = Array.from({ length: Math.ceil(cells.length / 3) }, (_, i) => cells.slice(3 * i, 3 * i + 3));
-  return (
-    <div className={clsx('flex gap-x-5 overflow-x-auto', className)}>
-      <div className="flex w-10 shrink-0 flex-col gap-y-1">{head}</div>
-      <div className="flex gap-x-12">
-        {cols.map((col, i) => <div key={i} className="grid shrink-0 grid-cols-[auto_10ch] content-start gap-x-2 gap-y-1">{col}</div>)}
-      </div>
-    </div>
-  );
-}
-
-// One label + value pair: two cells of its column's grid.
-function M({ l, v, hint }: { l: string; v: string; hint?: string }) {
-  return (
-    <>
-      <span title={hint} className="text-muted whitespace-nowrap">{l}</span>
-      <span title={hint} className="tabular-nums whitespace-nowrap text-fg">{v}</span>
-    </>
-  );
-}
-
 // rAF loop reads io.scopeData and the store directly: frames never go through React state.
 function useDrawLoop(ref: React.RefObject<HTMLCanvasElement | null>, cur: React.RefObject<Cur>) {
   useEffect(() => {
@@ -432,18 +387,14 @@ function useDrawLoop(ref: React.RefObject<HTMLCanvasElement | null>, cur: React.
     const loop = () => {
       raf = requestAnimationFrame(loop);
       const st = useDev.getState();
-      draw(ref.current!, st.scope, io.scopeData.frames, cur.current, st);
+      draw(ref.current!, st.scope, io.scopeData.frames, cur.current, st.cursors);
     };
     raf = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(raf);
   }, [ref, cur]);
 }
 
-type View = Pick<State, 'cursors' | 'fft' | 'fftWin' | 'fftScale' | 'fftSrc'>;
-const FFT_TOP = 0.62; // the FFT's share starts here (canvas and FftStrip)
-const FFT_STRIP_PX = 36; // FftStrip's height (one row); the spectrum is drawn below it
-
-function draw(c: HTMLCanvasElement, s: State['scope'], frames: Frame[], cur: Cur, view: View) {
+function draw(c: HTMLCanvasElement, s: State['scope'], frames: Frame[], cur: Cur, cursors: CursorMode) {
   const dpr = devicePixelRatio || 1;
   const W = Math.round(c.clientWidth * dpr), H = Math.round(c.clientHeight * dpr);
   if (c.width !== W || c.height !== H) { c.width = W; c.height = H; }
@@ -464,9 +415,7 @@ function draw(c: HTMLCanvasElement, s: State['scope'], frames: Frame[], cur: Cur
     g.fillText('Waiting for a frame…', W / 2, H / 2 - 12 * dpr);
     g.textAlign = 'start';
   }
-  const ff = frames.find((f) => f.ch === view.fftSrc) ?? f0;
-  if (view.fft && ff && !ff.lo) drawFft(g, W, H, ff, vdiv(s.ch[ff.ch]), view, dpr); // a PEAK frame has no evenly spaced samples
-  if (view.cursors !== 'OFF') drawCursors(g, W, H, cur, view.cursors, dpr);
+  if (cursors !== 'OFF') drawCursors(g, W, H, cur, cursors, dpr);
 }
 
 // The time span across the plot: the frame's own window. Roll (Auto, ≥ 200 ms/div) fills from the
@@ -552,33 +501,6 @@ function drawCursors(g: CanvasRenderingContext2D, W: number, H: number, cur: Cur
 
 const clampY = (y: number, H: number) => Math.min(H + 2, Math.max(-2, y));
 
-// Spectrum cached per frame and window; the scale maps a bin's peak volts to 0 (top) … 1 (bottom).
-let fftCache: { f: Frame | null; win: FftWindow; amp: Float32Array } = { f: null, win: 'HANN', amp: new Float32Array() };
-const FFT_SCALE: Record<FftScale, { y: (a: number, fs: number) => number; label: (fs: number) => string }> = {
-  DBV: { y: (a) => (20 - 20 * Math.log10(a / Math.SQRT2 + 1e-9)) / 100, label: () => '+20…−80 dBV (rms)' },
-  DBFS: { y: (a, fs) => (-20 * Math.log10(a / fs + 1e-12)) / 100, label: () => '0…−100 dBFS' },
-  LIN: { y: (a, fs) => 1 - a / fs, label: (fs) => `0…${fmtVolt(fs)} peak` },
-};
-
-function drawFft(g: CanvasRenderingContext2D, W: number, H: number, f: Frame, vd: number, view: View, dpr: number) {
-  if (fftCache.f !== f || fftCache.win !== view.fftWin) fftCache = { f, win: view.fftWin, amp: spectrum(f.volts, view.fftWin) };
-  const amp = fftCache.amp, fs = 4 * vd, scale = FFT_SCALE[view.fftScale]; // full scale: ±4 div
-  const top = H * FFT_TOP, plotTop = top + FFT_STRIP_PX * dpr, h = H - plotTop; // the spectrum starts below FftStrip
-  g.fillStyle = 'rgba(7,9,13,0.45)';
-  g.fillRect(0, top, W, H - top);
-  g.strokeStyle = '#d946ef';
-  g.lineWidth = 1.2 * dpr;
-  g.beginPath();
-  for (let k = 1; k < amp.length; k++) {
-    const x = (k / amp.length) * W, y = plotTop + Math.min(1, Math.max(0, scale.y(amp[k], fs))) * h;
-    if (k === 1) g.moveTo(x, y); else g.lineTo(x, y);
-  }
-  g.stroke();
-  g.fillStyle = '#d946ef';
-  g.font = `${11 * dpr}px "Geist Mono Variable", monospace`;
-  g.fillText(`CH${f.ch + 1} · ${amp.length * 2} pts · 0–${fmtHz(1 / (2 * f.xinc), true)} · ${scale.label(fs)}`, 12 * dpr, plotTop + 14 * dpr);
-}
-
 function marker(g: CanvasRenderingContext2D, x: number, y: number, color: string, text: string, dir: 'left' | 'right', dpr: number) {
   const w = 16 * dpr, h = 14 * dpr;
   const x0 = dir === 'right' ? x : x - w;
@@ -601,6 +523,8 @@ function fmtSps(r: number) {
   return r >= 1e6 ? `${+(r / 1e6).toPrecision(3)} MSa/s` : r >= 1e3 ? `${+(r / 1e3).toPrecision(3)} kSa/s` : `${+r.toPrecision(3)} Sa/s`;
 }
 
-function savePng(c: HTMLCanvasElement) {
-  c.toBlob((b) => b && io.download(`scope-${Date.now()}.png`, b), 'image/png');
+// With the FFT shown (its canvas exists) the image holds both, with the spectrum's readouts and notes.
+function savePng(trace: HTMLCanvasElement, spectrum: HTMLCanvasElement | null) {
+  const image = spectrum ? composePng(trace, spectrum) : trace;
+  image.toBlob((b) => b && io.download(`scope-${Date.now()}.png`, b), 'image/png');
 }

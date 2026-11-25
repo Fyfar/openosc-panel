@@ -146,6 +146,9 @@ export const DMM_FUNCS: { id: DmmFunc; label: string; short: string; base: strin
 export const HOLD_MODES = ['MAN', 'DEL', 'STAB', 'AUTO'] as const;
 export type HoldMode = (typeof HOLD_MODES)[number];
 
+// A channel's volts per division at the probe tip.
+export const vdiv = (c: { vdivMv: number; probe: number }) => (c.vdivMv * c.probe) / 1000;
+
 export function fmtTime(s: number): string {
   const a = Math.abs(s);
   if (a === 0) return '0 s';
