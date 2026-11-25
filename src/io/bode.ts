@@ -1,6 +1,6 @@
 // Bode: host-side sweep. Generator sine → DUT; CH1 = DUT input, CH2 = DUT output.
-import { bodeMaxHz, bodePlan, genMaxHz, TIMEBASES, VDIV_MV, type Model } from '../device';
-import { extent, gainPhase, type Frame } from '../dsp';
+import { bodeMaxHz, bodePlan, bodeTimebase, genMaxHz, MEM_DEPTHS, VDIV_MV, type Model } from '../device';
+import { bodeTone, extent, type Frame } from '../dsp';
 import { sleep } from '../link';
 import type { State } from '../store';
 import { ctl, errText, fail, get, link, nearest, num, on } from './core';
@@ -9,13 +9,19 @@ import { fetchChannel } from './scope';
 
 // The sweep's scope setup, and what each point sends. Everything these touch (plus the
 // CHANn:SCAL re-ranging) must be put back by scopeRestore: scripts/check-logic.mts checks it.
-export const SWEEP_SCOPE = ['CHAN1:DISP ON', 'CHAN2:DISP ON', 'CHAN1:OFFS 0', 'CHAN2:OFFS 0', 'TRIG:EDGE:SOUR CHAN1', 'TRIG:SWE AUTO', 'RUN'];
+// AC: the ZT703S sine sits on ~1.3 V DC, which would waste half the ADC codes. ACQ:MDEP is points per
+// enabled channel (the firmware picks the smallest memory budget covering it), so it is set after both
+// channels are on: half the smallest budget per channel keeps a record about the 10 divisions.
+export const SWEEP_SCOPE = [
+  'CHAN1:DISP ON', 'CHAN2:DISP ON', 'CHAN1:COUP AC', 'CHAN2:COUP AC', 'CHAN1:OFFS 0', 'CHAN2:OFFS 0',
+  'ACQ:ROLL OFF', `ACQ:MDEP ${MEM_DEPTHS[0] / 2}`, 'TRIG:EDGE:SOUR CHAN1', 'TRIG:SWE AUTO', 'RUN',
+];
 export const pointCmds = (f: number, tb: number) => [`SOUR:FREQ ${+f.toPrecision(6)}`, `TIM:SCAL ${tb}`, 'TIM:OFFS 0'];
 
 const SAVE_Q = {
   tb: 'TIM:SCAL?', hoff: 'TIM:OFFS?', swe: 'TRIG:SWE?', stat: 'TRIG:STAT?', src: 'TRIG:EDGE:SOUR?',
   d1: 'CHAN1:DISP?', d2: 'CHAN2:DISP?', s1: 'CHAN1:SCAL?', s2: 'CHAN2:SCAL?', o1: 'CHAN1:OFFS?', o2: 'CHAN2:OFFS?',
-  p1: 'CHAN1:PROB?', p2: 'CHAN2:PROB?',
+  p1: 'CHAN1:PROB?', p2: 'CHAN2:PROB?', c1: 'CHAN1:COUP?', c2: 'CHAN2:COUP?', roll: 'ACQ:ROLL?', mdep: 'ACQ:MDEP?',
 };
 type Saved = Record<keyof typeof SAVE_Q, string>;
 
@@ -24,8 +30,14 @@ export function scopeRestore(s: Saved): string[] {
   const n = (x: string) => (Number.isFinite(num(x)) ? +num(x).toPrecision(6) : null);
   const val = (head: string, x: string) => (n(x) === null ? [] : [`${head} ${n(x)}`]);
   const swe = s.swe.toUpperCase();
+  const coup = (head: string, x: string) => { const m = x.trim().toUpperCase().match(/^(AC|DC|GND)/); return m ? [`${head} ${m[1]}`] : []; };
+  // ACQ:MDEP? is the samples per enabled channel (258 048 of a 256K budget on one, 126 976 on two): back
+  // to the budget, then per channel again for the channels the restore turns on.
+  const chans = Math.max(1, +on(s.d1) + +on(s.d2));
+  const depth = n(s.mdep) === null ? [] : [`ACQ:MDEP ${nearest(MEM_DEPTHS, num(s.mdep) * chans) / chans}`];
   return [
-    `CHAN1:DISP ${on(s.d1) ? 'ON' : 'OFF'}`, `CHAN2:DISP ${on(s.d2) ? 'ON' : 'OFF'}`,
+    `CHAN1:DISP ${on(s.d1) ? 'ON' : 'OFF'}`, `CHAN2:DISP ${on(s.d2) ? 'ON' : 'OFF'}`, ...coup('CHAN1:COUP', s.c1), ...coup('CHAN2:COUP', s.c2),
+    ...(n(s.roll) === null ? [] : [`ACQ:ROLL ${on(s.roll) ? 'ON' : 'OFF'}`]), ...depth,
     ...val('CHAN1:SCAL', s.s1), ...val('CHAN2:SCAL', s.s2), ...val('CHAN1:OFFS', s.o1), ...val('CHAN2:OFFS', s.o2),
     ...val('TIM:SCAL', s.tb), ...val('TIM:OFFS', s.hoff),
     `TRIG:EDGE:SOUR CHAN${s.src.endsWith('2') ? 2 : 1}`,
@@ -53,30 +65,83 @@ export function rerange(frames: Frame[], vdiv: number[], probe: number[]): numbe
   });
 }
 
-// One point from a CH1/CH2 pair of the same frame. A channel that clips or is tiny is
-// re-ranged and the point retried. Null when no clean pair came in 5 tries.
-async function measurePoint(f: number, vdiv: number[], probe: number[]) {
-  for (let attempt = 0; attempt < 5; attempt++) {
-    await link.run(['WAV:SNAP']); // release, so the next frame is captured after the change
-    await fetchChannel(0, 4096, 5000); // discard one frame
-    const a = await fetchChannel(0, 4096, 5000);
-    const c = await fetchChannel(1, 4096, 5000);
-    if (a.seq !== c.seq) continue;
-    const next = rerange([a, c], vdiv, probe);
-    const fix = next.flatMap((v, i) => (v !== vdiv[i] ? [`CHAN${i + 1}:SCAL ${v}`] : []));
-    if (!fix.length) return { f, ...gainPhase(a, c, f) };
-    if (!(await ctl(fix))) return null;
-    next.forEach((v, i) => (vdiv[i] = v));
-    await sleep(100);
+// A repeated WAV:PRE? on a channel waits 1 s for a newer record, then answers NAN (-230): with
+// records of a second or more that only means "not yet".
+const notYet = (e: unknown) => /preamble "NAN/.test(errText(e));
+
+// Retries `read` while the device has no newer record yet; null once `until` (ms) has passed or the
+// user stopped the sweep (a 1 Hz point can otherwise wait minutes).
+async function untilRecord<T>(until: number, read: (timeout: number) => Promise<T>): Promise<T | null> {
+  while (performance.now() < until && get().bode.running) {
+    try {
+      return await read(Math.max(1500, until - performance.now()));
+    } catch (e) {
+      if (!notYet(e)) throw e;
+      await link.run(['*CLS']);
+    }
   }
   return null;
 }
 
+// Sequence of the newest complete record, without reading its data (PRE? leases it, SEQ? names it).
+async function latestSeq(timeout: number) {
+  const [pre, seq] = await link.run(['WAV:SOUR CHAN1', 'WAV:POIN 0', 'WAV:PRE?', 'WAV:SEQ?'], timeout);
+  if (!Number.isFinite(num(seq.text ?? ''))) throw new Error(`preamble "${pre.text}"`);
+  return num(seq.text ?? '');
+}
+
+// CH1's newest record once its sequence is at least `min`; null at the deadline or on stop.
+async function seqAtLeast(until: number, min: number) {
+  for (;;) {
+    const s = await untilRecord(until, latestSeq);
+    if (s === null || s >= min) return s;
+  }
+}
+
+// A CH1/CH2 pair of whole records, both channels of one acquisition, from a record that started
+// after now: s0 + 1 can still hold the previous setting (1 of 10 on the bench), s0 + 2 can't. Each CH1
+// PRE? after the first waits for the next record, so s0 + 1 is passed without reading its data.
+async function freshPair(recordMs: number) {
+  const until = performance.now() + 2000 + 3 * recordMs;
+  const s0 = await seqAtLeast(until, 0);
+  if (s0 === null || (await seqAtLeast(until, s0 + 1)) === null) return null;
+  let a: Frame | null = null;
+  while (!a || a.seq < s0 + 2) {
+    a = await untilRecord(until, (t) => fetchChannel(0, 0, t, true));
+    if (!a) return null;
+  }
+  const c = await fetchChannel(1, 0, Math.max(1500, until - performance.now()), true);
+  return a.seq === c.seq ? [a, c] : null;
+}
+
+// One point. A channel that clips or is tiny is re-ranged and the point retried. Null when no clean
+// pair came in 5 tries, or no fresh record before the deadline.
+async function measurePoint(f: number, tb: number, vdiv: number[], probe: number[]) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    // 32 768 per channel: a record lasts 10 × the timebase and arrives every ≤ 2 of that (ZT703S, 0.21.14).
+    const pair = await freshPair(20_000 * tb);
+    if (!pair) return null;
+    const next = rerange(pair, vdiv, probe);
+    const fix = next.flatMap((v, i) => (v !== vdiv[i] ? [`CHAN${i + 1}:SCAL ${v}`] : []));
+    if (!fix.length) return bodeTone(pair[0], pair[1], f);
+    if (!(await ctl(fix))) return null;
+    next.forEach((v, i) => (vdiv[i] = v));
+  }
+  return null;
+}
+
+// Throws (ending the sweep) when the device refuses the point or the generator stopped by itself:
+// the firmware halts the output on a DAC underrun (-240) and the pin then carries something else.
 async function sweepPoint(f: number, vdiv: number[], probe: number[]) {
-  const tb = TIMEBASES.find((t) => t * 10 >= 4 / f) ?? TIMEBASES.at(-1)!; // ≥ 4 periods on screen
-  await ctl(pointCmds(f, tb));
+  const tb = bodeTimebase(f);
+  if (!(await ctl(pointCmds(f, tb)))) throw new Error(get().error ?? 'the device refused the point');
   await sleep(Math.max(80, 5000 / f)); // settle: ≥ 5 periods
-  return measurePoint(f, vdiv, probe);
+  const p = await measurePoint(f, tb, vdiv, probe);
+  // ponytail: from the firmware source (output.cpp halt() clears what OUTP? reports); no underrun was seen
+  // on 0.21.14 to confirm it on hardware.
+  const [out] = await link.texts(['OUTP?']);
+  if (!on(out)) throw new Error('the generator output turned off (DAC underrun?)');
+  return p;
 }
 
 export async function bodeSweep() {
@@ -91,13 +156,16 @@ export async function bodeSweep() {
     const vals = await link.texts(Object.values(SAVE_Q));
     const saved = Object.fromEntries(keys.map((k, i) => [k, vals[i]])) as Saved;
     restore = scopeRestore(saved);
-    const vdiv = [num(saved.s1) || 1, num(saved.s2) || 1], probe = [num(saved.p1) || 1, num(saved.p2) || 1];
+    // Both channels start on CH1's V/div: on the same signal they then range alike (different ranges
+    // disagree by up to 0.5 dB on a ZT703S).
+    const probe = [num(saved.p1) || 1, num(saved.p2) || 1], v1 = num(saved.s1) || probe[0];
+    const vdiv = [v1, nearest(VDIV_MV.map((m) => (m * probe[1]) / 1000), v1)];
     await link.run(['WAV:MODE RAW', 'WAV:FORM BYTE']);
-    if (!(await ctl([`SOUR:FREQ ${freqs[0]}`, 'SOUR:FUNC SINusoid', 'OUTP ON', ...SWEEP_SCOPE]))) return;
+    if (!(await ctl([`SOUR:FREQ ${freqs[0]}`, 'SOUR:FUNC SINusoid', 'OUTP ON', ...SWEEP_SCOPE, `CHAN1:SCAL ${vdiv[0]}`, `CHAN2:SCAL ${vdiv[1]}`]))) return;
     for (let k = 0; k < freqs.length && get().bode.running; k++) {
       const p = await sweepPoint(freqs[k], vdiv, probe);
       if (p) get().patch('bode', { points: [...get().bode.points, p] });
-      else skipped++;
+      else if (get().bode.running) skipped++;
       get().patch('bode', { progress: (k + 1) / freqs.length });
     }
   } catch (e) {

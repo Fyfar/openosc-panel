@@ -1,7 +1,8 @@
 import { Download, Play, Square } from 'lucide-react';
 import { useMemo } from 'react';
 import type uPlot from 'uplot';
-import { bodeMaxHz, bodePlan, fmtHz } from '../device';
+import { bodeEta, bodeMaxHz, bodePlan, fmtHz } from '../device';
+import { spanAtLeast, unwrapPhase } from '../dsp';
 import * as io from '../io';
 import { AXIS, Plot } from '../Plot';
 import { useDev } from '../store';
@@ -12,7 +13,7 @@ export function Bode() {
   const patch = useDev((s) => s.patch);
   const model = useDev((s) => s.model);
   const amp = useDev((s) => s.gen.amp);
-  const pts = b.points;
+  const pts = useMemo(() => continuous(b.points), [b.points]);
   const fw = useDev((s) => s.idn?.fw);
   const sineMax = bodeMaxHz(model, amp, fw); // same ceiling as io.bodeSweep
   const plan = useMemo(() => bodePlan(b.start, Math.min(b.stop, sineMax), b.ppd), [b.start, b.stop, b.ppd, sineMax]);
@@ -20,10 +21,10 @@ export function Bode() {
   const opts = useMemo<Omit<uPlot.Options, 'width' | 'height'>>(() => ({
     legend: { show: false },
     cursor: { y: false },
-    scales: { x: { time: false, distr: 3, log: 10 }, db: { auto: true }, ph: { range: [-185, 185] } },
+    scales: { x: { time: false, distr: 3, log: 10 }, db: { range: (_u, mn, mx) => spanAtLeast(mn, mx, 6) }, ph: { range: (_u, mn, mx) => spanAtLeast(mn, mx, 90) } },
     axes: [
       { ...AXIS, values: (_u, t) => t.map((v) => (v == null ? '' : fmtHz(v, true))) },
-      { ...AXIS, scale: 'db', size: 52, values: (_u, t) => t.map((v) => (v == null ? '' : `${v} dB`)) },
+      { ...AXIS, scale: 'db', size: 64, values: (_u, t) => t.map((v) => (v == null ? '' : `${v} dB`)) },
       { ...AXIS, scale: 'ph', side: 1, size: 48, grid: { show: false }, values: (_u, t) => t.map((v) => (v == null ? '' : `${v}°`)) },
     ],
     series: [
@@ -87,14 +88,15 @@ export function Bode() {
             <Row label="Start"><Select label="Start frequency" value={b.start} options={startOpts} onChange={(start) => set({ start })} /></Row>
             <Row label="Stop"><Select label="Stop frequency" value={b.stop} options={stopOpts} onChange={(stop) => set({ stop })} /></Row>
             <Row label="Points / decade"><Select label="Points per decade" value={b.ppd} options={[5, 10, 20, 50].map((n) => ({ id: n, label: String(n) }))} onChange={(ppd) => set({ ppd })} /></Row>
-            <Row label="Est. time"><span className="font-mono">~{Math.ceil(plan.length * (model === 'ZT706S' ? 1.2 : 0.6))} s</span></Row>
+            <Row label="Est. time"><span className="font-mono">~{etaText(bodeEta(plan, model))}</span></Row>
             <Btn tone={b.running ? 'danger' : 'accent'} className="w-full py-2" onClick={() => void (b.running ? io.bodeStop() : io.bodeSweep())}>
               {b.running ? <><Square size={13} /> Stop sweep</> : <><Play size={13} /> Run sweep</>}
             </Btn>
             <Btn className="w-full" disabled={!pts.length || b.running} onClick={() => exportCsv(pts)}><Download size={13} /> Export CSV</Btn>
-            <p className="text-[11px] text-muted">Sine only, up to {fmtHz(sineMax, true)}{model === 'ZT706S' ? ` at ${amp.toFixed(1)} V` : ''}. Gain is a CH2/CH1 ratio, so the uncalibrated generator level doesn't matter.</p>
           </div>
         </Panel>
+
+        <LimitsNote top={`${fmtHz(sineMax, true)}${model === 'ZT706S' ? ` at ${amp.toFixed(1)} V` : ''}`} />
 
         <Panel title="Wiring">
           <svg viewBox="0 0 280 120" className="w-full text-muted" fill="none" stroke="currentColor" strokeWidth="1.5">
@@ -118,7 +120,32 @@ export function Bode() {
   );
 }
 
-function exportCsv(pts: { f: number; db: number; ph: number }[]) {
+type Point = { f: number; db: number; ph: number };
+
+const etaText = (s: number) => (s < 90 ? `${Math.ceil(s)} s` : `${Math.ceil(s / 60)} min`);
+
+// Phase continuous across points everywhere it's shown or exported (stored wrapped, as measured).
+function continuous(points: Point[]): Point[] {
+  const ph = unwrapPhase(points.map((p) => p.ph));
+  return points.map((p, i) => ({ ...p, ph: ph[i] }));
+}
+
+// Measured on a ZT703S (0.21.14) with both probes on the generator and on an RC low-pass.
+function LimitsNote({ top }: { top: string }) {
+  return (
+    <Panel title="Accuracy and limits">
+      <ul className="list-disc space-y-1 pl-4 text-[11px] text-muted">
+        <li>Sine only, up to {top}.</li>
+        <li>Gain about ±0.5 dB, phase about ±1°, uncalibrated; more when CH1 and CH2 end up on different V/div. Gain is a CH2/CH1 ratio, so the generator level doesn't matter.</li>
+        <li>Both inputs are AC coupled during the sweep: DC levels aren't measured.</li>
+        <li>Low frequencies are slow: each point waits for a few periods (1 Hz ≈ 20 s per point).</li>
+        <li>Readings far below −40 dB aren't verified.</li>
+      </ul>
+    </Panel>
+  );
+}
+
+function exportCsv(pts: Point[]) {
   const rows = pts.map((p) => `${p.f},${p.db.toFixed(3)},${p.ph.toFixed(2)}`).join('\n');
   io.download(`bode-${Date.now()}.csv`, new Blob([`freq_hz,gain_db,phase_deg\n${rows}\n`], { type: 'text/csv' }));
 }

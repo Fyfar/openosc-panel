@@ -116,6 +116,17 @@ export const HALVED_NOTE = 'Generator on: scope max sample rate is halved while 
 export const bodeMaxHz = (model: Model, volts: number, fw: string | undefined) =>
   Math.min(genMaxHz(model, fw).SIN, MODELS[model].amplitude ? sineMaxAt(volts) : Infinity);
 
+// A Bode point's timebase: at least 4 periods on the 10 divisions.
+export const bodeTimebase = (f: number) => TIMEBASES.find((t) => t * 10 >= 4 / f) ?? TIMEBASES.at(-1)!;
+
+// Estimated sweep time (s), fitted on a ZT703S (0.21.14): per point the settle plus 3 records
+// (r = 10 × the timebase at 32 768 per channel), each arriving every 2r below 1 s and r + ~1.2 s above,
+// at least ~0.5 s of commands and transfer; the ZT706S module adds ~0.6 s per command.
+export const bodeEta = (plan: number[], model: Model) => plan.reduce((s, f) => {
+  const r = 10 * bodeTimebase(f);
+  return s + Math.max(0.5, Math.max(0.08, 5 / f) + 3 * (r + Math.min(r, 1.2))) + (model === 'ZT706S' ? 0.6 : 0);
+}, 0);
+
 // Log-spaced sweep frequencies, both ends included. Shared by the Bode preview and the sweep.
 export function bodePlan(start: number, stop: number, ppd: number): number[] {
   const n = Math.max(2, Math.round(Math.log10(stop / start) * ppd) + 1);

@@ -1,4 +1,4 @@
-// Waveform maths on captured frames: Bode tone detection, the scope's browser-side
+// Waveform maths on captured frames: Bode tone measurement, the scope's browser-side
 // measurements (the fallback before firmware 0.21.9's WAV:MEAS?) and FFT, plus DMM statistics and
 // the trend's Y floor. Pure, no device access.
 // PEAK frames (WAV:POIN:MODE PEAK) carry each bucket's min and max in lo/hi; volts is then their
@@ -20,27 +20,52 @@ export function extent(v: Float32Array) {
   return { mn, mx };
 }
 
-// Amplitude and phase of the `f` component (single-bin DFT over a whole number of periods).
-function tone(fr: Frame, f: number) {
-  const n = fr.volts.length, per = 1 / (f * fr.xinc), whole = Math.floor(n / per);
-  const N = whole >= 1 ? Math.min(n, Math.round(whole * per)) : n;
+// Mean removed and Hann weight applied once, so each trial frequency costs one rotation per sample.
+function hannWeighted(v: Float32Array) {
+  const n = v.length, out = new Float64Array(n);
   let mean = 0;
-  for (let i = 0; i < N; i++) mean += fr.volts[i];
-  mean /= N;
-  let I = 0, Q = 0;
-  for (let i = 0; i < N; i++) {
-    const w = 2 * Math.PI * f * (fr.xorig + i * fr.xinc), v = fr.volts[i] - mean;
-    I += v * Math.cos(w);
-    Q += v * Math.sin(w);
-  }
-  return { amp: (2 / N) * Math.hypot(I, Q), ph: Math.atan2(-Q, I) };
+  for (let i = 0; i < n; i++) mean += v[i];
+  mean /= n;
+  let sum = 0;
+  for (let i = 0; i < n; i++) { const w = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (n - 1)); out[i] = (v[i] - mean) * w; sum += w; }
+  return { x: out, sum };
 }
 
-// Gain (dB) and phase (degrees, −180…180) of `out` relative to `inp` at `f`.
-export function gainPhase(inp: Frame, out: Frame, f: number) {
-  const x = tone(inp, f), y = tone(out, f);
-  const ph = ((((y.ph - x.ph) * 180) / Math.PI + 540) % 360) - 180;
-  return { db: 20 * Math.log10(y.amp / x.amp), ph };
+// Complex amplitude at `cyc` cycles per sample (x = A·cos(2π·cyc·i + φ) → A·e^{jφ}).
+function bin(h: { x: Float64Array; sum: number }, cyc: number) {
+  const dc = Math.cos(2 * Math.PI * cyc), ds = Math.sin(2 * Math.PI * cyc);
+  let c = 1, s = 0, re = 0, im = 0;
+  for (let i = 0; i < h.x.length; i++) {
+    re += h.x[i] * c; im -= h.x[i] * s;
+    const nc = c * dc - s * ds; s = s * dc + c * ds; c = nc;
+  }
+  return { re: (2 * re) / h.sum, im: (2 * im) / h.sum };
+}
+
+// Bode point from one record pair: CH1's frequency found near the request (the generator plays a
+// quantised one), then gain (dB) and phase (degrees, −180…180) of `out` relative to `inp` there.
+// Hann over the whole record: the true frequency is never a whole number of periods.
+export function bodeTone(inp: Frame, out: Frame, fReq: number) {
+  const x = hannWeighted(inp.volts), y = hannWeighted(out.volts), n = x.x.length;
+  const mag = (cyc: number) => { const b = bin(x, cyc); return Math.hypot(b.re, b.im); };
+  // Golden-section search for the peak of the main lobe, ±1 bin (1/n cycles per sample) around the request.
+  const c0 = fReq * inp.xinc, g = (Math.sqrt(5) - 1) / 2;
+  let a = Math.max(c0 / 2, c0 - 1 / n), b = c0 + 1 / n;
+  let p = b - g * (b - a), q = a + g * (b - a), mp = mag(p), mq = mag(q);
+  while (b - a > c0 * 1e-7) {
+    if (mp < mq) { a = p; p = q; mp = mq; q = a + g * (b - a); mq = mag(q); }
+    else { b = q; q = p; mq = mp; p = b - g * (b - a); mp = mag(p); }
+  }
+  const cyc = (a + b) / 2, X = bin(x, cyc), Y = bin(y, cyc);
+  const ph = ((((Math.atan2(Y.im, Y.re) - Math.atan2(X.im, X.re)) * 180) / Math.PI + 540) % 360) - 180;
+  return { f: cyc / inp.xinc, db: 20 * Math.log10(Math.hypot(Y.re, Y.im) / Math.hypot(X.re, X.im)), ph };
+}
+
+// Phase continuous across points: each moved by whole turns to within 180° of the one before.
+export function unwrapPhase(ph: number[]): number[] {
+  const out: number[] = [];
+  for (const p of ph) out.push(out.length ? p - 360 * Math.round((p - out[out.length - 1]) / 360) : p);
+  return out;
 }
 
 // The device's readout set (WAV:MEAS? order, SCPI_DESKTOP.md) plus rise time, which only the
@@ -289,6 +314,14 @@ export function histogram(counts: Map<number, number>, width: number, center = 0
   if (under) bins.unshift({ value: (lo - 1) * width, count: under, kind: 'under' });
   if (over) bins.push({ value: (hi + 1) * width, count: over, kind: 'over' });
   return bins;
+}
+
+// Axis range: the data extent widened about its middle to at least `span` (Bode: a flat 0.1 dB
+// spread must not fill the plot). No data → centred on 0.
+export function spanAtLeast(min: number, max: number, span: number): [number, number] {
+  if (!(Number.isFinite(min) && Number.isFinite(max))) return [-span / 2, span / 2];
+  const pad = Math.max(0, span - (max - min)) / 2;
+  return [min - pad, max + pad];
 }
 
 // Auto Y floor: the data extent, never narrower than ±20 counts around its middle, so a steady

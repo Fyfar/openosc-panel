@@ -1,8 +1,8 @@
 // Self-check for the pure logic: typed frequency, DMM scaling, Bode maths/plan/restore,
 // scope measurements and generator command order. Run: `npm run check`.
 import assert from 'node:assert/strict';
-import { bodePlan, fmtStable, fwAtLeast, genMaxHz, interleaveBlockers, parseHz, scaleFor, seenRef, VDIV_MV } from '../src/device.ts';
-import { addStat, emptyStats, FFT_WINDOWS, fftNotes, fftSpanHz, findPeak, gainPhase, histogram, measure, peakIn, peakNear, spectrum, spectrumOf, stdDev, yFloor, type FftWindow, type Frame } from '../src/dsp.ts';
+import { bodeEta, bodePlan, fmtStable, fwAtLeast, genMaxHz, interleaveBlockers, parseHz, scaleFor, seenRef, VDIV_MV } from '../src/device.ts';
+import { addStat, emptyStats, FFT_WINDOWS, fftNotes, fftSpanHz, bodeTone, findPeak, histogram, spanAtLeast, unwrapPhase, measure, peakIn, peakNear, spectrum, spectrumOf, stdDev, yFloor, type FftWindow, type Frame } from '../src/dsp.ts';
 import { parseFrame, parseMeas, screenWindow } from '../src/io/scope.ts';
 import { pointCmds, rerange, scopeRestore, SWEEP_SCOPE } from '../src/io/bode.ts';
 import { dmmDiff } from '../src/io/dmm.ts';
@@ -90,17 +90,53 @@ checks += 3;
   near(p[10], 100, 1e-9, 'plan one decade in');
 }
 
-// --- gainPhase: a known −6 dB / −45° pair, over a non-integer number of periods ------------
 const frame = (ch: 0 | 1, n: number, xinc: number, fn: (t: number) => number): Frame =>
   ({ ch, seq: 1, xinc, xorig: -n * xinc * 0.3, volts: Float32Array.from({ length: n }, (_, i) => fn(-n * xinc * 0.3 + i * xinc)) });
+
+// --- bodeEta: from each point's record, so slow points dominate --------------------------
 {
-  const f = 1234, w = 2 * Math.PI * f;
-  const inp = frame(0, 4096, 1e-6, (t) => 1.0 * Math.cos(w * t) + 0.2);
-  const out = frame(1, 4096, 1e-6, (t) => 0.5 * Math.cos(w * t - Math.PI / 4) - 0.1);
-  const r = gainPhase(inp, out, f);
-  near(r.db, 20 * Math.log10(0.5), 0.05, 'gain dB');
-  near(r.ph, -45, 0.5, 'phase deg');
-  near(gainPhase(out, inp, f).ph, 45, 0.5, 'phase sign flips');
+  const low = bodePlan(1, 100_000, 10), eta = bodeEta(low, 'ZT703S'), slow = bodeEta(low.filter((f) => f < 10), 'ZT703S');
+  assert.ok(slow > eta / 2, `points below 10 Hz dominate: ${slow} of ${eta} s`);
+  assert.ok(bodeEta(bodePlan(1000, 100_000, 10), 'ZT703S') < 120, 'a 1 kHz–100 kHz sweep stays under 2 min');
+  assert.ok(bodeEta([1000], 'ZT706S') > bodeEta([1000], 'ZT703S'), 'ZT706S waits for its module');
+  checks += 3;
+}
+
+// --- bodeTone: −6 dB / −45° with DC, non-whole periods, generator 0.1 % off the request ----
+{
+  const req = 37, f = req * 1.001, w = 2 * Math.PI * f, n = 20_000, xinc = 2.5e-5; // 18.5 periods
+  const inp = frame(0, n, xinc, (t) => 1.0 * Math.cos(w * t) + 0.2);
+  const out = frame(1, n, xinc, (t) => 0.5 * Math.cos(w * t - Math.PI / 4) - 0.1);
+  const r = bodeTone(inp, out, req);
+  near(r.db, 20 * Math.log10(0.5), 0.05, 'tone gain dB');
+  near(r.ph, -45, 0.2, 'tone phase deg');
+  near(r.f, f, f * 1e-4, 'tone frequency is the played one');
+  near(bodeTone(out, inp, req).ph, 45, 0.2, 'tone phase sign flips');
+  // 8-bit samples (25 codes/div at 1 V/div) with ±0.5 code of noise before rounding.
+  let seed = 1;
+  const rnd = () => ((seed = (seed * 1103515245 + 12345) % 2 ** 31) / 2 ** 31) - 0.5;
+  const q = (x: number) => Math.round(x / 0.04 + rnd()) * 0.04;
+  const qi = frame(0, n, xinc, (t) => q(1.0 * Math.cos(w * t) + 0.2)), qo = frame(1, n, xinc, (t) => q(0.5 * Math.cos(w * t - Math.PI / 4) - 0.1));
+  const rq = bodeTone(qi, qo, req);
+  near(rq.db, 20 * Math.log10(0.5), 0.1, 'quantised tone gain dB');
+  near(rq.ph, -45, 0.5, 'quantised tone phase deg');
+}
+
+// --- unwrapPhase: no step over 180° between neighbours ------------------------------------
+assert.deepEqual(unwrapPhase([-170, 175, 160]), [-170, -185, -200]);
+assert.deepEqual(unwrapPhase([10, -20, -90, -150]), [10, -20, -90, -150]);
+assert.deepEqual(unwrapPhase([170, -170]), [170, 190]);
+assert.deepEqual(unwrapPhase([]), []);
+assert.deepEqual(unwrapPhase([42]), [42]);
+checks += 5;
+
+// --- spanAtLeast: Bode axes never magnify noise, never cut data ---------------------------
+{
+  const [lo, hi] = spanAtLeast(-0.12, -0.03, 6);
+  assert.ok(hi - lo >= 6 - 1e-9 && lo <= -0.12 && hi >= -0.03, `flat gain axis ${lo}…${hi}`);
+  assert.deepEqual(spanAtLeast(-40, 0, 6), [-40, 0]);
+  assert.deepEqual(spanAtLeast(Number.NaN, Number.NaN, 90), [-45, 45]);
+  checks += 3;
 }
 
 // --- measure: 1 kHz square, 30 % duty, 0…3.3 V --------------------------------------------
@@ -323,9 +359,19 @@ checks += 6;
   const touched = new Set([...SWEEP_SCOPE, ...pointCmds(1000, 1e-3), 'CHAN1:SCAL 1', 'CHAN2:SCAL 1'].map(head).filter((h) => !h.startsWith('SOUR') && h !== 'RUN'));
   const saved = {
     tb: '0.001', hoff: '0', swe: 'NORMal', stat: 'STOP', src: 'CHAN2', d1: '1', d2: '0',
-    s1: '0.5', s2: '2', o1: '0.1', o2: '-0.4', p1: '10', p2: '1',
+    s1: '0.5', s2: '2', o1: '0.1', o2: '-0.4', p1: '10', p2: '1', c1: 'DC', c2: 'GND', roll: '1', mdep: '2.58048e+5',
   };
   const restore = scopeRestore(saved);
+  // ACQ:MDEP? is the planned length: 258 048 sent back would select 512K (measured), so snap it.
+  assert.ok(restore.includes('ACQ:MDEP 262144') && restore.includes('ACQ:ROLL ON') && restore.includes('CHAN1:COUP DC') && restore.includes('CHAN2:COUP GND'), restore.join('; '));
+  const at = (h: string) => restore.findIndex((c) => c.startsWith(h));
+  assert.ok(at('ACQ:MDEP') > at('CHAN1:DISP') && at('ACQ:MDEP') > at('CHAN2:DISP'), 'depth restored after the channels');
+  assert.ok(!scopeRestore({ ...saved, c1: '', mdep: 'NAN' }).some((c) => c.startsWith('CHAN1:COUP') || c.startsWith('ACQ:MDEP')), 'unreported coupling/depth skipped');
+  assert.ok(SWEEP_SCOPE.indexOf('ACQ:MDEP 32768') > SWEEP_SCOPE.indexOf('CHAN2:DISP ON'), 'sweep: 32 768 per channel of two = the 64K budget, the smallest');
+  // ACQ:MDEP is per enabled channel (firmware RecordBudget::covering): 2 channels on a 64K budget report 32 768.
+  const two = (mdep: string) => scopeRestore({ ...saved, d2: '1', mdep }).find((c) => c.startsWith('ACQ:MDEP'));
+  assert.deepEqual([two('3.2768e+4'), two('1.26976e+5'), two('2.58048e+5')], ['ACQ:MDEP 32768', 'ACQ:MDEP 131072', 'ACQ:MDEP 262144']);
+  checks += 5;
   for (const h of touched) assert.ok(restore.some((c) => head(c) === h), `restore misses ${h}`);
   assert.ok(restore.includes('TRIG:SWE NORM') && restore.includes('TRIG:EDGE:SOUR CHAN2') && restore.at(-1) === 'STOP', restore.join('; '));
   assert.ok(scopeRestore({ ...saved, swe: 'SINGle', stat: 'WAIT' }).at(-1) === 'SING', 'single is restored with SING');
