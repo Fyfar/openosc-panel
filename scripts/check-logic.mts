@@ -2,7 +2,7 @@
 // scope measurements and generator command order. Run: `npm run check`.
 import assert from 'node:assert/strict';
 import { bodePlan, fmtStable, fwAtLeast, genMaxHz, interleaveBlockers, parseHz, scaleFor, seenRef, VDIV_MV } from '../src/device.ts';
-import { addStat, emptyStats, FFT_WINDOWS, gainPhase, histogram, measure, spectrum, stdDev, yFloor, type Frame } from '../src/dsp.ts';
+import { addStat, emptyStats, FFT_WINDOWS, fftNotes, fftSpanHz, findPeak, gainPhase, histogram, measure, peakIn, peakNear, spectrum, spectrumOf, stdDev, yFloor, type FftWindow, type Frame } from '../src/dsp.ts';
 import { parseFrame, parseMeas, screenWindow } from '../src/io/scope.ts';
 import { pointCmds, rerange, scopeRestore, SWEEP_SCOPE } from '../src/io/bode.ts';
 import { dmmDiff } from '../src/io/dmm.ts';
@@ -116,15 +116,114 @@ const frame = (ch: 0 | 1, n: number, xinc: number, fn: (t: number) => number): F
   near(m.edges, 4, 0, 'square rising edges (4 periods)');
 }
 
-// --- spectrum: a bin-centred 1.5 V sine reads 1.5 V at its bin with every window ------------
+// --- spectrum: every sample, mean removed; a bin-centred 1.5 V sine on 2 V reads 1.5 V ------
 {
-  const N = 2048, bin = 64, v = Float32Array.from({ length: N }, (_, i) => 1.5 * Math.sin((2 * Math.PI * bin * i) / N) + 0.2);
+  const L = 3000, N = 4096, bin = 256, phase = (i: number) => (2 * Math.PI * bin * i) / N;
+  const v = Float32Array.from({ length: L }, (_, i) => 1.5 * Math.sin(phase(i)) + 2);
   for (const w of FFT_WINDOWS) {
     const amp = spectrum(v, w);
-    assert.equal(amp.length, N / 2);
-    near(amp[bin], 1.5, 0.02, `${w} sine amplitude`);
-    near(amp[0], 0.2, 0.02, `${w} DC bin (not doubled)`);
+    assert.equal(amp.length, N / 2, `${w}: ${L} samples padded to ${N}`);
+    near(amp[bin], 1.5, 0.03, `${w} sine amplitude within 2 %`);
+    near(amp[0], 0, 0.02, `${w} DC removed`);
   }
+  const tail = Float32Array.from({ length: L }, (_, i) => (i < 2048 ? 0 : Math.sin(phase(i))));
+  assert.ok(spectrum(tail, 'RECT')[bin] > 0.2, 'samples past the last power of two contribute');
+  checks++;
+
+  const dt = 1 / 6.25e6;
+  const amp = spectrum(Float32Array.from({ length: 62_500 }, (_, i) => Math.sin(2 * Math.PI * 150e3 * i * dt)), 'HANN');
+  let top = 1;
+  for (let k = 2; k < amp.length; k++) if (amp[k] > amp[top]) top = k;
+  near(top / (2 * amp.length * dt), 150e3, 48, '150 kHz at 6.25 MSa/s peaks at 150 kHz');
+}
+
+// --- findPeak: interpolated between bins; withheld or ≈ where it can't be trusted -----------
+const wave = (L: number, fn: (i: number) => number): Frame =>
+  ({ ch: 0, seq: 1, xinc: 1e-6, xorig: 0, volts: Float32Array.from({ length: L }, (_, i) => fn(i)) });
+// 1 V sine with `periods` periods in L samples, so its frequency is `periods` resolutions.
+const tonePk = (L: number, periods: number, win: FftWindow, phase = 0) => {
+  const s = spectrumOf(wave(L, (i) => Math.sin((2 * Math.PI * periods * i) / L + phase) + 0.5), win);
+  return { s, p: findPeak(s, 1, win) };
+};
+{
+  for (const [win, tol] of [['HANN', 0.05], ['BLACK', 0.05], ['HAMM', 0.06]] as const) {
+    let worstHz = 0, worstLevel = 0;
+    for (const L of [1000, 600]) { // barely and heavily zero-padded
+      for (let periods = 5; periods < L / 2 - 2.1; periods += 0.37) {
+        for (const phase of [0, 1, 2]) {
+          const { s, p } = tonePk(L, periods, win, phase);
+          assert.deepEqual([p.withheld, p.approxHz], [null, false], `${win} L=${L} ${periods} periods`);
+          if (periods >= 5.1) assert.equal(p.approxLevel, false, `${win} L=${L} ${periods} periods is exact`); // boundary ± the error
+          worstHz = Math.max(worstHz, Math.abs(p.hz / s.resHz - periods));
+          worstLevel = Math.max(worstLevel, Math.abs(p.amp - 1));
+        }
+      }
+    }
+    near(worstHz, 0, 0.1, `${win} worst frequency error in resolutions`);
+    near(worstLevel, 0, tol, `${win} worst level error`);
+  }
+  for (const phase of [0, 1, 2, 3]) assert.equal(tonePk(1000, 1.5, 'HANN', phase).p.withheld, 'low', `1.5 periods, phase ${phase}`);
+  const few = tonePk(1000, 3, 'HANN').p;
+  assert.deepEqual([few.withheld, few.approxHz, few.approxLevel, few.fewPeriods], [null, false, true, true], '3 periods');
+  assert.equal(tonePk(1000, 499, 'HANN').p.withheld, 'limit', '1 resolution below half rate');
+  const rect = tonePk(1000, 20.5, 'RECT').p;
+  assert.deepEqual([rect.withheld, rect.approxHz, rect.approxLevel, rect.fewPeriods], [null, true, true, false], 'Rect is approximate');
+  const noise = spectrumOf(wave(1000, (i) => 0.01 * Math.sin(i * i * 12.9898)), 'HANN');
+  assert.equal(findPeak(noise, 1, 'HANN').withheld, 'none', 'noise far below vdiv/50');
+
+  const { s } = tonePk(1000, 20.3, 'HANN'), at = (20.3 * s.resHz) / s.binHz;
+  near(peakIn(s.amp, 14, 22)!.bin, at, 0.1, 'a range holding the peak off-centre finds it');
+  assert.equal(peakIn(s.amp, 14, 18)!.bin, 18, 'a range on the slope gives its highest bin, not an extrapolation');
+  assert.equal(peakIn(Float32Array.of(9, 1, 2, 1), 0, 3)!.bin, 2, 'never bin 0');
+  assert.equal(peakIn(s.amp, s.amp.length, s.amp.length + 5), null, 'a range past the end is empty');
+  checks += 10;
+}
+
+// --- fftNotes: one id per condition, in the order the panel lists them -----------------------
+{
+  const peak = tonePk(1000, 20.5, 'HANN').p; // 20.5 kHz
+  const fine = { samples: 1000, screen: 1000, clipped: false, swing: 4, vdiv: 1, peak, spanHz: 1e5 };
+  assert.deepEqual(fftNotes(fine), [], 'nothing wrong, no notes');
+  for (const [change, ids] of [
+    [{ screen: 2000 }, ['partial']],
+    [{ clipped: true }, ['clipped']],
+    [{ swing: 0.25 }, ['small']],
+    [{ samples: 63, screen: 63, peak: null }, ['few']],
+    [{ peak: { ...peak, withheld: 'low', fewPeriods: true } }, ['low']],
+    [{ peak: { ...peak, withheld: 'limit' } }, ['limit']],
+    [{ peak: { ...peak, fewPeriods: true } }, ['periods']],
+    [{ peak: { ...peak, approxHz: true } }, ['rect']],
+    [{ spanHz: 1e4 }, ['beyond']],
+    [{ spanHz: 1e4, peak: { ...peak, withheld: 'none' } }, []],
+    [{ spanHz: 1e4, screen: 2000, clipped: true, peak: { ...peak, fewPeriods: true, approxHz: true } }, ['partial', 'clipped', 'periods', 'rect', 'beyond']],
+  ] as const) {
+    assert.deepEqual(fftNotes({ ...fine, ...change }), ids, ids.join() || 'no signal is not "beyond the view"');
+  }
+  checks += 12;
+}
+
+// --- fftSpanHz: Auto shows 1000 resolution steps, never past half the sample rate ------------
+{
+  const at = (samples: number, xinc: number) => spectrumOf({ ch: 0, seq: 1, xinc, xorig: 0, volts: new Float32Array(samples) }, 'HANN');
+  const slow = at(62_500, 1 / 6.25e6); // 1 ms/div: 10 ms on screen
+  near(fftSpanHz(slow, 'AUTO'), 100_000, 1e-6, 'Auto span for 10 ms at 6.25 MSa/s');
+  near(fftSpanHz(slow, 'FULL'), 3.125e6, 1e-6, 'Full span is half the sample rate');
+  near(fftSpanHz(at(1000, 1e-6), 'AUTO'), 500_000, 1e-6, 'Auto stops at half the sample rate');
+}
+
+// --- peakNear: what a marker reads; nothing above half the sample rate -----------------------
+{
+  const { s } = tonePk(1000, 20.3, 'HANN'); // 20.3 kHz, resolution 1 kHz
+  const on = peakNear(s, 19_500, 1000)!;
+  near(on.hz, 20_300, 100, 'a marker next to a peak reads the peak');
+  near(on.amp, 1, 0.05, 'and its level');
+  assert.equal(peakNear(s, 600_000, 1000), null, 'above half the sample rate there is no value');
+  assert.equal(peakNear(s, NaN, 1000), null, 'an unplaced marker reads nothing');
+  checks += 2;
+  const square = spectrumOf(wave(2000, (i) => ((i % 100) < 50 ? 1 : -1)), 'HANN'); // 10 kHz
+  const a = peakNear(square, 10_000, 500)!, b = peakNear(square, 30_000, 500)!;
+  near(b.hz - a.hz, 20_000, 50, 'ΔF from the fundamental to the third harmonic');
+  near(20 * Math.log10(b.amp / a.amp), -9.5, 0.3, 'their level difference in dB');
 }
 
 // --- fmtStable: a reading hovering at a prefix edge keeps its unit and its width --------------

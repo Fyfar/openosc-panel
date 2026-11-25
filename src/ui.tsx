@@ -1,6 +1,34 @@
 import { clsx } from 'clsx';
 import { ChevronLeft, ChevronRight } from 'lucide-react';
-import type { ReactNode } from 'react';
+import { Children, type ReactNode } from 'react';
+
+export const CH_COLOR = ['#facc15', '#22d3ee'];
+
+// Readouts in columns of three, after a label column. In each column the labels are as wide as
+// its longest label and every value has a fixed 10ch slot, so a changing value never moves the
+// next column. Scrolls sideways rather than wrapping, so every value keeps its place.
+export function Columns({ head, children, className }: { head: ReactNode; children: ReactNode; className?: string }) {
+  const cells = Children.toArray(children);
+  const cols = Array.from({ length: Math.ceil(cells.length / 3) }, (_, i) => cells.slice(3 * i, 3 * i + 3));
+  return (
+    <div className={clsx('flex gap-x-5 overflow-x-auto', className)}>
+      <div className="flex w-10 shrink-0 flex-col gap-y-1">{head}</div>
+      <div className="flex gap-x-12">
+        {cols.map((col, i) => <div key={i} className="grid shrink-0 grid-cols-[auto_10ch] content-start gap-x-2 gap-y-1">{col}</div>)}
+      </div>
+    </div>
+  );
+}
+
+// One label + value pair: two cells of its column's grid.
+export function M({ l, v, hint }: { l: string; v: string; hint?: string }) {
+  return (
+    <>
+      <span title={hint} className="text-muted whitespace-nowrap">{l}</span>
+      <span title={hint} className="tabular-nums whitespace-nowrap text-fg">{v}</span>
+    </>
+  );
+}
 
 export function Panel({ title, right, children, className }: { title?: ReactNode; right?: ReactNode; children: ReactNode; className?: string }) {
   return (

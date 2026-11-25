@@ -22,9 +22,11 @@ install, no backend. Your data never leaves your machine.
 ## Features
 
 - **The scope on your monitor.** Both channels live, edge trigger, Run/Stop/Single, Auto
-  setup, Roll, time and level cursors, FFT with four windows. The same measurements as the
-  device's own readouts (frequency, Vpp, amplitude, RMS, duty and more), plus the hardware
-  frequency counter on each channel. Export the full capture record as CSV.
+  setup, Roll, time and level cursors. The same measurements as the device's own readouts
+  (frequency, Vpp, amplitude, RMS, duty and more), plus the hardware frequency counter on
+  each channel. Export the full capture record as CSV.
+- **An FFT you can measure on.** Peak frequency and level, two markers for differences, four
+  windows, and plain notes on the panel when a spectrum can't be trusted.
 - **Bode plots in one click.** The panel sweeps the generator, re-ranges each channel as the
   gain changes, reads off the −3 dB corner and roll-off, then puts your settings back.
 - **A generator you can type into.** `10k`, `2.5 MHz`, `500 mHz`. Six shapes, duty cycle,

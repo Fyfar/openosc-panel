@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import type { DmmFunc, HoldMode, Mode, Model, Profile, Shape } from './device';
-import { emptyStats, type DmmStats, type FftWindow } from './dsp';
+import { emptyStats, type DmmStats, type FftSpan, type FftWindow } from './dsp';
 
 export type LinkState = 'disconnected' | 'connecting' | 'connected' | 'switching';
 
@@ -30,6 +30,8 @@ export type State = {
   fftWin: FftWindow;
   fftScale: FftScale;
   fftSrc: 0 | 1;
+  fftSpan: FftSpan;
+  fftMarkers: boolean;
   logging: boolean;
   update: boolean; // a newer deploy exists (src/pwa.ts); the user decides when to reload
 
@@ -88,6 +90,8 @@ export const useDev = create<State>((set) => ({
   fftWin: 'HANN',
   fftScale: 'DBV',
   fftSrc: 0,
+  fftSpan: 'AUTO',
+  fftMarkers: false,
   logging: false,
 
   dmm: { func: 'VDC', auto: true, range: 0, hold: false, holdMode: 'MAN', rel: false, cj: null },

@@ -3,11 +3,20 @@
 // the trend's Y floor. Pure, no device access.
 // PEAK frames (WAV:POIN:MODE PEAK) carry each bucket's min and max in lo/hi; volts is then their
 // midpoint, good for drawing levels but not for spectra.
-export type Frame = { ch: 0 | 1; seq: number; xinc: number; xorig: number; volts: Float32Array; lo?: Float32Array; hi?: Float32Array };
+// `win` and `scale` say where a device frame sits in its record (samples first…end − 1, `interval`
+// seconds apart) and how its bytes became volts: enough to read the same window again.
+export type RecordWindow = { first: number; end: number; interval: number };
+export type Scale = { yinc: number; zero: number; yref: number }; // volts = (byte − yref − zero) · yinc
+export type Frame = {
+  ch: 0 | 1; seq: number; xinc: number; xorig: number; volts: Float32Array; lo?: Float32Array; hi?: Float32Array;
+  win?: RecordWindow; scale?: Scale;
+  screen?: number; clipped?: boolean; // full-rate FFT data: samples across the screen; any on an ADC rail
+};
 
 export function extent(v: Float32Array) {
   let mn = Infinity, mx = -Infinity;
-  for (const x of v) { if (x < mn) mn = x; if (x > mx) mx = x; }
+  // Indexed: for-of over a typed array is several times slower, and this runs on 65 536 samples.
+  for (let i = 0; i < v.length; i++) { const x = v[i]; if (x < mn) mn = x; if (x > mx) mx = x; }
   return { mn, mx };
 }
 
@@ -93,42 +102,147 @@ const WINDOW_FN: Record<FftWindow, (x: number) => number> = { // x = 2πi/(N−1
   BLACK: (x) => 0.42 - 0.5 * Math.cos(x) + 0.08 * Math.cos(2 * x),
 };
 
-// Peak amplitude (V) per bin 0..N/2 of the largest power-of-two prefix of `v`, corrected for the
-// window's coherent gain so a sine of amplitude A reads ≈ A at its bin.
-export function spectrum(v: Float32Array, win: FftWindow): Float32Array {
-  let N = 1;
-  while (N * 2 <= v.length) N *= 2;
-  const re = new Float64Array(N), im = new Float64Array(N), w = WINDOW_FN[win];
-  let gain = 0;
-  for (let i = 0; i < N; i++) {
-    const k = w((2 * Math.PI * i) / (N - 1));
-    re[i] = v[i] * k;
-    gain += k;
+// One-slot caches: the view transforms one channel with one window, over and over.
+let winCache = { win: 'RECT' as FftWindow, w: new Float64Array(0), sum: 0 };
+function windowFor(win: FftWindow, len: number) {
+  if (winCache.win !== win || winCache.w.length !== len) {
+    const w = new Float64Array(len);
+    let sum = 0;
+    for (let i = 0; i < len; i++) {
+      w[i] = WINDOW_FN[win]((2 * Math.PI * i) / (len - 1));
+      sum += w[i];
+    }
+    winCache = { win, w, sum };
   }
+  return winCache;
+}
+
+let twiddles = { cos: new Float64Array(0), sin: new Float64Array(0) };
+function twiddlesFor(N: number) {
+  if (twiddles.cos.length !== N / 2) {
+    const cos = new Float64Array(N / 2), sin = new Float64Array(N / 2);
+    for (let k = 0; k < N / 2; k++) {
+      cos[k] = Math.cos((-2 * Math.PI * k) / N);
+      sin[k] = Math.sin((-2 * Math.PI * k) / N);
+    }
+    twiddles = { cos, sin };
+  }
+  return twiddles;
+}
+
+// Peak amplitude (V) per bin of all of `v`: mean removed, windowed, zero-padded to a power of two N.
+// The result holds bins k < N/2, bin k at k / (N·dt) Hz; a sine of amplitude A reads ≈ A at its bin.
+export function spectrum(v: Float32Array, win: FftWindow): Float32Array {
+  const L = v.length, { w, sum } = windowFor(win, L);
+  let N = 1;
+  while (N < L) N *= 2;
+  let mean = 0;
+  for (let i = 0; i < L; i++) mean += v[i];
+  mean /= L;
+  const re = new Float64Array(N), im = new Float64Array(N);
+  for (let i = 0; i < L; i++) re[i] = (v[i] - mean) * w[i];
   fftInPlace(re, im);
   const amp = new Float32Array(N / 2);
-  for (let k = 0; k < N / 2; k++) amp[k] = ((k ? 2 : 1) * Math.hypot(re[k], im[k])) / gain; // ×2: one-sided, not DC
+  // ×2: one-sided, not DC. Math.sqrt, as Math.hypot is several times slower.
+  for (let k = 0; k < amp.length; k++) amp[k] = ((k ? 2 : 1) * Math.sqrt(re[k] * re[k] + im[k] * im[k])) / sum;
   return amp;
+}
+
+// `amp` plus what its bins mean: spacing, the resolution of the analysed samples (1 / their time,
+// coarser than the zero-padded spacing) and half the sample rate.
+export type Spectrum = { amp: Float32Array; binHz: number; resHz: number; topHz: number };
+
+export function spectrumOf(f: Frame, win: FftWindow): Spectrum {
+  const amp = spectrum(f.volts, win), topHz = 1 / (2 * f.xinc);
+  return { amp, binHz: topHz / amp.length, resHz: 1 / (f.volts.length * f.xinc), topHz };
+}
+
+// Highest bin in lo…hi (never bin 0, the window's DC leftover) as a fractional bin and level. A local
+// maximum is refined by a parabola through the logs of its three bins; null when the range is empty.
+export function peakIn(amp: Float32Array, lo: number, hi: number): { bin: number; amp: number } | null {
+  const from = Math.max(1, Math.round(lo)), to = Math.min(amp.length - 1, Math.round(hi));
+  if (from > to) return null;
+  let k = from;
+  for (let i = from + 1; i <= to; i++) if (amp[i] > amp[k]) k = i;
+  const a = amp[k - 1], b = amp[k], c = amp[k + 1] ?? Infinity;
+  if (!(a > 0 && c > 0 && b >= a && b >= c)) return { bin: k, amp: b };
+  const la = Math.log(a), lb = Math.log(b), lc = Math.log(c), curve = la - 2 * lb + lc;
+  const shift = curve < 0 ? (0.5 * (la - lc)) / curve : 0;
+  return { bin: k + shift, amp: Math.exp(lb - 0.25 * (la - lc) * shift) };
+}
+
+// The highest point within `reachHz` of `hz` (a marker's reading); null above half the sample rate.
+export function peakNear(s: Spectrum, hz: number, reachHz: number): { hz: number; amp: number } | null {
+  if (!(hz <= s.topHz)) return null;
+  const found = peakIn(s.amp, (hz - reachHz) / s.binHz, (hz + reachHz) / s.binHz);
+  return found && { hz: found.bin * s.binHz, amp: found.amp };
+}
+
+// Auto shows 1000 resolution steps (100 kHz at 1 ms/div), never past half the sample rate.
+export type FftSpan = 'AUTO' | 'FULL';
+export const fftSpanHz = (s: Spectrum, span: FftSpan) => (span === 'FULL' ? s.topHz : Math.min(s.topHz, 1000 * s.resHz));
+
+// The strongest component and how far to trust it. Thresholds come from simulation: under 5 periods
+// the level is rough, under 2 or within 2 resolutions of half the sample rate both values are.
+export type Peak = {
+  hz: number; amp: number; withheld: 'none' | 'low' | 'limit' | null;
+  fewPeriods: boolean; approxHz: boolean; approxLevel: boolean;
+};
+
+export function findPeak(s: Spectrum, vdiv: number, win: FftWindow): Peak {
+  const found = peakIn(s.amp, 1, s.amp.length - 1) ?? { bin: 0, amp: 0 };
+  const hz = found.bin * s.binHz, periods = hz / s.resHz;
+  let withheld: Peak['withheld'] = null;
+  if (found.amp < vdiv / 50) withheld = 'none';
+  else if (periods < 2) withheld = 'low';
+  else if (hz > s.topHz - 2 * s.resHz) withheld = 'limit';
+  const rect = win === 'RECT', fewPeriods = periods < 5;
+  return { hz, amp: found.amp, withheld, fewPeriods, approxHz: rect, approxLevel: rect || fewPeriods };
+}
+
+// Why the spectrum may mislead, as ids in the order the panel lists them (the view holds the text).
+// samples: analysed; screen: samples across the screen; swing and vdiv in volts.
+export const MIN_FFT_SAMPLES = 64;
+export type FftState = {
+  samples: number; screen: number; clipped: boolean; swing: number; vdiv: number; peak: Peak | null; spanHz: number;
+};
+export type FftNote = 'partial' | 'clipped' | 'small' | 'few' | 'low' | 'limit' | 'periods' | 'rect' | 'beyond';
+
+export function fftNotes(s: FftState): FftNote[] {
+  const p = s.peak;
+  const active: Record<FftNote, boolean> = {
+    partial: s.screen > s.samples,
+    clipped: s.clipped,
+    small: s.swing < s.vdiv,
+    few: s.samples < MIN_FFT_SAMPLES,
+    low: p?.withheld === 'low',
+    limit: p?.withheld === 'limit',
+    periods: p?.withheld === null && p.fewPeriods,
+    rect: p?.approxHz === true,
+    beyond: p != null && p.withheld !== 'none' && p.hz > s.spanHz,
+  };
+  return (Object.keys(active) as FftNote[]).filter((id) => active[id]);
 }
 
 // Radix-2 decimation in time; N a power of two.
 function fftInPlace(re: Float64Array, im: Float64Array) {
-  const N = re.length;
+  const N = re.length, { cos, sin } = twiddlesFor(N);
   for (let i = 1, j = 0; i < N; i++) {
     let bit = N >> 1;
     for (; j & bit; bit >>= 1) j ^= bit;
     j ^= bit;
     if (i < j) { [re[i], re[j]] = [re[j], re[i]]; [im[i], im[j]] = [im[j], im[i]]; }
   }
+  // Values held in locals: about 20 % faster than re-reading the arrays.
   for (let len = 2; len <= N; len <<= 1) {
-    const ang = (-2 * Math.PI) / len;
+    const half = len >> 1, step = N / len;
     for (let i = 0; i < N; i += len) {
-      for (let k = 0; k < len / 2; k++) {
-        const wr = Math.cos(ang * k), wi = Math.sin(ang * k);
-        const a = i + k, b = a + len / 2;
-        const tr = re[b] * wr - im[b] * wi, ti = re[b] * wi + im[b] * wr;
-        re[b] = re[a] - tr; im[b] = im[a] - ti;
-        re[a] += tr; im[a] += ti;
+      for (let k = 0, t = 0; k < half; k++, t += step) {
+        const wr = cos[t], wi = sin[t], a = i + k, b = a + half;
+        const ar = re[a], ai = im[a], br = re[b], bi = im[b];
+        const tr = br * wr - bi * wi, ti = br * wi + bi * wr;
+        re[a] = ar + tr; im[a] = ai + ti;
+        re[b] = ar - tr; im[b] = ai - ti;
       }
     }
   }
