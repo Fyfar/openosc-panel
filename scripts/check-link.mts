@@ -6,6 +6,7 @@ import { Link, sleep } from '../src/link.ts';
 import { link, runLoop, stopLoop } from '../src/io/core.ts';
 import { dmmLogCsv, dmmLoop, flushDmm } from '../src/io/dmm.ts';
 import { scopeData, scopeLoop, scopeRun } from '../src/io/scope.ts';
+import { bodeStop, bodeSweep } from '../src/io/bode.ts';
 import { useDev } from '../src/store.ts';
 
 const enc = new TextEncoder();
@@ -157,6 +158,15 @@ let checks = 0;
   checks += 4;
 }
 
+// A fake from three tables: set-commands change state, `wave` queries are computed, `cfg` are fixed.
+function tableDevice(setting: Record<string, (arg: string) => void>, wave: Record<string, () => Answer>, cfg: Record<string, string>) {
+  return fakePort((c) => {
+    const [cmd, arg] = c.split(' ');
+    setting[cmd]?.(arg);
+    return wave[c]?.() ?? cfg[c] ?? (c.includes('?') ? 'NAN' : null);
+  });
+}
+
 // --- scope loop: 0.21.9 reads both channels with one WAV:FRAM? (PEAK when decimated) plus the device's readouts; 0.21.7 never gets a command it doesn't know (-113)
 function fakeScope(samples = 65536) { // samples < ACQ:MDEP?: a Roll record still filling
   const w = { star: 1, stop: 0, poin: 0, peak: false, seq: 0, src: 'CHAN1' };
@@ -199,11 +209,7 @@ function fakeScope(samples = 65536) { // samples < ACQ:MDEP?: a Roll record stil
   const wave: Record<string, () => Answer> = {
     'WAV:SEQ?': () => String(w.seq + (w.poin ? 0 : knob.seqSkew)), 'WAV:DATA?': data, 'WAV:FRAM?': frame,
   };
-  const dev = fakePort((c) => {
-    const [cmd, arg] = c.split(' ');
-    setting[cmd]?.(arg);
-    return wave[c]?.() ?? cfg[c] ?? (c.includes('?') ? 'NAN' : null);
-  });
+  const dev = tableDevice(setting, wave, cfg);
   return { dev, cfg, reads, knob };
 }
 
@@ -387,6 +393,96 @@ await withScope({ fft: true, fw: '0.21.7' }, async (s) => {
   await link.close();
   const sent = dev.written.slice(from);
   assert.ok(sent.indexOf('TRIG:SWE AUTO') >= 0 && sent.indexOf('TRIG:SWE AUTO') < sent.indexOf('RUN'), `Run after Single: ${sent.join(' | ')}`);
+  checks += 3;
+}
+
+// --- Bode sweep: whole records from a fresh acquisition, slow records waited for, generator stop ---
+// The generator plays 0.1 % above the request; CH2 = CH1 at −6 dB, −45°. Each CH1 WAV:PRE? is a newer
+// record (the firmware's repeated PRE?), CH2's reads the same one. `nanAt`: the first two PRE? after that
+// frequency set answer NAN; `stuckAt`: all of them; `outOffAt`: that OUTP? query reads 0.
+function fakeBode() {
+  const st = { freq: 1000, tb: 1e-3, vd: [1, 1], src: 1, seq: 0, nan: 0, nanAt: 0, stuckAt: 0, outOffAt: 0, outQ: 0, freqSets: 0, star: [] as string[] };
+  const xinc = () => (20 * st.tb) / 65536;
+  const cfg: Record<string, string> = {
+    '*IDN?': 'OpenOSC,DS1052,T,0.21.14', '*OPC?': '1', 'SYST:ERR?': '0,"No error"', 'TIM:SCAL?': '0.001', 'TIM:OFFS?': '0',
+    'TRIG:SWE?': 'AUTO', 'TRIG:STAT?': 'TD', 'TRIG:EDGE:SOUR?': 'CHAN1', 'CHAN1:DISP?': '1', 'CHAN2:DISP?': '0',
+    'CHAN1:SCAL?': '1', 'CHAN2:SCAL?': '2', 'CHAN1:OFFS?': '0', 'CHAN2:OFFS?': '0', 'CHAN1:PROB?': '1', 'CHAN2:PROB?': '1',
+    'CHAN1:COUP?': 'DC', 'CHAN2:COUP?': 'DC', 'ACQ:ROLL?': '1', 'ACQ:MDEP?': '2.58048e+5',
+  };
+  const data = () => {
+    const f = st.freq * 1.001, ch = st.src, yinc = st.vd[ch - 1] / 25, amp = ch === 1 ? 1 : 0.5, ph = ch === 1 ? 0 : -Math.PI / 4;
+    const b = Uint8Array.from({ length: 65536 }, (_, i) => Math.max(0, Math.min(255, 128 + Math.round((amp * Math.cos(2 * Math.PI * f * i * xinc() + ph)) / yinc))));
+    return Uint8Array.from([...enc.encode('#565536'), ...b, 10]);
+  };
+  const setting: Record<string, (arg: string) => void> = {
+    'SOUR:FREQ': (a) => { st.freq = +a; if (++st.freqSets === st.nanAt) st.nan = 2; },
+    'TIM:SCAL': (a) => (st.tb = +a), 'CHAN1:SCAL': (a) => (st.vd[0] = +a), 'CHAN2:SCAL': (a) => (st.vd[1] = +a),
+    'WAV:SOUR': (a) => (st.src = +a.slice(4)), 'WAV:STAR': (a) => st.star.push(a),
+  };
+  const pre = () => {
+    if (st.freqSets === st.stuckAt || st.nan-- > 0) return 'NAN';
+    if (st.src === 1) st.seq++;
+    return `0,0,65536,1,${xinc()},0,0,${st.vd[st.src - 1] / 25},0,128`;
+  };
+  const wave: Record<string, () => Answer> = {
+    'WAV:PRE?': pre, 'WAV:SEQ?': () => String(st.seq), 'WAV:DATA?': data, 'OUTP?': () => (++st.outQ === st.outOffAt ? '0' : '1'),
+  };
+  const dev = tableDevice(setting, wave, cfg);
+  return { dev, st };
+}
+const near = (got: number, want: number, tol: number, what: string) => assert.ok(Math.abs(got - want) <= tol, `${what}: got ${got}, want ${want} ± ${tol}`);
+async function runBode(setup: (st: ReturnType<typeof fakeBode>['st']) => void, storeTb = 15) {
+  const { dev, st } = fakeBode();
+  setup(st);
+  useDev.setState({ idn: { model: 'DS1052', serial: 'T', fw: '0.21.14' }, model: 'ZT703S', profile: 'DS1052', error: null });
+  useDev.getState().patch('scope', { tb: storeTb });
+  useDev.getState().patch('bode', { start: 1000, stop: 10_000, ppd: 2 }); // 1 k, 3.16 k, 10 k
+  await link.open(dev.port);
+  await bodeSweep();
+  await link.close();
+  return { sent: dev.written, st, points: useDev.getState().bode.points, error: useDev.getState().error };
+}
+{
+  const r = await runBode((st) => (st.nanAt = 2)); // the 2nd point's first two PRE? answer NAN
+  assert.equal(r.points.length, 3, `points: ${JSON.stringify(r.points)} ${r.error}`);
+  for (const p of r.points) {
+    near(p.db, -6.02, 0.1, 'Bode gain');
+    near(p.ph, -45, 0.5, 'Bode phase');
+  }
+  [1000, 10 ** 3.5, 10_000].forEach((f, i) => near(r.points[i].f, f * 1.001, f * 1e-4, 'Bode point at the played frequency'));
+  assert.ok(r.st.star.every((a) => a === '1'), `whole records only: WAV:STAR ${r.st.star.join(',')}`);
+  assert.ok(r.sent.includes('CHAN2:SCAL 0.5'), 'CH2 (0.5 V on 1 V/div after starting from CH1\'s V/div) ranged down');
+  const tail = r.sent.slice(r.sent.lastIndexOf('WAV:DATA?'));
+  for (const c of ['ACQ:ROLL ON', 'ACQ:MDEP 262144', 'CHAN1:COUP DC', 'CHAN2:DISP OFF', 'CHAN2:SCAL 2']) assert.ok(tail.includes(c), `restored ${c}`);
+  checks += 3;
+
+  const fast = await runBode((st) => (st.nanAt = 2), 6); // Scope screen last at 1 µs/div
+  assert.deepEqual(fast.points, r.points, 'the Scope screen\'s timebase changes nothing');
+  checks++;
+}
+{
+  const r = await runBode((st) => (st.stuckAt = 3)); // SOUR:FREQ #1 is the setup, #3 the 2nd point
+  assert.equal(r.points.length, 2, 'a point with no record before its deadline is skipped');
+  assert.match(r.error ?? '', /1 point\(s\) skipped/);
+  assert.equal(useDev.getState().bode.running, false);
+  checks += 3;
+}
+{
+  const r = await runBode((st) => (st.outOffAt = 3));
+  assert.equal(r.points.length, 2, 'the point measured with the output off is dropped, earlier ones stay');
+  assert.match(r.error ?? '', /generator output turned off/);
+  assert.ok(r.sent.lastIndexOf('ACQ:MDEP 262144') > r.sent.lastIndexOf('WAV:DATA?'), 'restore still sent');
+  checks += 3;
+}
+
+{
+  // Stop while a point waits for a record that never comes: the wait ends at once, nothing counts as skipped.
+  const t0 = performance.now();
+  setTimeout(() => bodeStop(), 300);
+  const r = await runBode((st) => (st.stuckAt = 2));
+  assert.ok(performance.now() - t0 < 1500, `stop took ${Math.round(performance.now() - t0)} ms`);
+  assert.equal(r.error, null, 'a stopped point is not reported as skipped');
+  assert.ok(r.sent.includes('ACQ:MDEP 262144'), 'restore sent after stop');
   checks += 3;
 }
 
