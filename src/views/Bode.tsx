@@ -1,5 +1,5 @@
 import { Download, Play, Square } from 'lucide-react';
-import { useMemo } from 'react';
+import { useMemo, useRef } from 'react';
 import type uPlot from 'uplot';
 import { bodeEta, bodeMaxHz, bodePlan, fmtHz } from '../device';
 import { spanAtLeast, unwrapPhase } from '../dsp';
@@ -17,23 +17,6 @@ export function Bode() {
   const fw = useDev((s) => s.idn?.fw);
   const sineMax = bodeMaxHz(model, amp, fw); // same ceiling as io.bodeSweep
   const plan = useMemo(() => bodePlan(b.start, Math.min(b.stop, sineMax), b.ppd), [b.start, b.stop, b.ppd, sineMax]);
-
-  const opts = useMemo<Omit<uPlot.Options, 'width' | 'height'>>(() => ({
-    legend: { show: false },
-    cursor: { y: false },
-    scales: { x: { time: false, distr: 3, log: 10 }, db: { range: (_u, mn, mx) => spanAtLeast(mn, mx, 6) }, ph: { range: (_u, mn, mx) => spanAtLeast(mn, mx, 90) } },
-    axes: [
-      { ...AXIS, values: (_u, t) => t.map((v) => (v == null ? '' : fmtHz(v, true))) },
-      { ...AXIS, scale: 'db', size: 64, values: (_u, t) => t.map((v) => (v == null ? '' : `${v} dB`)) },
-      { ...AXIS, scale: 'ph', side: 1, size: 48, grid: { show: false }, values: (_u, t) => t.map((v) => (v == null ? '' : `${v}°`)) },
-    ],
-    series: [
-      {},
-      { scale: 'db', stroke: '#facc15', width: 2, points: { size: 4 } },
-      { scale: 'ph', stroke: '#22d3ee', width: 1.5, dash: [6, 4], points: { size: 3 } },
-    ],
-  }), []);
-  const data = useMemo<uPlot.AlignedData>(() => [pts.map((p) => p.f), pts.map((p) => p.db), pts.map((p) => p.ph)], [pts]);
 
   // -3 dB point by linear interpolation in log-frequency.
   const f3 = useMemo(() => {
@@ -53,27 +36,12 @@ export function Bode() {
 
   const set = (p: Partial<typeof b>) => patch('bode', p);
   const startOpts = [1, 10, 100, 1000].map((f) => ({ id: f, label: fmtHz(f, true) }));
-  const stopOpts = [1000, 10_000, 100_000, 300_000, 1e6, 3e6, 10e6].filter((f) => f <= sineMax).map((f) => ({ id: f, label: fmtHz(f, true) }));
+  const stopOpts = stopList(sineMax);
 
   return (
     <div className="grid gap-4 xl:grid-cols-[1fr_320px]">
       <div className="min-w-0 space-y-4">
-        <Panel
-          title="Frequency response"
-          right={
-            <div className="flex items-center gap-3 text-xs">
-              <span className="flex items-center gap-1.5"><span className="h-0.5 w-4 bg-ch1" /> Gain CH2/CH1</span>
-              <span className="flex items-center gap-1.5"><span className="h-0.5 w-4 border-t-2 border-dashed border-ch2" /> Phase</span>
-            </div>
-          }
-        >
-          <Plot opts={opts} data={data} className="h-[clamp(300px,52vh,620px)]" />
-          {b.running && (
-            <div className="mt-3 h-1 overflow-hidden rounded-full bg-surface">
-              <div className="h-full bg-accent transition-all" style={{ width: `${b.progress * 100}%` }} />
-            </div>
-          )}
-        </Panel>
+        <ResponseChart pts={pts} progress={b.running ? b.progress : null} />
         <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
           <Stat label="−3 dB corner" value={f3 ? fmtHz(f3) : '—'} tone="text-ch1" />
           <Stat label="Phase at corner" value={ph3 !== null ? `${ph3.toFixed(1)}°` : '—'} tone="text-ch2" />
@@ -122,6 +90,48 @@ export function Bode() {
 
 type Point = { f: number; db: number; ph: number };
 
+// The gain/phase chart. uPlot's live legend sits in the panel header: the hovered point's values.
+function ResponseChart({ pts, progress }: { pts: Point[]; progress: number | null }) {
+  const legend = useRef<HTMLDivElement>(null);
+  const opts = useMemo<Omit<uPlot.Options, 'width' | 'height'>>(() => ({
+    legend: { live: true, mount: (_u, el) => legend.current?.replaceChildren(el) },
+    cursor: { y: false },
+    scales: { x: { time: false, distr: 3, log: 10 }, db: { range: (_u, mn, mx) => spanAtLeast(mn, mx, 6) }, ph: { range: (_u, mn, mx) => spanAtLeast(mn, mx, 90) } },
+    axes: [
+      { ...AXIS, values: (_u, t) => t.map((v) => (v == null ? '' : fmtHz(v, true))) },
+      { ...AXIS, scale: 'db', size: 64, values: (_u, t) => t.map((v) => (v == null ? '' : `${v} dB`)) },
+      { ...AXIS, scale: 'ph', side: 1, size: 48, grid: { show: false }, values: (_u, t) => t.map((v) => (v == null ? '' : `${v}°`)) },
+    ],
+    series: SERIES,
+  }), []);
+  const data = useMemo<uPlot.AlignedData>(() => [pts.map((p) => p.f), pts.map((p) => p.db), pts.map((p) => p.ph)], [pts]);
+  return (
+    <Panel title="Frequency response" right={<div ref={legend} className="bode-legend font-mono text-xs" />}>
+      <Plot opts={opts} data={data} className="h-[clamp(300px,52vh,620px)]" />
+      {progress !== null && (
+        <div className="mt-3 h-1 overflow-hidden rounded-full bg-surface">
+          <div className="h-full bg-accent transition-all" style={{ width: `${progress * 100}%` }} />
+        </div>
+      )}
+    </Panel>
+  );
+}
+
+
+// A legend value: '—' while the cursor is off the data.
+const shown = (fmt: (v: number) => string) => (_u: uPlot, v: number | null) => (v == null ? '—' : fmt(v));
+
+// Series with their live-legend labels and values.
+const SERIES: uPlot.Series[] = [
+  { label: 'f', value: shown(fmtHz) },
+  { label: 'Gain CH2/CH1', scale: 'db', stroke: '#facc15', width: 2, points: { size: 4 }, value: shown((v) => `${v.toFixed(2)} dB`) },
+  { label: 'Phase', scale: 'ph', stroke: '#22d3ee', width: 1.5, dash: [6, 4], points: { size: 3 }, value: shown((v) => `${v.toFixed(1)}°`) },
+];
+
+// Round stops below the sine ceiling, then the ceiling itself, so the highest frequency is selectable.
+const stopList = (max: number) =>
+  [...[1000, 10_000, 100_000, 300_000, 1e6, 3e6].filter((f) => f < max), max].map((f) => ({ id: f, label: `${fmtHz(f, true)}${f === max ? ' (max)' : ''}` }));
+
 const etaText = (s: number) => (s < 90 ? `${Math.ceil(s)} s` : `${Math.ceil(s / 60)} min`);
 
 // Phase continuous across points everywhere it's shown or exported (stored wrapped, as measured).
@@ -135,11 +145,10 @@ function LimitsNote({ top }: { top: string }) {
   return (
     <Panel title="Accuracy and limits">
       <ul className="list-disc space-y-1 pl-4 text-[11px] text-muted">
-        <li>Sine only, up to {top}.</li>
-        <li>Gain about ±0.5 dB, phase about ±1°, uncalibrated; more when CH1 and CH2 end up on different V/div. Gain is a CH2/CH1 ratio, so the generator level doesn't matter.</li>
-        <li>Both inputs are AC coupled during the sweep: DC levels aren't measured.</li>
-        <li>Low frequencies are slow: each point waits for a few periods (1 Hz ≈ 20 s per point).</li>
-        <li>Readings far below −40 dB aren't verified.</li>
+        <li>Sine, up to {top}.</li>
+        <li>About ±0.5 dB and ±1°, down to about −40 dB. Calibrating the scope on the device improves it: Settings → Device → Scope calibration → Gain → Match to other channel.</li>
+        <li>Inputs are AC coupled: DC gain isn't measured.</li>
+        <li>Low frequencies are slow: 1 Hz takes about 20 s per point.</li>
       </ul>
     </Panel>
   );
