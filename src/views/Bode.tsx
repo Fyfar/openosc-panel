@@ -53,7 +53,7 @@ export function Bode() {
 
   const set = (p: Partial<typeof b>) => patch('bode', p);
   const startOpts = [1, 10, 100, 1000].map((f) => ({ id: f, label: fmtHz(f, true) }));
-  const stopOpts = [1000, 10_000, 100_000, 300_000, 1e6, 3e6, 10e6].filter((f) => f <= sineMax).map((f) => ({ id: f, label: fmtHz(f, true) }));
+  const stopOpts = stopList(sineMax);
 
   return (
     <div className="grid gap-4 xl:grid-cols-[1fr_320px]">
@@ -122,6 +122,10 @@ export function Bode() {
 
 type Point = { f: number; db: number; ph: number };
 
+// Round stops below the sine ceiling, then the ceiling itself, so the highest frequency is selectable.
+const stopList = (max: number) =>
+  [...[1000, 10_000, 100_000, 300_000, 1e6, 3e6].filter((f) => f < max), max].map((f) => ({ id: f, label: `${fmtHz(f, true)}${f === max ? ' (max)' : ''}` }));
+
 const etaText = (s: number) => (s < 90 ? `${Math.ceil(s)} s` : `${Math.ceil(s / 60)} min`);
 
 // Phase continuous across points everywhere it's shown or exported (stored wrapped, as measured).
@@ -135,11 +139,10 @@ function LimitsNote({ top }: { top: string }) {
   return (
     <Panel title="Accuracy and limits">
       <ul className="list-disc space-y-1 pl-4 text-[11px] text-muted">
-        <li>Sine only, up to {top}.</li>
-        <li>Gain about ±0.5 dB, phase about ±1°, uncalibrated; more when CH1 and CH2 end up on different V/div. Gain is a CH2/CH1 ratio, so the generator level doesn't matter.</li>
-        <li>Both inputs are AC coupled during the sweep: DC levels aren't measured.</li>
-        <li>Low frequencies are slow: each point waits for a few periods (1 Hz ≈ 20 s per point).</li>
-        <li>Readings far below −40 dB aren't verified.</li>
+        <li>Sine, up to {top}.</li>
+        <li>About ±0.5 dB and ±1°, down to about −40 dB. Calibrating the scope on the device improves it: Settings → Device → Scope calibration → Gain → Match to other channel.</li>
+        <li>Inputs are AC coupled: DC gain isn't measured.</li>
+        <li>Low frequencies are slow: 1 Hz takes about 20 s per point.</li>
       </ul>
     </Panel>
   );
