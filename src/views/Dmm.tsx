@@ -1,11 +1,11 @@
 import { clsx } from 'clsx';
 import { Download, Pause, Play, Trash2 } from 'lucide-react';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import uPlot from 'uplot';
 import { DMM_FUNCS, dmmBase, dmmScale, HOLD_MODES, scaleFor, type DmmFunc } from '../device';
-import { histogram, stdDev, windowExtent, yFloor } from '../dsp';
+import { heldIdx, histogram, stdDev, windowExtent, yFloor } from '../dsp';
 import * as io from '../io';
-import { AXIS, Plot } from '../Plot';
+import { AXIS, legendIn, legendValue, Plot } from '../Plot';
 import { useDev } from '../store';
 import { Btn, Panel, Seg, Stat, Toggle } from '../ui';
 
@@ -18,6 +18,7 @@ const KINDS = [{ id: 'line' as const, label: 'Line' }, { id: 'hist' as const, la
 // A reading holds until the next one: the meter never shows the values a sloped segment would claim.
 const STEPPED = uPlot.paths.stepped!({ align: 1 });
 const BARS = uPlot.paths.bars!({ size: [0.92, 100] });
+const CLOCK = uPlot.fmtDate('{HH}:{mm}:{ss}');
 // uPlot picks the tick step from these (whole seconds: readings come ~3/s) and formats with its
 // template table: [min step, format, year, month, day, hour, min, sec, mode]; day shown on change.
 const TIME_INCRS = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400];
@@ -175,13 +176,14 @@ function Trend({ sc }: { sc: Scale }) {
   const [kind, setKind] = useState<'line' | 'hist'>('line');
   const [win, setWin] = useState(60);
   const [manual, setManual] = useManualY();
+  const legend = useRef<HTMLDivElement>(null);
   const { end, x0, x1 } = useTimeWindow(hist.t, win);
   const width = dstats.lsd || sc.lsd;
   const bins = useMemo(() => (kind === 'hist' ? histogram(dstats.counts, width, center) : []), [kind, dstats, width, center]);
   const hdp = Math.max(0, Math.round(-Math.log10(width / sc.div)));
 
   // Rebuilt only when the axis format changes: `sc` is a new object on every reading.
-  const opts = useMemo(() => trendOpts(kind, sc, manual, hdp), [kind, sc.div, sc.dp, sc.lsd, manual, hdp]);
+  const opts = useMemo(() => ({ ...trendOpts(kind, sc, manual, hdp), legend: legendIn(legend) }), [kind, sc.div, sc.dp, sc.lsd, manual, hdp]);
   const data = useMemo<uPlot.AlignedData>(
     () => (kind === 'hist'
       ? [bins.map((b) => b.value), bins.map((b) => (b.kind === 'in' ? b.count : null)), bins.map((b) => (b.kind === 'in' ? null : b.count))]
@@ -196,7 +198,9 @@ function Trend({ sc }: { sc: Scale }) {
     <Panel
       title={kind === 'line' ? 'Trend' : 'Distribution'}
       right={
-        <div className="flex flex-wrap justify-end gap-1.5">
+        <div className="flex flex-wrap items-center justify-end gap-1.5">
+          {/* One trace: clicking the legend must not hide it. */}
+          <div ref={legend} className="head-legend dmm-legend pointer-events-none font-mono text-xs" />
           <Seg size="xs" value={kind} options={KINDS} onChange={setKind} />
           {kind === 'line' && <Seg size="xs" value={win} options={WINDOWS} onChange={setWin} />}
         </div>
@@ -268,25 +272,28 @@ const yAuto = (mn: number, mx: number, lsd: number) => uPlot.rangeNum(...yFloor(
 
 // Line: time axis, x window set by Plot's `x`; Histogram: ordinal x over the bin values.
 function trendOpts(kind: 'line' | 'hist', sc: Scale, manual: { lo: number; hi: number } | null, hdp: number): Omit<uPlot.Options, 'width' | 'height'> {
-  const base = { legend: { show: false }, cursor: { y: false, drag: { x: false } } };
+  const cursor = { y: false, drag: { x: false } };
+  // A histogram bin; the edge ones (series 2) hold everything beyond the window: ≤ / ≥ their value.
+  const bin = (u: uPlot, v: number) => {
+    const i = u.data[0].indexOf(v), edge = u.data[2][i] != null ? (i === 0 ? '≤' : '≥') : '';
+    return edge + (v / sc.div).toFixed(hdp);
+  };
   if (kind === 'hist') return {
-    ...base,
+    cursor,
     scales: { x: { time: false, distr: 2 }, y: { range: { min: { pad: 0, soft: 0, mode: 1 }, max: { pad: 0.1, soft: 0, mode: 3 } } } },
     axes: [
-      {
-        ...AXIS,
-        // Edge bins (series 2) hold everything beyond the window: ≤ / ≥ their value.
-        values: (u, t) => t.map((v) => {
-          const i = u.data[0].indexOf(v), edge = u.data[2][i] != null ? (i === 0 ? '≤' : '≥') : '';
-          return edge + (v / sc.div).toFixed(hdp);
-        }),
-      },
+      { ...AXIS, values: (u, t) => t.map((v) => bin(u, v)) },
       { ...AXIS, size: 56 },
     ],
-    series: [{}, { stroke: '#3b82f6', fill: 'rgba(59,130,246,0.6)', paths: BARS, points: { show: false } }, { stroke: '#f59e0b', fill: 'rgba(245,158,11,0.7)', paths: BARS, points: { show: false } }],
+    series: [
+      { label: 'Value', value: (u, v) => (v == null ? '—' : `${bin(u, v)} ${sc.unit}`) },
+      { label: 'Count', value: legendValue(String), stroke: '#3b82f6', fill: 'rgba(59,130,246,0.6)', paths: BARS, points: { show: false } },
+      { label: 'Beyond', value: legendValue(String), stroke: '#f59e0b', fill: 'rgba(245,158,11,0.7)', paths: BARS, points: { show: false } },
+    ],
   };
   return {
-    ...base,
+    // The value under the cursor is the one the stepped line shows there, with that reading's time.
+    cursor: { ...cursor, dataIdx: (u, _series, near, x) => heldIdx(u.data[0], near, x) },
     scales: {
       x: { time: true, auto: false },
       y: { range: manual ? [manual.lo, manual.hi] : (_u, mn, mx) => yAuto(mn, mx, sc.lsd) },
@@ -295,7 +302,10 @@ function trendOpts(kind: 'line' | 'hist', sc: Scale, manual: { lo: number; hi: n
       { ...AXIS, space: 70, incrs: TIME_INCRS, values: TIME_FMT },
       { ...AXIS, size: 70, values: (_u, t) => t.map((v) => (v == null ? '' : (v / sc.div).toFixed(sc.dp))) },
     ],
-    series: [{}, { stroke: '#3b82f6', width: 1.5, fill: 'rgba(59,130,246,0.08)', paths: STEPPED, points: { show: false } }],
+    series: [
+      { label: 'Time', value: legendValue((t) => CLOCK(new Date(t * 1000))) },
+      { label: 'Value', value: legendValue((v) => `${(v / sc.div).toFixed(sc.dp)} ${sc.unit}`), stroke: '#3b82f6', width: 1.5, fill: 'rgba(59,130,246,0.08)', paths: STEPPED, points: { show: false } },
+    ],
   };
 }
 

@@ -2,7 +2,7 @@
 // scope measurements and generator command order. Run: `npm run check`.
 import assert from 'node:assert/strict';
 import { bodeEta, bodePlan, dmmScale, fmtStable, fwAtLeast, genMaxHz, interleaveBlockers, parseHz, scaleFor, VDIV_MV } from '../src/device.ts';
-import { addStat, emptyStats, FFT_WINDOWS, fftNotes, fftSpanHz, bodeTone, findPeak, histogram, spanAtLeast, unwrapPhase, measure, peakIn, peakNear, spectrum, spectrumOf, stdDev, yFloor, windowExtent, type FftWindow, type Frame } from '../src/dsp.ts';
+import { addStat, emptyStats, FFT_WINDOWS, fftNotes, fftSpanHz, bodeTone, findPeak, histogram, spanAtLeast, unwrapPhase, measure, peakIn, peakNear, spectrum, spectrumOf, stdDev, yFloor, windowExtent, heldIdx, type FftWindow, type Frame } from '../src/dsp.ts';
 import { parseFrame, parseMeas, screenWindow } from '../src/io/scope.ts';
 import { pointCmds, rerange, scopeRestore, SWEEP_SCOPE } from '../src/io/bode.ts';
 import { dmmDiff } from '../src/io/dmm.ts';
@@ -86,6 +86,19 @@ checks++;
   assert.deepEqual(dmmDiff({ ...base, func: 'TEMP', cj: null }, { ...base, func: 'TEMP', cj: 21.5 }), ['SYST:DMM:TEMP:CJUN 21.5'], 'cj set');
   assert.deepEqual(dmmDiff({ ...base, func: 'TEMP', cj: 21.5 }, { ...base, func: 'TEMP', cj: null }), [], 'cj cleared sends nothing');
   checks += 2;
+}
+
+// --- heldIdx: the point a stepped line draws under the cursor, not the nearest one ---------------
+{
+  const t = [0, 10, 20, 20, 30]; // 20 twice: where a gap starts (value repeated, then null)
+  assert.equal(heldIdx(t, 1, 9), 0, 'just before a step: still the earlier reading');
+  assert.equal(heldIdx(t, 1, 14), 1, 'after it');
+  assert.equal(heldIdx(t, 2, 21), 3, 'inside a gap: its null, whichever duplicate is nearest');
+  assert.equal(heldIdx(t, 3, 19), 1, 'before a gap');
+  assert.equal(heldIdx(t, 4, 30), 4, 'on the last point');
+  assert.equal(heldIdx(t, 0, -1), null, 'before the line starts');
+  assert.equal(heldIdx(t, 4, 31), null, 'past its end');
+  checks += 7;
 }
 
 // --- yFloor: ±20-count floor on a steady reading, real spread kept as is --------------------

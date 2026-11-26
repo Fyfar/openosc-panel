@@ -4,7 +4,7 @@ import type uPlot from 'uplot';
 import { bodeEta, bodeMaxHz, bodePlan, fmtHz } from '../device';
 import { spanAtLeast, unwrapPhase } from '../dsp';
 import * as io from '../io';
-import { AXIS, Plot } from '../Plot';
+import { AXIS, Plot, legendIn, legendValue } from '../Plot';
 import { useDev } from '../store';
 import { Btn, Panel, Row, Select, Stat } from '../ui';
 
@@ -94,7 +94,7 @@ type Point = { f: number; db: number; ph: number };
 function ResponseChart({ pts, progress }: { pts: Point[]; progress: number | null }) {
   const legend = useRef<HTMLDivElement>(null);
   const opts = useMemo<Omit<uPlot.Options, 'width' | 'height'>>(() => ({
-    legend: { live: true, mount: (_u, el) => legend.current?.replaceChildren(el) },
+    legend: legendIn(legend),
     cursor: { y: false },
     scales: { x: { time: false, distr: 3, log: 10 }, db: { range: (_u, mn, mx) => spanAtLeast(mn, mx, 6) }, ph: { range: (_u, mn, mx) => spanAtLeast(mn, mx, 90) } },
     axes: [
@@ -106,7 +106,7 @@ function ResponseChart({ pts, progress }: { pts: Point[]; progress: number | nul
   }), []);
   const data = useMemo<uPlot.AlignedData>(() => [pts.map((p) => p.f), pts.map((p) => p.db), pts.map((p) => p.ph)], [pts]);
   return (
-    <Panel title="Frequency response" right={<div ref={legend} className="bode-legend font-mono text-xs" />}>
+    <Panel title="Frequency response" right={<div ref={legend} className="head-legend font-mono text-xs" />}>
       <Plot opts={opts} data={data} className="h-[clamp(300px,52vh,620px)]" />
       {progress !== null && (
         <div className="mt-3 h-1 overflow-hidden rounded-full bg-surface">
@@ -118,14 +118,11 @@ function ResponseChart({ pts, progress }: { pts: Point[]; progress: number | nul
 }
 
 
-// A legend value: '—' while the cursor is off the data.
-const shown = (fmt: (v: number) => string) => (_u: uPlot, v: number | null) => (v == null ? '—' : fmt(v));
-
 // Series with their live-legend labels and values.
 const SERIES: uPlot.Series[] = [
-  { label: 'f', value: shown(fmtHz) },
-  { label: 'Gain CH2/CH1', scale: 'db', stroke: '#facc15', width: 2, points: { size: 4 }, value: shown((v) => `${v.toFixed(2)} dB`) },
-  { label: 'Phase', scale: 'ph', stroke: '#22d3ee', width: 1.5, dash: [6, 4], points: { size: 3 }, value: shown((v) => `${v.toFixed(1)}°`) },
+  { label: 'f', value: legendValue(fmtHz) },
+  { label: 'Gain CH2/CH1', scale: 'db', stroke: '#facc15', width: 2, points: { size: 4 }, value: legendValue((v) => `${v.toFixed(2)} dB`) },
+  { label: 'Phase', scale: 'ph', stroke: '#22d3ee', width: 1.5, dash: [6, 4], points: { size: 3 }, value: legendValue((v) => `${v.toFixed(1)}°`) },
 ];
 
 // Round stops below the sine ceiling, then the ceiling itself, so the highest frequency is selectable.

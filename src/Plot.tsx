@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, type RefObject } from 'react';
 import uPlot from 'uplot';
 
 // Thin uPlot host: rebuilds on `opts` identity change, pushes `data` without rebuilding.
@@ -24,5 +24,10 @@ export function Plot({ opts, data, x, className }: { opts: Omit<uPlot.Options, '
 
   return <div ref={box} className={className} />;
 }
+
+// uPlot's live legend (the values under the cursor), mounted outside the plot, e.g. in a panel header
+// with the `head-legend` class. A value is '—' while the cursor is off the data.
+export const legendIn = (box: RefObject<HTMLElement | null>): uPlot.Legend => ({ live: true, mount: (_u, el) => box.current?.replaceChildren(el) });
+export const legendValue = (fmt: (v: number) => string) => (_u: uPlot, v: number | null) => (v == null ? '—' : fmt(v));
 
 export const AXIS = { stroke: '#8b949e', grid: { stroke: '#30363d', width: 1 }, ticks: { stroke: '#30363d', width: 1 }, font: '11px "Geist Mono Variable", monospace' };

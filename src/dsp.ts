@@ -344,3 +344,13 @@ export function windowExtent(t: number[], v: (number | null)[], x0: number, x1: 
   }
   return [lo, hi];
 }
+
+// The point a stepped line draws at x: the last one at or before it (`near` is the closest one), null
+// where there is no line.
+export function heldIdx(t: ArrayLike<number>, near: number, x: number): number | null {
+  if (x > t[t.length - 1]) return null;
+  let i = near;
+  while (i >= 0 && t[i] > x) i--;
+  while (t[i + 1] <= x) i++;
+  return i < 0 ? null : i;
+}
