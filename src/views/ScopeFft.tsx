@@ -8,10 +8,10 @@ import {
 } from '../dsp';
 import * as io from '../io';
 import { useDev, type FftScale } from '../store';
-import { Columns, M, Seg } from '../ui';
+import { Columns, M, Seg, strokeGrid } from '../ui';
 
 export const COLOR = '#d946ef'; // the FFT's trace and readout colour
-const GRID = '#1f2630', MUTED = '#8b949e';
+const MUTED = '#8b949e';
 const SNAP_PX = 6; // a placed marker takes the highest point this close to the pointer
 const WINDOW_LABEL: Record<FftWindow, string> = { RECT: 'Rect', HANN: 'Hann', HAMM: 'Hamming', BLACK: 'Blackman' };
 const SCALES: { id: FftScale; label: string }[] = [{ id: 'DBV', label: 'dBV' }, { id: 'DBFS', label: 'dBFS' }, { id: 'LIN', label: 'Linear' }];
@@ -188,9 +188,10 @@ function tickStep(span: number) {
   return pow * ([1, 2, 5].find((k) => k * pow >= raw * 0.999) ?? 10);
 }
 
-function drawLevels({ g, W, top, h }: Plot, { level }: Model) {
-  g.fillStyle = GRID;
-  for (let i = 0; i <= level.lines; i++) g.fillRect(0, Math.round(top + (i / level.lines) * h), W, 1);
+function drawLevels({ g, W, top, h, dpr }: Plot, { level }: Model) {
+  g.beginPath();
+  for (let i = 0; i <= level.lines; i++) { const y = top + (i / level.lines) * h; g.moveTo(0, y); g.lineTo(W, y); }
+  strokeGrid(g, dpr);
 }
 
 // Drawn after the curve, on a backing, so noise never hides them.
@@ -207,8 +208,9 @@ function drawLevelLabels({ g, top, h, dpr }: Plot, { level, vd }: Model) {
 
 function drawFrequencies({ g, W, top, h, dpr }: Plot, { spanHz }: Model) {
   const step = tickStep(spanHz), px = (step / spanHz) * W, every = Math.ceil((64 * dpr) / px);
-  g.fillStyle = GRID;
-  for (let i = 1; i * px < W; i++) g.fillRect(Math.round(i * px), top, 1, h);
+  g.beginPath();
+  for (let i = 1; i * px < W; i++) { g.moveTo(i * px, top); g.lineTo(i * px, top + h); }
+  strokeGrid(g, dpr);
   g.fillStyle = MUTED;
   for (let i = 0; i * px <= W + 1; i += every) {
     const text = fmtHz(i * step, true), w = g.measureText(text).width;

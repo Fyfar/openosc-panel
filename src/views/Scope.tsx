@@ -5,7 +5,7 @@ import { fmtStable, fmtTime, fmtVolt, genHalvesScope, HALVED_NOTE, interleaveBlo
 import { extent, measure, type Frame, type Meas } from '../dsp';
 import * as io from '../io';
 import { useDev, type Channel, type CursorMode, type State } from '../store';
-import { Btn, CH_COLOR, Columns, M, Panel, Row, Seg, Select, Stepper, Toggle } from '../ui';
+import { Btn, CH_COLOR, Columns, M, Panel, Row, Seg, Select, Stepper, strokeGrid, Toggle } from '../ui';
 import { COLOR as FFT_COLOR, fftPngText, FONT, SpectrumPanel, SpectrumReadout, wrap } from './ScopeFft';
 
 // Roll runs with Auto sweep from 200 ms/div (wiki: Oscilloscope → Roll mode).
@@ -432,13 +432,11 @@ function timeWindow(s: State['scope'], f0: Frame | undefined) {
 
 function drawGrid(g: CanvasRenderingContext2D, W: number, H: number, dpr: number) {
   const dx = W / 10, dy = H / 8;
-  g.strokeStyle = '#1f2630';
-  g.lineWidth = 1;
-  g.setLineDash([2 * dpr, 4 * dpr]);
-  for (let i = 1; i < 10; i++) line(g, i * dx, 0, i * dx, H);
-  for (let i = 1; i < 8; i++) line(g, 0, i * dy, W, i * dy);
-  g.setLineDash([]);
-  g.strokeStyle = '#2d3643';
+  g.beginPath();
+  for (let i = 1; i < 10; i++) { g.moveTo(i * dx, 0); g.lineTo(i * dx, H); }
+  for (let i = 1; i < 8; i++) { g.moveTo(0, i * dy); g.lineTo(W, i * dy); }
+  strokeGrid(g, dpr);
+  g.strokeStyle = '#5a6678';
   line(g, W / 2, 0, W / 2, H);
   line(g, 0, H / 2, W, H / 2);
   for (let i = 0; i <= 50; i++) line(g, (i * W) / 50, H / 2 - 3 * dpr, (i * W) / 50, H / 2 + 3 * dpr);

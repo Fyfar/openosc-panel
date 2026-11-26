@@ -4,6 +4,15 @@ import { Children, type ReactNode } from 'react';
 
 export const CH_COLOR = ['#facc15', '#22d3ee'];
 
+// The division grid of the scope trace and the FFT: strokes the current path dotted.
+export function strokeGrid(g: CanvasRenderingContext2D, dpr: number) {
+  g.strokeStyle = '#465263';
+  g.lineWidth = 1;
+  g.setLineDash([2 * dpr, 3 * dpr]);
+  g.stroke();
+  g.setLineDash([]);
+}
+
 // Readouts in columns of three, after a label column. In each column the labels are as wide as
 // its longest label and every value has a fixed 10ch slot, so a changing value never moves the
 // next column. Scrolls sideways rather than wrapping, so every value keeps its place.
