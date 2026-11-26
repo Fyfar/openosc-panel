@@ -1,7 +1,7 @@
 // Self-check for the pure logic: typed frequency, DMM scaling, Bode maths/plan/restore,
 // scope measurements and generator command order. Run: `npm run check`.
 import assert from 'node:assert/strict';
-import { bodeEta, bodePlan, dmmScale, fmtStable, fwAtLeast, genMaxHz, interleaveBlockers, parseHz, scaleFor, VDIV_MV } from '../src/device.ts';
+import { bodeEta, bodePlan, bodeSlow, dmmScale, fmtStable, fwAtLeast, genMaxHz, interleaveBlockers, parseHz, scaleFor, VDIV_MV } from '../src/device.ts';
 import { addStat, emptyStats, FFT_WINDOWS, fftNotes, fftSpanHz, bodeTone, findPeak, histogram, spanAtLeast, unwrapPhase, measure, peakIn, peakNear, spectrum, spectrumOf, stdDev, yFloor, windowExtent, heldIdx, type FftWindow, type Frame } from '../src/dsp.ts';
 import { parseFrame, parseMeas, screenWindow } from '../src/io/scope.ts';
 import { pointCmds, rerange, scopeRestore, SWEEP_SCOPE } from '../src/io/bode.ts';
@@ -139,6 +139,15 @@ const frame = (ch: 0 | 1, n: number, xinc: number, fn: (t: number) => number): F
   assert.ok(slow > eta / 2, `points below 10 Hz dominate: ${slow} of ${eta} s`);
   assert.ok(bodeEta(bodePlan(1000, 100_000, 10), 'ZT703S') < 120, 'a 1 kHz–100 kHz sweep stays under 2 min');
   assert.ok(bodeEta([1000], 'ZT706S') > bodeEta([1000], 'ZT703S'), 'ZT706S waits for its module');
+  checks += 3;
+}
+
+// --- bodeSlow: the plan's 10 Hz point is slow, the next ones up aren't -------------------
+{
+  const p10 = bodePlan(1, 100_000, 10), p50 = bodePlan(1, 100_000, 50);
+  assert.ok(p10[10] > 10 && bodeSlow(p10[10]), `the 10 Hz point (${p10[10]}) is slow`);
+  assert.ok(!bodeSlow(p10[11]) && !bodeSlow(p50[51]), `${p10[11]} and ${p50[51]} Hz are not slow`);
+  assert.ok(bodeSlow(1), '1 Hz is slow');
   checks += 3;
 }
 

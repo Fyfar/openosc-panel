@@ -755,10 +755,13 @@ async function runBode(setup: (st: ReturnType<typeof fakeBode>['st']) => void, s
   useDev.setState({ idn: { model: 'DS1052', serial: 'T', fw: '0.21.14' }, model: 'ZT703S', profile: 'DS1052', error: null });
   useDev.getState().patch('scope', { tb: storeTb });
   useDev.getState().patch('bode', { start: 1000, stop: 10_000, ppd: 2 }); // 1 k, 3.16 k, 10 k
+  const ats: (number | null)[] = []; // every frequency the view was told is being measured
+  const unsub = useDev.subscribe((s, prev) => void (s.bode.at !== prev.bode.at && ats.push(s.bode.at)));
   await link.open(dev.port);
   await bodeSweep();
   await link.close();
-  return { sent: dev.written, st, points: useDev.getState().bode.points, error: useDev.getState().error };
+  unsub();
+  return { sent: dev.written, st, ats, points: useDev.getState().bode.points, error: useDev.getState().error };
 }
 {
   const r = await runBode((st) => (st.nanAt = 2)); // the 2nd point's first two PRE? answer NAN
@@ -775,7 +778,9 @@ async function runBode(setup: (st: ReturnType<typeof fakeBode>['st']) => void, s
   const sweep = r.sent.slice(0, r.sent.lastIndexOf('WAV:SNAP')); // before the restore
   assert.equal(sweep.filter((c) => c === 'TIM:OFFS 0').length, 1, 'TIM:OFFS once, at setup');
   assert.ok(!sweep.includes('*OPC?'), 'ZT703S: no *OPC? per point');
-  checks += 5;
+  assert.equal(r.ats.at(-1), null, 'no point being measured after the sweep');
+  [1000, 10 ** 3.5, 10_000].forEach((f, i) => near(r.ats[i] ?? NaN, f, 1e-6, 'point being measured, in plan order'));
+  checks += 7;
 
   const fast = await runBode((st) => (st.nanAt = 2), 6); // Scope screen last at 1 µs/div
   assert.deepEqual(fast.points, r.points, 'the Scope screen\'s timebase changes nothing');
@@ -793,7 +798,9 @@ async function runBode(setup: (st: ReturnType<typeof fakeBode>['st']) => void, s
   assert.equal(r.points.length, 2, 'the point measured with the output off is dropped, earlier ones stay');
   assert.match(r.error ?? '', /generator output turned off/);
   assert.ok(r.sent.lastIndexOf('ACQ:MDEP 262144') > r.sent.lastIndexOf('WAV:DATA?'), 'restore still sent');
-  checks += 3;
+  assert.equal(r.ats.at(-1), null, 'generator stop: no point being measured');
+  near(r.ats.at(-2) ?? NaN, 10_000, 1e-6, 'generator stop: the point with the output off was the last measured');
+  checks += 5;
 }
 
 {
@@ -814,7 +821,8 @@ async function runBode(setup: (st: ReturnType<typeof fakeBode>['st']) => void, s
   assert.ok(performance.now() - t0 < 1500, `stop took ${Math.round(performance.now() - t0)} ms`);
   assert.equal(r.error, null, 'a stopped point is not reported as skipped');
   assert.ok(r.sent.includes('ACQ:MDEP 262144'), 'restore sent after stop');
-  checks += 3;
+  assert.equal(r.ats.at(-1), null, 'stop: no point being measured');
+  checks += 4;
 }
 
 console.log(`check-link: ${checks} checks passed`);
