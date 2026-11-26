@@ -1,7 +1,7 @@
-import { Download, Play, Square } from 'lucide-react';
-import { useMemo, useRef } from 'react';
+import { Download, Loader2, Play, Square } from 'lucide-react';
+import { useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import type uPlot from 'uplot';
-import { bodeEta, bodeMaxHz, bodePlan, fmtHz } from '../device';
+import { bodeEta, bodeMaxHz, bodePlan, bodeSlow, fmtHz } from '../device';
 import { spanAtLeast, unwrapPhase } from '../dsp';
 import * as io from '../io';
 import { AXIS, Plot, legendIn, legendValue } from '../Plot';
@@ -41,7 +41,7 @@ export function Bode() {
   return (
     <div className="grid gap-4 xl:grid-cols-[1fr_320px]">
       <div className="min-w-0 space-y-4">
-        <ResponseChart pts={pts} progress={b.running ? b.progress : null} />
+        <ResponseChart pts={pts} progress={b.running ? b.progress : null} slow={b.running && b.at !== null && bodeSlow(b.at) ? b.at : null} />
         <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
           <Stat label="−3 dB corner" value={f3 ? fmtHz(f3) : '—'} tone="text-ch1" />
           <Stat label="Phase at corner" value={ph3 !== null ? `${ph3.toFixed(1)}°` : '—'} tone="text-ch2" />
@@ -91,7 +91,7 @@ export function Bode() {
 type Point = { f: number; db: number; ph: number };
 
 // The gain/phase chart. uPlot's live legend sits in the panel header: the hovered point's values.
-function ResponseChart({ pts, progress }: { pts: Point[]; progress: number | null }) {
+function ResponseChart({ pts, progress, slow }: { pts: Point[]; progress: number | null; slow: number | null }) {
   const legend = useRef<HTMLDivElement>(null);
   const opts = useMemo<Omit<uPlot.Options, 'width' | 'height'>>(() => ({
     legend: legendIn(legend),
@@ -113,10 +113,28 @@ function ResponseChart({ pts, progress }: { pts: Point[]; progress: number | nul
           <div className="h-full bg-accent transition-all" style={{ width: `${progress * 100}%` }} />
         </div>
       )}
+      {slow !== null && <SlowPoint key={slow} f={slow} />}
     </Panel>
   );
 }
 
+// A ≤ 10 Hz point takes seconds with nothing else on screen moving: the count shows the sweep is alive.
+// Keyed on the frequency, so each point counts from 0.
+function SlowPoint({ f }: { f: number }) {
+  const model = useDev((s) => s.model);
+  const [t0] = useState(() => performance.now());
+  const [, tick] = useReducer((n: number) => n + 1, 0);
+  useEffect(() => {
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, []);
+  return (
+    <p className="mt-2 flex items-center gap-1.5 text-xs text-muted">
+      <Loader2 size={12} className="animate-spin" />
+      Measuring {fmtHz(f, true)} · slow signal: {Math.floor((performance.now() - t0) / 1000)} s of ~{etaText(bodeEta([f], model))}
+    </p>
+  );
+}
 
 // Series with their live-legend labels and values.
 const SERIES: uPlot.Series[] = [

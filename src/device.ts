@@ -127,6 +127,10 @@ export const bodeEta = (plan: number[], model: Model) => plan.reduce((s, f) => {
   return s + Math.max(0.5, Math.max(0.08, 5 / f) + 3 * (r + Math.min(r, 1.2))) + (model === 'ZT706S' ? 0.6 : 0);
 }, 0);
 
+// The Bode view shows a "slow signal" line on these points (they take ~3.5–24 s). Rounded like the
+// SOUR:FREQ that pointCmds sends: bodePlan's 10 Hz point is 10.000000000000002.
+export const bodeSlow = (f: number) => +f.toPrecision(6) <= 10;
+
 // Log-spaced sweep frequencies, both ends included. Shared by the Bode preview and the sweep.
 export function bodePlan(start: number, stop: number, ppd: number): number[] {
   const n = Math.max(2, Math.round(Math.log10(stop / start) * ppd) + 1);

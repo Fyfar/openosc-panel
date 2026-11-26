@@ -156,7 +156,7 @@ export async function bodeSweep() {
   if (get().profile !== 'DS1052') return fail('Bode needs the scope profile.');
   const { model, gen: g0, bode: b } = get();
   const freqs = bodePlan(b.start, Math.min(b.stop, bodeMaxHz(model, g0.amp, get().idn?.fw)), b.ppd);
-  get().patch('bode', { running: true, progress: 0, points: [] });
+  get().patch('bode', { running: true, progress: 0, at: null, points: [] });
   let restore: string[] = [];
   let skipped = 0;
   try {
@@ -172,6 +172,7 @@ export async function bodeSweep() {
     await link.run(['WAV:MODE RAW', 'WAV:FORM BYTE']);
     if (!(await ctl([`SOUR:FREQ ${freqs[0]}`, 'SOUR:FUNC SINusoid', 'OUTP ON', ...SWEEP_SCOPE, `CHAN1:SCAL ${vdiv[0]}`, `CHAN2:SCAL ${vdiv[1]}`]))) return;
     for (let k = 0; k < freqs.length && get().bode.running; k++) {
+      get().patch('bode', { at: freqs[k] });
       const p = await sweepPoint(freqs[k], vdiv, probe, freqs[k - 1]);
       if (p) get().patch('bode', { points: [...get().bode.points, p] });
       else if (get().bode.running) skipped++;
@@ -180,6 +181,7 @@ export async function bodeSweep() {
   } catch (e) {
     if (!link.closed) fail(`Bode sweep stopped: ${errText(e)}`);
   } finally {
+    get().patch('bode', { at: null });
     await link.run(['WAV:SNAP']).catch(() => {});
     await ctl([...genRestore(g0, model), ...restore]);
     await readGen(true);

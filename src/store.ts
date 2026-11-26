@@ -64,7 +64,7 @@ export type State = {
   };
 
   gen: { shape: Shape; freq: number; duty: number; prof: 'DED' | 'LOW' | 'HIGH' | 'CUST'; low: number; high: number; drive: 'FACT' | 'PWM'; amp: number; out: boolean; startup: boolean };
-  bode: { start: number; stop: number; ppd: number; running: boolean; progress: number; points: { f: number; db: number; ph: number }[] };
+  bode: { start: number; stop: number; ppd: number; running: boolean; progress: number; at: number | null; points: { f: number; db: number; ph: number }[] };
 
   set: (p: Partial<State>) => void;
   patch: <K extends 'dmm' | 'scope' | 'gen' | 'bode'>(k: K, p: Partial<State[K]>) => void;
@@ -122,7 +122,7 @@ export const useDev = create<State>((set) => ({
   scopeStatus: { stat: '—', srate: NaN, lastSweep: 'AUTO', fcnt: [NaN, NaN], qual: '', interleave: null, capture: { active: false, seq: NaN, since: 0 } },
 
   gen: { shape: 'SIN', freq: 1000, duty: 50, prof: 'DED', low: 0, high: 4095, drive: 'FACT', amp: 3, out: false, startup: false },
-  bode: { start: 10, stop: 100_000, ppd: 10, running: false, progress: 0, points: [] },
+  bode: { start: 10, stop: 100_000, ppd: 10, running: false, progress: 0, at: null, points: [] },
 
   set: (p) => set(p),
   patch: (k, p) => set((s) => ({ [k]: { ...s[k], ...p } }) as Partial<State>),
