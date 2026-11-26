@@ -399,18 +399,19 @@ await withScope({ fft: true, fw: '0.21.7' }, async (s) => {
 // --- Bode sweep: whole records from a fresh acquisition, slow records waited for, generator stop ---
 // The generator plays 0.1 % above the request; CH2 = CH1 at −6 dB, −45°. Each CH1 WAV:PRE? is a newer
 // record (the firmware's repeated PRE?), CH2's reads the same one. `nanAt`: the first two PRE? after that
-// frequency set answer NAN; `stuckAt`: all of them; `outOffAt`: that OUTP? query reads 0.
+// frequency set answer NAN; `stuckAt`: all of them; `outOffAt`: that OUTP? query reads 0; `amp`: volts
+// peak per channel; `saved`: the V/div CHAN1:SCAL? reports before the sweep.
 function fakeBode() {
-  const st = { freq: 1000, tb: 1e-3, vd: [1, 1], src: 1, seq: 0, nan: 0, nanAt: 0, stuckAt: 0, outOffAt: 0, outQ: 0, freqSets: 0, star: [] as string[] };
+  const st = { freq: 1000, tb: 1e-3, vd: [1, 1], amp: [1, 0.5], saved: '1', src: 1, seq: 0, nan: 0, nanAt: 0, stuckAt: 0, outOffAt: 0, outQ: 0, freqSets: 0, star: [] as string[] };
   const xinc = () => (20 * st.tb) / 65536;
   const cfg: Record<string, string> = {
     '*IDN?': 'OpenOSC,DS1052,T,0.21.14', '*OPC?': '1', 'SYST:ERR?': '0,"No error"', 'TIM:SCAL?': '0.001', 'TIM:OFFS?': '0',
     'TRIG:SWE?': 'AUTO', 'TRIG:STAT?': 'TD', 'TRIG:EDGE:SOUR?': 'CHAN1', 'CHAN1:DISP?': '1', 'CHAN2:DISP?': '0',
-    'CHAN1:SCAL?': '1', 'CHAN2:SCAL?': '2', 'CHAN1:OFFS?': '0', 'CHAN2:OFFS?': '0', 'CHAN1:PROB?': '1', 'CHAN2:PROB?': '1',
+    'CHAN2:SCAL?': '2', 'CHAN1:OFFS?': '0', 'CHAN2:OFFS?': '0', 'CHAN1:PROB?': '1', 'CHAN2:PROB?': '1',
     'CHAN1:COUP?': 'DC', 'CHAN2:COUP?': 'DC', 'ACQ:ROLL?': '1', 'ACQ:MDEP?': '2.58048e+5',
   };
   const data = () => {
-    const f = st.freq * 1.001, ch = st.src, yinc = st.vd[ch - 1] / 25, amp = ch === 1 ? 1 : 0.5, ph = ch === 1 ? 0 : -Math.PI / 4;
+    const f = st.freq * 1.001, ch = st.src, yinc = st.vd[ch - 1] / 25, amp = st.amp[ch - 1], ph = ch === 1 ? 0 : -Math.PI / 4;
     const b = Uint8Array.from({ length: 65536 }, (_, i) => Math.max(0, Math.min(255, 128 + Math.round((amp * Math.cos(2 * Math.PI * f * i * xinc() + ph)) / yinc))));
     return Uint8Array.from([...enc.encode('#565536'), ...b, 10]);
   };
@@ -425,7 +426,7 @@ function fakeBode() {
     return `0,0,65536,1,${xinc()},0,0,${st.vd[st.src - 1] / 25},0,128`;
   };
   const wave: Record<string, () => Answer> = {
-    'WAV:PRE?': pre, 'WAV:SEQ?': () => String(st.seq), 'WAV:DATA?': data, 'OUTP?': () => (++st.outQ === st.outOffAt ? '0' : '1'),
+    'CHAN1:SCAL?': () => st.saved, 'WAV:PRE?': pre, 'WAV:SEQ?': () => String(st.seq), 'WAV:DATA?': data, 'OUTP?': () => (++st.outQ === st.outOffAt ? '0' : '1'),
   };
   const dev = tableDevice(setting, wave, cfg);
   return { dev, st };
@@ -473,6 +474,16 @@ async function runBode(setup: (st: ReturnType<typeof fakeBode>['st']) => void, s
   assert.match(r.error ?? '', /generator output turned off/);
   assert.ok(r.sent.lastIndexOf('ACQ:MDEP 262144') > r.sent.lastIndexOf('WAV:DATA?'), 'restore still sent');
   checks += 3;
+}
+
+{
+  // A silent channel jumps down; clipping climbs one step per record, and the longest climb (20 mV → 10 V,
+  // 10 steps + the measurement) must not use up the first point.
+  const silent = await runBode((st) => (st.amp[1] = 0.001)); // grounded or deep-stopband CH2: 1 V → 20 mV/div
+  assert.equal(silent.points.length, 3, `silent CH2: ${silent.points.length} points, ${silent.error}`);
+  const climb = await runBode((st) => { st.saved = '0.02'; st.amp = [30, 15]; }); // Scope left at 20 mV/div, 60 Vpp input
+  assert.equal(climb.points.length, 3, `starting at 20 mV/div: ${climb.points.length} points, ${climb.error}`);
+  checks += 2;
 }
 
 {

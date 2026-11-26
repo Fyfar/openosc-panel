@@ -345,12 +345,25 @@ checks += 6;
   checks += 6;
 }
 
-// --- Bode re-range: one step up on clipping, down when tiny, else exactly unchanged ---------
+// --- Bode re-range: one step up on clipping, straight down when tiny, else exactly unchanged ---
 {
   const sine = (amp: number) => frame(0, 1000, 1e-5, (t) => amp * Math.sin(2 * Math.PI * 1000 * t));
   const steps = VDIV_MV.map((m) => m / 1000), i1v = steps.indexOf(1);
   assert.deepEqual(rerange([sine(4.5), sine(0.5), sine(2)], [1, 1, 1.0000001], [1, 1, 1]), [steps[i1v + 1], steps[i1v - 1], 1.0000001]);
-  checks++;
+  // A tiny channel lands in one call where one-step walking would end (≥ 1.5 div p-p, or 20 mV/div).
+  for (const amp of [0.0001, 0.004, 0.017, 0.051, 0.13, 0.31, 0.7]) {
+    let i = i1v;
+    while (i > 0 && (2 * amp) / steps[i] < 1.5) i--;
+    assert.deepEqual(rerange([sine(amp)], [1], [1]), [steps[i]], `${amp} V from 1 V/div`);
+  }
+  // Under one 8-bit code a signal reads flat: at 5 V/div (0.2 V codes) that is not proof of silence, so
+  // the jump goes only where one code would show (0.1 V/div), not on to 20 mV where it could clip.
+  const flat = { ...sine(0), scale: { yinc: 0.2, zero: 0, yref: 128 } };
+  assert.deepEqual(rerange([flat], [5], [1]), [0.1]);
+  // Tiny but offset (0.1 V DC): never down into a range its peak would clip, or it steps back up for ever.
+  const offset = frame(0, 1000, 1e-5, (t) => 0.1 + 0.01 * Math.sin(2 * Math.PI * 1000 * t));
+  assert.deepEqual([rerange([offset], [1], [1]), rerange([offset], [0.04], [1])], [[0.04], [0.04]]);
+  checks += 4;
 }
 
 // --- Bode restore covers everything the sweep touches on the scope -------------------------
