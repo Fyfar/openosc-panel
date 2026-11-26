@@ -331,3 +331,26 @@ export function yFloor(min: number, max: number, lsd: number): [number, number] 
   const mid = (min + max) / 2, half = Math.max(20 * lsd, (max - min) / 2);
   return [mid - half, mid + half];
 }
+
+// Min/max of what a stepped trend draws inside [x0, x1]: the readings taken there and the one still held
+// at x0.
+export function windowExtent(t: number[], v: (number | null)[], x0: number, x1: number): [number, number] {
+  let lo = Infinity, hi = -Infinity;
+  for (let i = 0; i < t.length && t[i] <= x1; i++) {
+    const x = v[i];
+    if (x == null || t[i + 1] < x0) continue; // a gap, or replaced before the window starts
+    lo = Math.min(lo, x);
+    hi = Math.max(hi, x);
+  }
+  return [lo, hi];
+}
+
+// The point a stepped line draws at x: the last one at or before it (`near` is the closest one), null
+// where there is no line.
+export function heldIdx(t: ArrayLike<number>, near: number, x: number): number | null {
+  if (x > t[t.length - 1]) return null;
+  let i = near;
+  while (i >= 0 && t[i] > x) i--;
+  while (t[i + 1] <= x) i++;
+  return i < 0 ? null : i;
+}

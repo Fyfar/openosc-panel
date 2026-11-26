@@ -37,6 +37,8 @@ body {
 ::-webkit-scrollbar-thumb { background: var(--color-border); border-radius: 3px; }
 
 .u-legend { display: none; }
-/* Bode: uPlot's live legend in the panel header (cursor values). */
-.bode-legend .u-legend { display: block; margin: 0; font: inherit; text-align: right; }
-.bode-legend .u-legend th { font-weight: normal; }
+/* uPlot's live legend in a panel header (cursor values): Bode, DMM chart. */
+.head-legend .u-legend { display: block; margin: 0; font: inherit; text-align: right; }
+.head-legend .u-legend th { font-weight: normal; }
+/* DMM: room for the longest value, so hovering never rewraps the header and moves the chart. */
+.dmm-legend .u-value { display: inline-block; min-width: 11ch; text-align: left; }

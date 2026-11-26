@@ -1,11 +1,11 @@
 import { clsx } from 'clsx';
 import { Download, Pause, Play, Trash2 } from 'lucide-react';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import uPlot from 'uplot';
-import { DMM_FUNCS, HOLD_MODES, scaleFor, seenRef, type DmmFunc } from '../device';
-import { histogram, stdDev, yFloor } from '../dsp';
+import { DMM_FUNCS, dmmBase, dmmScale, HOLD_MODES, scaleFor, type DmmFunc } from '../device';
+import { heldIdx, histogram, stdDev, windowExtent, yFloor } from '../dsp';
 import * as io from '../io';
-import { AXIS, Plot } from '../Plot';
+import { AXIS, legendIn, legendValue, Plot } from '../Plot';
 import { useDev } from '../store';
 import { Btn, Panel, Seg, Stat, Toggle } from '../ui';
 
@@ -18,6 +18,7 @@ const KINDS = [{ id: 'line' as const, label: 'Line' }, { id: 'hist' as const, la
 // A reading holds until the next one: the meter never shows the values a sloped segment would claim.
 const STEPPED = uPlot.paths.stepped!({ align: 1 });
 const BARS = uPlot.paths.bars!({ size: [0.92, 100] });
+const CLOCK = uPlot.fmtDate('{HH}:{mm}:{ss}');
 // uPlot picks the tick step from these (whole seconds: readings come ~3/s) and formats with its
 // template table: [min step, format, year, month, day, hour, min, sec, mode]; day shown on change.
 const TIME_INCRS = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400];
@@ -41,9 +42,9 @@ export function Dmm() {
   const f = DMM_FUNCS.find((x) => x.id === dmm.func)!;
   const junctionNeeded = useDev((s) => s.junctionNeeded);
 
-  const ref = ranges[dmm.range] ?? seenRef(reading?.v ?? 0, dstats);
-  const sc = scaleFor(ref, f.base);
-  const fmt = (x: number, extra = 0) => `${(x / sc.div).toFixed(sc.dp + extra)} ${sc.unit}`;
+  const fahrenheit = useDev((s) => s.fahrenheit);
+  const sc = dmmScale(dmm.func, ranges[dmm.range], fahrenheit);
+  const recordedSc = useRecordedScale(sc);
   const ac = dmm.func.endsWith('AC');
 
   const shown = reading === null ? '- - - -' : reading.over ? 'OL' : reading.blank || reading.v === null ? '----' : (reading.v / sc.div).toFixed(sc.dp);
@@ -85,19 +86,9 @@ export function Dmm() {
           </div>
         </Panel>
 
-        <Trend sc={sc} />
+        <Trend sc={recordedSc} />
 
-        <Panel title="Statistics" right={<Btn onClick={() => void io.resetDmmStats()} title="SYST:DMM:STAT:RES">Reset</Btn>}>
-          {/* Average and σ resolve below one display count, so they get two extra decimals. */}
-          <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 2xl:grid-cols-6">
-            <Stat label="Average" value={n ? fmt(dstats.mean, 2) : '—'} />
-            <Stat label="Minimum" value={n ? fmt(dstats.min) : '—'} tone="text-success" />
-            <Stat label="Maximum" value={n ? fmt(dstats.max) : '—'} tone="text-danger" />
-            <Stat label="Peak to peak" value={n ? fmt(dstats.max - dstats.min) : '—'} />
-            <Stat label="Std dev σ" value={n ? fmt(stdDev(dstats), 2) : '—'} />
-            <Stat label="Count" value={n ? n.toLocaleString('en') : '—'} />
-          </div>
-        </Panel>
+        <Statistics sc={recordedSc} />
       </div>
 
       <aside className="space-y-4">
@@ -151,29 +142,48 @@ export function Dmm() {
   );
 }
 
-type Scale = ReturnType<typeof scaleFor>;
+type Scale = ReturnType<typeof dmmScale>;
+
+// Chart and statistics are in the recording's unit and decimals, whatever the meter measures now.
+function useRecordedScale(live: Scale): Scale {
+  const recorded = useDev((s) => s.recorded);
+  return recorded ? dmmScale(recorded.func, recorded.rangeMax, recorded.fahrenheit) : live;
+}
+
+function Statistics({ sc }: { sc: Scale }) {
+  const dstats = useDev((s) => s.dstats);
+  const n = dstats.n;
+  // Average and σ resolve below one display count, so they get two extra decimals.
+  const fmt = (x: number, extra = 0) => (n ? `${(x / sc.div).toFixed(sc.dp + extra)} ${sc.unit}` : '—');
+  return (
+    <Panel title="Statistics">
+      <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 2xl:grid-cols-6">
+        <Stat label="Average" value={fmt(dstats.mean, 2)} />
+        <Stat label="Minimum" value={fmt(dstats.min)} tone="text-success" />
+        <Stat label="Maximum" value={fmt(dstats.max)} tone="text-danger" />
+        <Stat label="Peak to peak" value={fmt(dstats.max - dstats.min)} />
+        <Stat label="Std dev σ" value={fmt(stdDev(dstats), 2)} />
+        <Stat label="Count" value={n ? n.toLocaleString('en') : '—'} />
+      </div>
+    </Panel>
+  );
+}
 
 function Trend({ sc }: { sc: Scale }) {
   const hist = useDev((s) => s.hist);
   const dstats = useDev((s) => s.dstats);
   const center = useDev((s) => s.reading?.v ?? 0);
-  const func = useDev((s) => s.dmm.func);
   const [kind, setKind] = useState<'line' | 'hist'>('line');
   const [win, setWin] = useState(60);
-  const [yMan, setYMan] = useState<{ func: DmmFunc; lo: number; hi: number } | null>(null);
-  const manual = yMan?.func === func ? yMan : null; // units change with the function
-  const now = useNow(1000); // the axis keeps rolling while HOLD stops new readings
-
-  // A bounded window starts at the first reading while it fills (the trace grows rightward),
-  // then rolls with the clock.
-  const end = Math.max(now, hist.t.at(-1) ?? 0), t0 = hist.t[0] ?? end;
-  const x0 = win ? Math.max(t0, end - win) : t0, x1 = win ? x0 + win : Math.max(end, t0 + 10);
+  const [manual, setManual] = useManualY();
+  const legend = useRef<HTMLDivElement>(null);
+  const { end, x0, x1 } = useTimeWindow(hist.t, win);
   const width = dstats.lsd || sc.lsd;
   const bins = useMemo(() => (kind === 'hist' ? histogram(dstats.counts, width, center) : []), [kind, dstats, width, center]);
   const hdp = Math.max(0, Math.round(-Math.log10(width / sc.div)));
 
   // Rebuilt only when the axis format changes: `sc` is a new object on every reading.
-  const opts = useMemo(() => trendOpts(kind, sc, manual, hdp), [kind, sc.div, sc.dp, sc.lsd, manual, hdp]);
+  const opts = useMemo(() => ({ ...trendOpts(kind, sc, manual, hdp), legend: legendIn(legend) }), [kind, sc.div, sc.dp, sc.lsd, manual, hdp]);
   const data = useMemo<uPlot.AlignedData>(
     () => (kind === 'hist'
       ? [bins.map((b) => b.value), bins.map((b) => (b.kind === 'in' ? b.count : null)), bins.map((b) => (b.kind === 'in' ? null : b.count))]
@@ -183,54 +193,107 @@ function Trend({ sc }: { sc: Scale }) {
     [kind, bins, hist, end],
   );
 
-  const setY = (lo: number, hi: number) => { if (lo < hi) setYMan({ func, lo, hi }); };
+  const setY = (lo: number, hi: number) => { if (lo < hi) setManual({ lo, hi }); };
   return (
     <Panel
       title={kind === 'line' ? 'Trend' : 'Distribution'}
       right={
-        <div className="flex flex-wrap justify-end gap-1.5">
+        <div className="flex flex-wrap items-center justify-end gap-1.5">
+          {/* One trace: clicking the legend must not hide it. */}
+          <div ref={legend} className="head-legend dmm-legend pointer-events-none font-mono text-xs" />
           <Seg size="xs" value={kind} options={KINDS} onChange={setKind} />
           {kind === 'line' && <Seg size="xs" value={win} options={WINDOWS} onChange={setWin} />}
         </div>
       }
     >
-      <Plot opts={opts} data={data} x={kind === 'line' ? [x0, x1] : undefined} className="h-64" />
+      <div className="relative">
+        <Plot opts={opts} data={data} x={kind === 'line' ? [x0, x1] : undefined} className="h-64" />
+        <ChartNotes manual={kind === 'line' ? manual : null} x0={x0} x1={x1} sc={sc} />
+      </div>
       {kind === 'line' ? (
         <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2">
-          <div className="w-36"><Toggle label="Auto Y" on={!manual} onChange={(auto) => setYMan(auto ? null : { func, ...range(yAuto(...visibleExtent(hist, x0, x1), sc.lsd)) })} /></div>
+          <div className="w-36"><Toggle label="Auto Y" on={!manual} onChange={(auto) => setManual(auto ? null : range(yAuto(...windowExtent(hist.t, hist.v, x0, x1), sc.lsd)))} /></div>
           {manual && <YInput label="Min" v={manual.lo} sc={sc} onCommit={(lo) => setY(lo, manual.hi)} />}
           {manual && <YInput label="Max" v={manual.hi} sc={sc} onCommit={(hi) => setY(manual.lo, hi)} />}
         </div>
       ) : (
-        <p className="mt-3 text-[11px] text-muted">{dstats.n.toLocaleString('en')} readings since Reset, one bar per display count{bins.some((b) => b.kind !== 'in') ? ' · amber: beyond ±100 counts' : ''}.</p>
+        <p className="mt-3 text-[11px] text-muted">{dstats.n.toLocaleString('en')} readings recorded, one bar per display count{bins.some((b) => b.kind !== 'in') ? ' · amber: beyond ±100 counts' : ''}.</p>
       )}
     </Panel>
   );
+}
+
+// The line view's x window. A bounded one starts at the first reading while it fills (the trace grows
+// rightward), then rolls with the clock while logging (also when HOLD stops new readings). Not logging,
+// it ends at the last point.
+function useTimeWindow(t: number[], win: number) {
+  const logging = useDev((s) => s.logging);
+  const now = useNow(1000);
+  const last = t.at(-1);
+  const end = !logging && last !== undefined ? last : Math.max(now, last ?? 0), t0 = t[0] ?? end;
+  const x0 = win ? Math.max(t0, end - win) : t0, x1 = win ? x0 + win : Math.max(end, t0 + 10);
+  return { end, x0, x1 };
+}
+
+// Text over the plot: how to fill an empty chart, and which side of a manual Y range cuts readings off.
+function ChartNotes({ manual, x0, x1, sc }: { manual: { lo: number; hi: number } | null; x0: number; x1: number; sc: Scale }) {
+  const hist = useDev((s) => s.hist);
+  const logging = useDev((s) => s.logging);
+  if (!hist.t.length) {
+    return logging ? null : (
+      <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center pr-3 pb-6 pl-18">
+        <p className="rounded-md border border-border bg-panel px-3 py-2 text-center text-sm text-muted">Press "Start logging" to chart readings and collect statistics</p>
+      </div>
+    );
+  }
+  if (!manual) return null;
+  const [lo, hi] = windowExtent(hist.t, hist.v, x0, x1);
+  const value = (x: number) => `${(x / sc.div).toFixed(sc.dp)} ${sc.unit}`;
+  const label = 'pointer-events-none absolute right-2 z-10 rounded border border-amber/50 bg-panel px-2 py-0.5 font-mono text-[11px] text-amber';
+  return (
+    <>
+      {hi > manual.hi && <span className={clsx(label, 'top-1')}>▲ above range: {value(hi)}</span>}
+      {lo < manual.lo && <span className={clsx(label, 'bottom-14')}>▼ below range: {value(lo)}</span>}
+    </>
+  );
+}
+
+// The manual Y range is in one unit: a chart of another function or unit drops back to auto.
+function useManualY() {
+  const key = useDev((s) => {
+    const { func, fahrenheit } = s.recorded ?? { func: s.dmm.func, fahrenheit: s.fahrenheit };
+    return `${func} ${dmmBase(func, fahrenheit)}`;
+  });
+  const [y, setY] = useState<{ key: string; lo: number; hi: number } | null>(null);
+  return [y?.key === key ? y : null, (r: { lo: number; hi: number } | null) => setY(r && { key, ...r })] as const;
 }
 
 const yAuto = (mn: number, mx: number, lsd: number) => uPlot.rangeNum(...yFloor(mn, mx, lsd), 0.1, true) as [number, number];
 
 // Line: time axis, x window set by Plot's `x`; Histogram: ordinal x over the bin values.
 function trendOpts(kind: 'line' | 'hist', sc: Scale, manual: { lo: number; hi: number } | null, hdp: number): Omit<uPlot.Options, 'width' | 'height'> {
-  const base = { legend: { show: false }, cursor: { y: false, drag: { x: false } } };
+  const cursor = { y: false, drag: { x: false } };
+  // A histogram bin; the edge ones (series 2) hold everything beyond the window: ≤ / ≥ their value.
+  const bin = (u: uPlot, v: number) => {
+    const i = u.data[0].indexOf(v), edge = u.data[2][i] != null ? (i === 0 ? '≤' : '≥') : '';
+    return edge + (v / sc.div).toFixed(hdp);
+  };
   if (kind === 'hist') return {
-    ...base,
+    cursor,
     scales: { x: { time: false, distr: 2 }, y: { range: { min: { pad: 0, soft: 0, mode: 1 }, max: { pad: 0.1, soft: 0, mode: 3 } } } },
     axes: [
-      {
-        ...AXIS,
-        // Edge bins (series 2) hold everything beyond the window: ≤ / ≥ their value.
-        values: (u, t) => t.map((v) => {
-          const i = u.data[0].indexOf(v), edge = u.data[2][i] != null ? (i === 0 ? '≤' : '≥') : '';
-          return edge + (v / sc.div).toFixed(hdp);
-        }),
-      },
+      { ...AXIS, values: (u, t) => t.map((v) => bin(u, v)) },
       { ...AXIS, size: 56 },
     ],
-    series: [{}, { stroke: '#3b82f6', fill: 'rgba(59,130,246,0.6)', paths: BARS, points: { show: false } }, { stroke: '#f59e0b', fill: 'rgba(245,158,11,0.7)', paths: BARS, points: { show: false } }],
+    series: [
+      { label: 'Value', value: (u, v) => (v == null ? '—' : `${bin(u, v)} ${sc.unit}`) },
+      { label: 'Count', value: legendValue(String), stroke: '#3b82f6', fill: 'rgba(59,130,246,0.6)', paths: BARS, points: { show: false } },
+      { label: 'Beyond', value: legendValue(String), stroke: '#f59e0b', fill: 'rgba(245,158,11,0.7)', paths: BARS, points: { show: false } },
+    ],
   };
   return {
-    ...base,
+    // The value under the cursor is the one the stepped line shows there, with that reading's time.
+    cursor: { ...cursor, dataIdx: (u, _series, near, x) => heldIdx(u.data[0], near, x) },
     scales: {
       x: { time: true, auto: false },
       y: { range: manual ? [manual.lo, manual.hi] : (_u, mn, mx) => yAuto(mn, mx, sc.lsd) },
@@ -239,21 +302,14 @@ function trendOpts(kind: 'line' | 'hist', sc: Scale, manual: { lo: number; hi: n
       { ...AXIS, space: 70, incrs: TIME_INCRS, values: TIME_FMT },
       { ...AXIS, size: 70, values: (_u, t) => t.map((v) => (v == null ? '' : (v / sc.div).toFixed(sc.dp))) },
     ],
-    series: [{}, { stroke: '#3b82f6', width: 1.5, fill: 'rgba(59,130,246,0.08)', paths: STEPPED, points: { show: false } }],
+    series: [
+      { label: 'Time', value: legendValue((t) => CLOCK(new Date(t * 1000))) },
+      { label: 'Value', value: legendValue((v) => `${(v / sc.div).toFixed(sc.dp)} ${sc.unit}`), stroke: '#3b82f6', width: 1.5, fill: 'rgba(59,130,246,0.08)', paths: STEPPED, points: { show: false } },
+    ],
   };
 }
 
 const range = ([lo, hi]: [number, number]) => ({ lo, hi });
-
-// Min/max of the readings inside [x0, x1]: what Auto Y is showing when the user switches to manual.
-function visibleExtent(hist: { t: number[]; v: (number | null)[] }, x0: number, x1: number): [number, number] {
-  let lo = Infinity, hi = -Infinity;
-  hist.t.forEach((t, i) => {
-    const v = hist.v[i];
-    if (t >= x0 && t <= x1 && v != null) { lo = Math.min(lo, v); hi = Math.max(hi, v); }
-  });
-  return [lo, hi];
-}
 
 // Typed in the display unit; an unparseable or crossing value snaps back to the current one.
 function YInput({ label, v, sc, onCommit }: { label: string; v: number; sc: Scale; onCommit: (x: number) => void }) {
@@ -359,22 +415,33 @@ function RangePanel() {
 function LogPanel() {
   const logged = useDev((s) => s.logged);
   const logging = useDev((s) => s.logging);
-  const set = useDev((s) => s.set);
+  const link = useDev((s) => s.link);
+  const recorded = useDev((s) => s.recorded);
+  const func = useDev((s) => s.dmm.func);
+  const fahrenheit = useDev((s) => s.fahrenheit);
+  // Data of another function or unit stays until cleared: nothing can be added to it.
+  const other = !logging && logged > 0 && !io.logMatches(recorded, func, fahrenheit) ? recorded : null;
   return (
     <Panel title="Logging">
       <div className="space-y-2">
         <Row2 label="Logged rows" value={logged.toLocaleString('en')} />
-        <Btn tone={logging ? 'danger' : 'success'} className="w-full" onClick={() => set({ logging: !logging })}>
+        <Btn tone={logging ? 'danger' : 'success'} className="w-full" disabled={!!other} onClick={logging ? io.stopDmmLog : io.startDmmLog}>
           {logging ? <><Pause size={13} /> Stop logging</> : <><Play size={13} /> Start logging</>}
         </Btn>
+        {other && <p className="text-[11px] text-amber">The data is from {funcName(other.func, other.fahrenheit)}. Switch back to it, or press "Clear data" to record something else.</p>}
         <div className="grid grid-cols-2 gap-2">
           <Btn disabled={!logged} onClick={io.exportDmmLog}><Download size={13} /> CSV</Btn>
-          <Btn tone="danger" disabled={!logged} onClick={io.clearDmmLog}><Trash2 size={13} /> Clear</Btn>
+          {/* Also resets the meter's own statistics, so it works with nothing recorded. */}
+          <Btn tone="danger" disabled={link !== 'connected' && !logged} onClick={() => void io.clearDmmData()}><Trash2 size={13} /> Clear data</Btn>
         </div>
       </div>
     </Panel>
   );
 }
+
+// A function as the message names it; temperature with its unit, which also has to match.
+const funcName = (func: DmmFunc, fahrenheit: boolean) =>
+  DMM_FUNCS.find((x) => x.id === func)!.label + (func === 'TEMP' ? ` in ${dmmBase(func, fahrenheit)}` : '');
 
 function Badge({ tone, pulse, children }: { tone: 'muted' | 'accent' | 'amber' | 'danger' | 'success'; pulse?: boolean; children: React.ReactNode }) {
   const c = { muted: 'border-border text-muted', accent: 'border-accent/50 text-accent', amber: 'border-amber/50 text-amber', danger: 'border-danger/50 text-danger', success: 'border-success/40 text-success' }[tone];

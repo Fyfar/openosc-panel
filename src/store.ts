@@ -37,9 +37,11 @@ export type State = {
 
   dmm: { func: DmmFunc; auto: boolean; range: number; hold: boolean; holdMode: HoldMode; rel: boolean; cj: number | null };
   ranges: number[]; // SI maxima from SYST:DMM:RANG:LIST?
+  fahrenheit: boolean; // SYST:DMM:TEMP:UNIT?
   reading: { v: number | null; over: boolean; blank: boolean; sec: number | null; seq: number } | null;
-  hist: { t: number[]; v: (number | null)[] }; // null = OL/blank gap, breaks the trend line
-  dstats: DmmStats; // since Reset or function change, not capped like `hist`
+  hist: { t: number[]; v: (number | null)[] }; // recorded readings; null = OL, blank or pause gap
+  dstats: DmmStats; // of every recorded reading, not capped like `hist`
+  recorded: { func: DmmFunc; fahrenheit: boolean; rangeMax?: number } | null; // what the recording holds
   logged: number;
   junctionNeeded: boolean; // CONF:TEMP was refused: Type K has no cold junction configured
 
@@ -96,9 +98,11 @@ export const useDev = create<State>((set) => ({
 
   dmm: { func: 'VDC', auto: true, range: 0, hold: false, holdMode: 'MAN', rel: false, cj: null },
   ranges: [],
+  fahrenheit: false,
   reading: null,
   hist: { t: [], v: [] },
   dstats: emptyStats(),
+  recorded: null,
   junctionNeeded: false,
   logged: 0,
 
