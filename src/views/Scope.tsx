@@ -5,8 +5,8 @@ import { fmtStable, fmtTime, fmtVolt, genHalvesScope, HALVED_NOTE, interleaveBlo
 import { extent, measure, type Frame, type Meas } from '../dsp';
 import * as io from '../io';
 import { useDev, type Channel, type CursorMode, type State } from '../store';
-import { Btn, CH_COLOR, Columns, M, Panel, Row, Seg, Select, Stepper, Toggle } from '../ui';
-import { composePng, SpectrumPanel, SpectrumReadout } from './ScopeFft';
+import { Btn, CH_COLOR, Columns, M, Panel, Row, Seg, Select, Stepper, strokeGrid, Toggle } from '../ui';
+import { COLOR as FFT_COLOR, fftPngText, FONT, SpectrumPanel, SpectrumReadout, wrap } from './ScopeFft';
 
 // Roll runs with Auto sweep from 200 ms/div (wiki: Oscilloscope → Roll mode).
 const isRolling = (s: State['scope']) => s.roll && s.sweep === 'AUTO' && TIMEBASES[s.tb] >= 0.2;
@@ -141,9 +141,6 @@ function TriggerBody({ s, set, say }: { s: State['scope']; set: (p: Partial<Stat
   };
   return (
     <div className="space-y-3">
-        <Row label="Source">
-          <Seg size="xs" value={s.trig.src} options={[{ id: 1, label: 'CH1', disabled: !s.ch[0].on }, { id: 2, label: 'CH2', disabled: !s.ch[1].on }]} onChange={(src) => set({ trig: { ...s.trig, src } })} />
-        </Row>
         <Row label="Slope">
           <Seg size="xs" value={s.trig.slope} options={[{ id: 'POS', label: '↑ Rising' }, { id: 'NEG', label: '↓ Falling' }]} onChange={(slope) => set({ trig: { ...s.trig, slope } })} />
         </Row>
@@ -175,7 +172,6 @@ function ChannelBody({ i, c, onChange }: { i: 0 | 1; c: Channel; onChange: (p: P
   const color = CH_COLOR[i];
   return (
     <div className={clsx('space-y-3', !c.on && 'pointer-events-none opacity-40')}>
-      <Row label="Coupling"><Seg size="xs" value={c.coup} options={[{ id: 'DC', label: 'DC' }, { id: 'AC', label: 'AC' }]} onChange={(coup) => onChange({ coup })} /></Row>
       <Stepper label="Volts/div" value={VDIV_MV.indexOf(c.vdivMv)} count={VDIV_MV.length} display={fmtVolt(vdiv(c))} color={color} onChange={(k) => onChange({ vdivMv: VDIV_MV[k] })} />
       <Slider label="Position" value={c.offsetDiv} min={-4} max={4} step={0.05} show={`${c.offsetDiv.toFixed(2)} div`} color={color} onChange={(offsetDiv) => onChange({ offsetDiv })} />
       <Row label="Probe">
@@ -186,8 +182,9 @@ function ChannelBody({ i, c, onChange }: { i: 0 | 1; c: Channel; onChange: (p: P
 }
 
 // A sidebar section that folds to one line of its current values; each opens and closes on its own.
-function Fold({ title, summary, open, onToggle, color, lead, children }: {
-  title: string; summary: string; open: boolean; onToggle: () => void; color?: string; lead?: React.ReactNode; children: React.ReactNode;
+// `tail` is a control shown in the header while open, in place of the summary.
+function Fold({ title, summary, open, onToggle, color, lead, tail, children }: {
+  title: string; summary: string; open: boolean; onToggle: () => void; color?: string; lead?: React.ReactNode; tail?: React.ReactNode; children: React.ReactNode;
 }) {
   return (
     <section className="rounded-lg border border-border bg-panel" style={{ borderColor: open && color ? `${color}55` : undefined }}>
@@ -198,6 +195,7 @@ function Fold({ title, summary, open, onToggle, color, lead, children }: {
           <span style={{ color }}>{title}</span>
           {!open && <span className="ml-auto truncate font-mono text-[11px] font-normal text-muted">{summary}</span>}
         </button>
+        {open && tail}
       </div>
       {open && <div className="border-t border-border px-4 py-3">{children}</div>}
     </section>
@@ -210,7 +208,7 @@ const SWEEP_LABEL = { AUTO: 'Auto', NORM: 'Normal', SING: 'Single' };
 function Sidebar({ s, set, setCh, say }: {
   s: State['scope']; set: (p: Partial<State['scope']>) => void; setCh: (i: 0 | 1, p: Partial<Channel>) => void; say: (m: string) => void;
 }) {
-  const [open, setOpen] = useState<Set<FoldId>>(() => new Set(['ch0']));
+  const [open, setOpen] = useState<Set<FoldId>>(() => new Set(['ch0', 'hor', 'trig']));
   const fold = (id: FoldId) => ({
     open: open.has(id),
     onToggle: () => setOpen((o) => { const n = new Set(o); if (!n.delete(id)) n.add(id); return n; }),
@@ -235,8 +233,11 @@ function Sidebar({ s, set, setCh, say }: {
           </button>
         );
         const summary = c.on ? `${fmtVolt(vdiv(c))}/div · ${c.coup} · ×${c.probe} · ${c.offsetDiv.toFixed(2)} div` : 'off';
+        const coupling = (
+          <Seg size="xs" value={c.coup} options={[{ id: 'DC', label: 'DC', disabled: !c.on }, { id: 'AC', label: 'AC', disabled: !c.on }]} onChange={(coup) => setCh(i, { coup })} />
+        );
         return (
-          <Fold key={i} title={`CH${i + 1}`} color={CH_COLOR[i]} lead={lead} summary={summary} {...fold(i ? 'ch1' : 'ch0')}>
+          <Fold key={i} title={`CH${i + 1}`} color={CH_COLOR[i]} lead={lead} tail={coupling} summary={summary} {...fold(i ? 'ch1' : 'ch0')}>
             <ChannelBody i={i} c={c} onChange={(p) => setCh(i, p)} />
           </Fold>
         );
@@ -247,7 +248,9 @@ function Sidebar({ s, set, setCh, say }: {
           <Slider label="Offset" value={s.hoff / tb} min={-5} max={5} step={0.1} show={fmtTime(s.hoff)} onChange={(d) => set({ hoff: d * tb })} />
         </div>
       </Fold>
-      <Fold title="Trigger" summary={`CH${s.trig.src} ${s.trig.slope === 'POS' ? '↑' : '↓'} ${fmtVolt(s.trig.level)} · ${SWEEP_LABEL[s.sweep]}`} {...fold('trig')}>
+      <Fold title="Trigger" summary={`CH${s.trig.src} ${s.trig.slope === 'POS' ? '↑' : '↓'} ${fmtVolt(s.trig.level)} · ${SWEEP_LABEL[s.sweep]}`} {...fold('trig')}
+        tail={<Seg size="xs" value={s.trig.src} options={[{ id: 1, label: 'CH1', disabled: !s.ch[0].on }, { id: 2, label: 'CH2', disabled: !s.ch[1].on }]} onChange={(src) => set({ trig: { ...s.trig, src } })} />}
+      >
         <TriggerBody s={s} set={set} say={say} />
       </Fold>
       <Fold title="Acquisition" summary={`${(s.mdepth / 1024).toFixed(0)}K · ${fmtSps(srate)}${s.roll ? ' · roll' : ''}`} {...fold('acq')}>
@@ -429,13 +432,11 @@ function timeWindow(s: State['scope'], f0: Frame | undefined) {
 
 function drawGrid(g: CanvasRenderingContext2D, W: number, H: number, dpr: number) {
   const dx = W / 10, dy = H / 8;
-  g.strokeStyle = '#1f2630';
-  g.lineWidth = 1;
-  g.setLineDash([2 * dpr, 4 * dpr]);
-  for (let i = 1; i < 10; i++) line(g, i * dx, 0, i * dx, H);
-  for (let i = 1; i < 8; i++) line(g, 0, i * dy, W, i * dy);
-  g.setLineDash([]);
-  g.strokeStyle = '#2d3643';
+  g.beginPath();
+  for (let i = 1; i < 10; i++) { g.moveTo(i * dx, 0); g.lineTo(i * dx, H); }
+  for (let i = 1; i < 8; i++) { g.moveTo(0, i * dy); g.lineTo(W, i * dy); }
+  strokeGrid(g, dpr);
+  g.strokeStyle = '#5a6678';
   line(g, W / 2, 0, W / 2, H);
   line(g, 0, H / 2, W, H / 2);
   for (let i = 0; i <= 50; i++) line(g, (i * W) / 50, H / 2 - 3 * dpr, (i * W) / 50, H / 2 + 3 * dpr);
@@ -523,8 +524,48 @@ function fmtSps(r: number) {
   return r >= 1e6 ? `${+(r / 1e6).toPrecision(3)} MSa/s` : r >= 1e3 ? `${+(r / 1e3).toPrecision(3)} kSa/s` : `${+r.toPrecision(3)} Sa/s`;
 }
 
-// With the FFT shown (its canvas exists) the image holds both, with the spectrum's readouts and notes.
+// The plot as on screen (FFT too when shown) on the plot's background, with the settings, basic
+// readouts per channel and the notes for readings known to be off written below.
 function savePng(trace: HTMLCanvasElement, spectrum: HTMLCanvasElement | null) {
-  const image = spectrum ? composePng(trace, spectrum) : trace;
-  image.toBlob((b) => b && io.download(`scope-${Date.now()}.png`, b), 'image/png');
+  const dpr = devicePixelRatio || 1, pad = 8 * dpr, row = 16 * dpr, W = trace.width;
+  const out = document.createElement('canvas'), g = out.getContext('2d')!;
+  g.font = FONT(dpr);
+  const lines = pngLines(g, W - 2 * pad, spectrum !== null);
+  const top = trace.height + (spectrum?.height ?? 0);
+  out.width = W; // resizing resets the context
+  out.height = top + lines.length * row + 2 * pad;
+  g.fillStyle = '#07090d';
+  g.fillRect(0, 0, out.width, out.height);
+  g.drawImage(trace, 0, 0);
+  if (spectrum) g.drawImage(spectrum, 0, trace.height);
+  g.font = FONT(dpr);
+  lines.forEach(({ text, color }, i) => { g.fillStyle = color; g.fillText(text, pad, top + pad + row * (i + 0.75)); });
+  out.toBlob((b) => b && io.download(`scope-${Date.now()}.png`, b), 'image/png');
+}
+
+function pngLines(g: CanvasRenderingContext2D, width: number, withFft: boolean) {
+  const { scope: s, scopeStatus } = useDev.getState();
+  const lines: { text: string; color: string }[] = [], notes: string[] = [];
+  const add = (parts: string[], sep: string, color: string) => { for (const text of wrap(g, parts, sep, width)) lines.push({ text, color }); };
+  add([
+    `${fmtTime(TIMEBASES[s.tb])}/div`, fmtSps(scopeStatus.srate), `${(s.mdepth / 1024).toFixed(0)}K pts`,
+    `trigger CH${s.trig.src} ${s.trig.slope === 'POS' ? '↑' : '↓'} ${fmtVolt(s.trig.level)}`,
+  ], ' · ', '#8b949e');
+  s.ch.forEach((c, i) => {
+    if (!c.on) return;
+    const f = io.scopeData.frames.find((fr) => fr.ch === i), m = f && readouts(f);
+    const parts = [`CH${i + 1} ${fmtVolt(vdiv(c))}/div ${c.coup} ×${c.probe}`];
+    if (m) {
+      parts.push(`Freq ${m.src === 'SPEC' ? '≈ ' : ''}${fmtStable(m.freq, 'Hz', 5).text}`, `Vpp ${fmtStable(m.vpp, 'V', 4).text}`);
+      if (m.clipped) notes.push(`CH${i + 1} clipped: Vpp reads low. Raise volts/div or move the trace.`);
+    }
+    add(parts, '   ', CH_COLOR[i]);
+  });
+  if (withFft) {
+    const fft = fftPngText();
+    add(fft.cells, '   ', FFT_COLOR);
+    notes.push(...fft.notes);
+  }
+  for (const note of notes) add(note.split(' '), ' ', '#f59e0b');
+  return lines;
 }

@@ -52,15 +52,21 @@ const genRestore = (g: State['gen'], model: Model) => [
   `OUTP ${g.out ? 'ON' : 'OFF'}`, `SOUR:FREQ ${Math.min(g.freq, genMaxHz(model, get().idn?.fw)[g.shape])}`, `SOUR:FUNC ${SHAPE_CMD[g.shape]}`, `SOUR:FREQ ${g.freq}`,
 ];
 
-// Next V/div per channel: a step up when it clips (> ±3.8 div), a step down when it is tiny
-// (< 1.5 div p-p), else unchanged.
+// Next V/div per channel: a step up when it clips (its real size is unknown), when tiny straight
+// down to the first range showing it larger, else unchanged. The jump counts a reading as at least one
+// ADC code (a smaller signal reads flat) and never goes where the peak would clip: a tiny signal on an
+// offset would step down and up for ever.
+const CLIP_DIV = 3.8, TINY_DIV = 1.5; // peak from 0 V, and peak to peak
 export function rerange(frames: Frame[], vdiv: number[], probe: number[]): number[] {
   return frames.map((fr, i) => {
     const { mn, mx } = extent(fr.volts);
-    const peak = Math.max(Math.abs(mn), Math.abs(mx)) / vdiv[i], pp = (mx - mn) / vdiv[i];
+    const peak = Math.max(Math.abs(mn), Math.abs(mx)), pp = mx - mn;
     const steps = VDIV_MV.map((m) => (m * probe[i]) / 1000);
     const idx = steps.indexOf(nearest(steps, vdiv[i]));
-    const want = peak > 3.8 ? Math.min(steps.length - 1, idx + 1) : pp < 1.5 ? Math.max(0, idx - 1) : idx;
+    const seen = Math.max(pp, fr.scale?.yinc ?? 0);
+    const lowest = () => steps.findIndex((s) => peak / s <= CLIP_DIV);
+    const down = () => Math.max(0, lowest(), steps.findLastIndex((s, j) => j < idx && seen / s >= TINY_DIV));
+    const want = peak / vdiv[i] > CLIP_DIV ? Math.min(steps.length - 1, idx + 1) : pp / vdiv[i] < TINY_DIV ? down() : idx;
     return want === idx ? vdiv[i] : steps[want];
   });
 }
@@ -114,10 +120,10 @@ async function freshPair(recordMs: number) {
   return a.seq === c.seq ? [a, c] : null;
 }
 
-// One point. A channel that clips or is tiny is re-ranged and the point retried. Null when no clean
-// pair came in 5 tries, or no fresh record before the deadline.
+// One point. A channel that clips or is tiny is re-ranged and the point retried, up to a walk of the
+// whole list (clipping goes up one step at a time). Null when no clean pair came, or it never settled.
 async function measurePoint(f: number, tb: number, vdiv: number[], probe: number[]) {
-  for (let attempt = 0; attempt < 5; attempt++) {
+  for (let attempt = 0; attempt < VDIV_MV.length; attempt++) {
     // 32 768 per channel: a record lasts 10 × the timebase and arrives every ≤ 2 of that (ZT703S, 0.21.14).
     const pair = await freshPair(20_000 * tb);
     if (!pair) return null;
@@ -176,7 +182,7 @@ export async function bodeSweep() {
     await readGen(true);
     get().patch('bode', { running: false });
   }
-  if (skipped) fail(`Bode: ${skipped} point(s) skipped, no clean CH1/CH2 frame pair.`);
+  if (skipped) fail(`Bode: ${skipped} point(s) skipped: no clean CH1/CH2 frame pair, or the range never settled.`);
 }
 
 export const bodeStop = () => get().patch('bode', { running: false });

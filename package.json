@@ -1,6 +1,6 @@
 {
   "name": "openosc-panel",
-  "version": "0.10.1",
+  "version": "0.11.0",
   "description": "Browser control panel for ZOYI ZT703S / ZT706S on OpenOSC firmware over Web Serial: oscilloscope, signal generator, Bode plotter and multimeter.",
   "private": true,
   "license": "MIT",
