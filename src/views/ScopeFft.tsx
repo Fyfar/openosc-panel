@@ -10,7 +10,8 @@ import * as io from '../io';
 import { useDev, type FftScale } from '../store';
 import { Columns, M, Seg } from '../ui';
 
-const COLOR = '#d946ef', GRID = '#1f2630', MUTED = '#8b949e';
+export const COLOR = '#d946ef'; // the FFT's trace and readout colour
+const GRID = '#1f2630', MUTED = '#8b949e';
 const SNAP_PX = 6; // a placed marker takes the highest point this close to the pointer
 const WINDOW_LABEL: Record<FftWindow, string> = { RECT: 'Rect', HANN: 'Hann', HAMM: 'Hamming', BLACK: 'Blackman' };
 const SCALES: { id: FftScale; label: string }[] = [{ id: 'DBV', label: 'dBV' }, { id: 'DBFS', label: 'dBFS' }, { id: 'LIN', label: 'Linear' }];
@@ -43,7 +44,7 @@ const NOTE: Record<FftNote, string> = {
 
 const HELP: [head: string, text: string][] = [
   ['', 'One channel is analysed: the samples across the screen, updated about twice a second.'],
-  ['Highest frequency', 'is half the sample rate ("valid to"). The scope has no filter for anything higher, so it appears at a false frequency and the app can\'t tell. Faster time/div raises it.'],
+  ['Highest frequency', 'is half the sample rate. The scope has no filter for anything higher, so it appears at a false frequency and the app can\'t tell. Faster time/div raises it. To check a peak, change time/div: a real one stays put.'],
   ['Detail', 'is 1 ÷ the time on screen: closer peaks merge. A slower time/div gives finer detail but can lower the highest frequency.'],
   ['Levels', 'depend on the scope\'s calibration; the two channels can differ by a few percent. ≈ marks a rough value.'],
   ['Weak peaks:', 'the scope measures in 256 steps. Fill the screen height without clipping. Peaks far below the strongest one may come from the scope or the signal source.'],
@@ -65,7 +66,7 @@ function analyse(f: Frame, win: FftWindow) {
 
 // What the panel shows right now: the settings, and the latest data if it is the shown channel's.
 function model() {
-  const { fftSrc, fftWin, fftScale, fftSpan, fftMarkers, scope, scopeStatus } = useDev.getState();
+  const { fftSrc, fftWin, fftScale, fftSpan, fftMarkers, scope } = useDev.getState();
   const ch = scope.ch[fftSrc].on ? fftSrc : ((1 - fftSrc) as 0 | 1); // as io reads: the enabled channel
   const f = io.scopeData.fft?.ch === ch ? io.scopeData.fft : null;
   const { sp, swing } = f ? analyse(f, fftWin) : { sp: null, swing: 0 };
@@ -74,7 +75,6 @@ function model() {
   return {
     ch, f, sp, swing, vd, win: fftWin, level: LEVEL[fftScale], markers: fftMarkers,
     spanHz: sp ? fftSpanHz(sp, fftSpan) : NaN,
-    topHz: f ? 1 / (2 * f.xinc) : scopeStatus.srate / 2,
     peak: sp ? findPeak(sp, vd, fftWin) : null,
     a: read(marks.a), b: read(marks.b),
   };
@@ -94,13 +94,11 @@ function everyFrame(changed: () => void) {
 function useSpectrum() {
   useSyncExternalStore(everyFrame, snapshot);
   // The settings the model reads, as one value that changes only when one of them does.
-  useDev((s) => [s.fftSrc, s.fftWin, s.fftScale, s.fftSpan, s.fftMarkers, s.scopeStatus.srate,
+  useDev((s) => [s.fftSrc, s.fftWin, s.fftScale, s.fftSpan, s.fftMarkers,
     ...s.scope.ch.map((c) => `${c.on} ${c.vdivMv} ${c.probe}`)].join());
   return model();
 }
 
-const limitLine = (m: Model) =>
-  `Valid to ${Number.isFinite(m.topHz) ? fmtHz(m.topHz, true) : '—'}. Higher signals show up at false frequencies. To check a peak, change time/div: a real one stays put.`;
 
 function notes({ f, swing, vd, peak, spanHz }: Model): string[] {
   if (!f) return [];
@@ -165,7 +163,7 @@ export const SpectrumReadout = memo(function SpectrumReadout() {
 // --- canvas ---------------------------------------------------------------------------------
 
 // Greedy line breaking of `parts` joined by `sep` to at most `width` canvas pixels.
-function wrap(g: CanvasRenderingContext2D, parts: string[], sep: string, width: number) {
+export function wrap(g: CanvasRenderingContext2D, parts: string[], sep: string, width: number) {
   const lines: string[] = [];
   for (const part of parts) {
     const joined = lines.length ? `${lines.at(-1)}${sep}${part}` : part;
@@ -175,7 +173,7 @@ function wrap(g: CanvasRenderingContext2D, parts: string[], sep: string, width: 
   return lines;
 }
 
-const FONT = (dpr: number) => `${11 * dpr}px "Geist Mono Variable", monospace`;
+export const FONT = (dpr: number) => `${11 * dpr}px "Geist Mono Variable", monospace`;
 type Plot = { g: CanvasRenderingContext2D; W: number; top: number; h: number; dpr: number };
 
 // A level (0 = plot top … 1 = bottom) of a bin's peak volts, kept inside the plot.
@@ -261,12 +259,9 @@ function drawMarkerLines({ g, W, top, h, dpr }: Plot, { a, b, spanHz }: Model) {
   g.setLineDash([]);
 }
 
-function caption({ ch, f, sp, topHz, win, level }: Model) {
+function caption({ ch, f, sp, win, level }: Model) {
   if (!f || !sp) return [`CH${ch + 1}`];
-  return [
-    `CH${ch + 1}`, `${f.volts.length.toLocaleString('en-US')} samples`, `resolution ${fmtHz(sp.resHz, true)}`,
-    `valid to ${fmtHz(topHz, true)}`, WINDOW_LABEL[win], level.name,
-  ];
+  return [`CH${ch + 1}`, `${f.volts.length.toLocaleString('en-US')} samples`, `resolution ${fmtHz(sp.resHz, true)}`, WINDOW_LABEL[win], level.name];
 }
 
 function drawSpectrum(c: HTMLCanvasElement, m: Model) {
@@ -294,25 +289,10 @@ function drawSpectrum(c: HTMLCanvasElement, m: Model) {
   drawMarkerLines(p, m);
 }
 
-// Trace and spectrum in one image, the readouts, the limit and the active notes written below.
-export function composePng(trace: HTMLCanvasElement, spectrum: HTMLCanvasElement) {
-  const m = model(), dpr = devicePixelRatio || 1, pad = 8 * dpr, row = 16 * dpr;
-  const out = document.createElement('canvas'), g = out.getContext('2d')!, W = trace.width;
-  g.font = FONT(dpr);
-  const text = [
-    ...wrap(g, cells(m).map((c) => `${c.l} ${c.v}`), '   ', W - 2 * pad),
-    ...[limitLine(m), ...notes(m)].flatMap((note) => wrap(g, note.split(' '), ' ', W - 2 * pad)),
-  ];
-  out.width = W; // resizing resets the context
-  out.height = trace.height + spectrum.height + text.length * row + 2 * pad;
-  g.fillStyle = '#07090d';
-  g.fillRect(0, 0, out.width, out.height);
-  g.drawImage(trace, 0, 0);
-  g.drawImage(spectrum, 0, trace.height);
-  g.font = FONT(dpr);
-  g.fillStyle = '#e6edf3';
-  text.forEach((line, i) => g.fillText(line, pad, trace.height + spectrum.height + pad + row * (i + 0.75)));
-  return out;
+// The spectrum's part of the PNG text: its readouts and the notes that apply.
+export function fftPngText() {
+  const m = model();
+  return { cells: cells(m).map((c) => `${c.l} ${c.v}`), notes: notes(m) };
 }
 
 // --- panel ----------------------------------------------------------------------------------
@@ -377,10 +357,11 @@ export const SpectrumPanel = memo(function SpectrumPanel({ canvas }: { canvas: R
   return (
     <div className="overflow-hidden rounded-lg border border-border bg-[#07090d]">
       <Controls shown={m.ch} />
-      <div className="space-y-0.5 px-3 py-1.5 text-[11px]">
-        <p className="text-muted">{limitLine(m)}</p>
-        {notes(m).map((n) => <p key={n} className="text-amber">{n}</p>)}
-      </div>
+      {notes(m).length > 0 && (
+        <div className="space-y-0.5 px-3 py-1.5 text-[11px]">
+          {notes(m).map((n) => <p key={n} className="text-amber">{n}</p>)}
+        </div>
+      )}
       <canvas
         ref={canvas}
         onPointerDown={onPointer}

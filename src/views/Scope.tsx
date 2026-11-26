@@ -6,7 +6,7 @@ import { extent, measure, type Frame, type Meas } from '../dsp';
 import * as io from '../io';
 import { useDev, type Channel, type CursorMode, type State } from '../store';
 import { Btn, CH_COLOR, Columns, M, Panel, Row, Seg, Select, Stepper, Toggle } from '../ui';
-import { composePng, SpectrumPanel, SpectrumReadout } from './ScopeFft';
+import { COLOR as FFT_COLOR, fftPngText, FONT, SpectrumPanel, SpectrumReadout, wrap } from './ScopeFft';
 
 // Roll runs with Auto sweep from 200 ms/div (wiki: Oscilloscope → Roll mode).
 const isRolling = (s: State['scope']) => s.roll && s.sweep === 'AUTO' && TIMEBASES[s.tb] >= 0.2;
@@ -526,8 +526,48 @@ function fmtSps(r: number) {
   return r >= 1e6 ? `${+(r / 1e6).toPrecision(3)} MSa/s` : r >= 1e3 ? `${+(r / 1e3).toPrecision(3)} kSa/s` : `${+r.toPrecision(3)} Sa/s`;
 }
 
-// With the FFT shown (its canvas exists) the image holds both, with the spectrum's readouts and notes.
+// The plot as on screen (FFT too when shown) on the plot's background, with the settings, basic
+// readouts per channel and the notes for readings known to be off written below.
 function savePng(trace: HTMLCanvasElement, spectrum: HTMLCanvasElement | null) {
-  const image = spectrum ? composePng(trace, spectrum) : trace;
-  image.toBlob((b) => b && io.download(`scope-${Date.now()}.png`, b), 'image/png');
+  const dpr = devicePixelRatio || 1, pad = 8 * dpr, row = 16 * dpr, W = trace.width;
+  const out = document.createElement('canvas'), g = out.getContext('2d')!;
+  g.font = FONT(dpr);
+  const lines = pngLines(g, W - 2 * pad, spectrum !== null);
+  const top = trace.height + (spectrum?.height ?? 0);
+  out.width = W; // resizing resets the context
+  out.height = top + lines.length * row + 2 * pad;
+  g.fillStyle = '#07090d';
+  g.fillRect(0, 0, out.width, out.height);
+  g.drawImage(trace, 0, 0);
+  if (spectrum) g.drawImage(spectrum, 0, trace.height);
+  g.font = FONT(dpr);
+  lines.forEach(({ text, color }, i) => { g.fillStyle = color; g.fillText(text, pad, top + pad + row * (i + 0.75)); });
+  out.toBlob((b) => b && io.download(`scope-${Date.now()}.png`, b), 'image/png');
+}
+
+function pngLines(g: CanvasRenderingContext2D, width: number, withFft: boolean) {
+  const { scope: s, scopeStatus } = useDev.getState();
+  const lines: { text: string; color: string }[] = [], notes: string[] = [];
+  const add = (parts: string[], sep: string, color: string) => { for (const text of wrap(g, parts, sep, width)) lines.push({ text, color }); };
+  add([
+    `${fmtTime(TIMEBASES[s.tb])}/div`, fmtSps(scopeStatus.srate), `${(s.mdepth / 1024).toFixed(0)}K pts`,
+    `trigger CH${s.trig.src} ${s.trig.slope === 'POS' ? '↑' : '↓'} ${fmtVolt(s.trig.level)}`,
+  ], ' · ', '#8b949e');
+  s.ch.forEach((c, i) => {
+    if (!c.on) return;
+    const f = io.scopeData.frames.find((fr) => fr.ch === i), m = f && readouts(f);
+    const parts = [`CH${i + 1} ${fmtVolt(vdiv(c))}/div ${c.coup} ×${c.probe}`];
+    if (m) {
+      parts.push(`Freq ${m.src === 'SPEC' ? '≈ ' : ''}${fmtStable(m.freq, 'Hz', 5).text}`, `Vpp ${fmtStable(m.vpp, 'V', 4).text}`);
+      if (m.clipped) notes.push(`CH${i + 1} clipped: Vpp reads low. Raise volts/div or move the trace.`);
+    }
+    add(parts, '   ', CH_COLOR[i]);
+  });
+  if (withFft) {
+    const fft = fftPngText();
+    add(fft.cells, '   ', FFT_COLOR);
+    notes.push(...fft.notes);
+  }
+  for (const note of notes) add(note.split(' '), ' ', '#f59e0b');
+  return lines;
 }
