@@ -128,7 +128,7 @@ let checks = 0;
   const cfg: Record<string, string> = {
     'FUNC?': '"VOLT"', 'SYST:DMM:RANG:LIST?': '3,2.5,25,250', 'AUTO?': '1', 'SYST:DMM:HOLD?': '0',
     'SYST:DMM:REL?': '0', 'SYST:DMM:HOLD:MODE?': 'MAN', '*IDN?': IDN, 'SYST:ERR?': '0,"No error"',
-    'SYST:DMM:TEMP:CJUN?': '22.5', 'SYST:REM?': '0',
+    'SYST:DMM:TEMP:CJUN?': '22.5', 'SYST:DMM:TEMP:UNIT?': 'C', 'SYST:REM?': '0',
   };
   const dev = fakePort((c) => {
     if (c === 'FUNC2 FREQ') func2 = true;
@@ -159,7 +159,7 @@ let checks = 0;
     if (c === '*CLS') err = '0,"No error"';
     const cfg: Record<string, string> = {
       'FUNC?': func, 'SYST:DMM:RANG:LIST?': '3,2.5,25,250', 'AUTO?': '1', 'SYST:DMM:HOLD?': '0', 'SYST:DMM:REL?': '0',
-      'SYST:DMM:HOLD:MODE?': 'MAN', 'SYST:DMM:TEMP:CJUN?': 'NAN', 'SYST:ERR?': err, '*IDN?': IDN, 'SYST:REM?': '0',
+      'SYST:DMM:HOLD:MODE?': 'MAN', 'SYST:DMM:TEMP:CJUN?': 'NAN', 'SYST:DMM:TEMP:UNIT?': 'C', 'SYST:ERR?': err, '*IDN?': IDN, 'SYST:REM?': '0',
     };
     return cfg[c] ?? null;
   });
@@ -176,6 +176,58 @@ let checks = 0;
   assert.equal(useDev.getState().junctionNeeded, false, 'any other function change clears it');
   await link.close();
   checks += 4;
+}
+
+// --- an overload reading: SYST:DMM:RES? sends NAN with status 6 (not MEAS?'s 1E+9) --------
+{
+  let seq = 100;
+  const cfg: Record<string, string> = {
+    'FUNC?': '"RES"', 'SYST:DMM:RANG:LIST?': '2,250,2500', 'AUTO?': '1', 'SYST:DMM:HOLD?': '0', 'SYST:DMM:REL?': '0',
+    'SYST:DMM:HOLD:MODE?': 'MAN', 'SYST:DMM:TEMP:CJUN?': 'NAN', 'SYST:DMM:TEMP:UNIT?': 'C', 'SYST:ERR?': '0,"No error"', '*IDN?': IDN, 'SYST:REM?': '0',
+  };
+  const dev = fakePort((c) => (c === 'SYST:DMM:RES?' ? `5,NAN,6,NAN,0,2,1,0,0,${++seq},0` : cfg[c] ?? null));
+  useDev.setState({ reading: null });
+  await link.open(dev.port);
+  runLoop('dmm', dmmLoop);
+  for (const end = performance.now() + 3000; !useDev.getState().reading && performance.now() < end;) await sleep(50);
+  await stopLoop();
+  await link.close();
+  const r = useDev.getState().reading;
+  assert.deepEqual([r?.over, r?.blank, r?.v], [true, false, null], 'overload shows OL, not ----');
+  checks++;
+}
+
+// --- °F: RES? stays in °C (the meter converts only its screen), so the panel converts, without the
+// +32 under REL; a unit change on the meter restarts trend and statistics
+{
+  let seq = 200, unit = 'F', rel = 0, value = 25;
+  const dev = fakePort((c) => {
+    const cfg: Record<string, string> = {
+      'FUNC?': '"TEMP"', 'SYST:DMM:RANG:LIST?': '0', 'AUTO?': '0', 'SYST:DMM:HOLD?': '0', 'SYST:DMM:REL?': String(rel),
+      'SYST:DMM:HOLD:MODE?': 'MAN', 'SYST:DMM:TEMP:CJUN?': '22.5', 'SYST:DMM:TEMP:UNIT?': unit,
+      'SYST:ERR?': '0,"No error"', '*IDN?': IDN, 'SYST:REM?': '0',
+    };
+    return c === 'SYST:DMM:RES?' ? `12,${value},0,NAN,0,0,-1,0,${rel},${++seq},0` : cfg[c] ?? null;
+  });
+  const shows = async (v: number, what: string) => {
+    for (const end = performance.now() + 4000; useDev.getState().reading?.v !== v && performance.now() < end;) await sleep(50);
+    assert.equal(useDev.getState().reading?.v, v, what);
+  };
+  useDev.setState({ reading: null, logging: true });
+  await link.open(dev.port);
+  runLoop('dmm', dmmLoop);
+  await shows(77, '25 °C shows as 77 °F');
+  assert.equal(useDev.getState().dstats.min, 77, 'statistics are in °F too');
+  assert.match(dmmLogCsv().trim().split('\n').at(-1)!, /,Temperature,77,°F$/);
+  rel = 1; value = 10;
+  await shows(18, 'a REL difference converts without +32');
+  rel = 0; value = 25; unit = 'C';
+  await shows(25, 'back to °C after the unit changes on the meter');
+  assert.ok(useDev.getState().hist.v.every((v) => v === 25) && useDev.getState().dstats.max === 25, 'no °F left in trend or statistics');
+  await stopLoop();
+  await link.close();
+  useDev.setState({ logging: false });
+  checks += 6;
 }
 
 // A fake from three tables: set-commands change state, `wave` queries are computed, `cfg` are fixed.

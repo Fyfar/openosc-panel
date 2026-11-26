@@ -1,7 +1,7 @@
 // Self-check for the pure logic: typed frequency, DMM scaling, Bode maths/plan/restore,
 // scope measurements and generator command order. Run: `npm run check`.
 import assert from 'node:assert/strict';
-import { bodeEta, bodePlan, fmtStable, fwAtLeast, genMaxHz, interleaveBlockers, parseHz, scaleFor, seenRef, VDIV_MV } from '../src/device.ts';
+import { bodeEta, bodePlan, dmmScale, fmtStable, fwAtLeast, genMaxHz, interleaveBlockers, parseHz, scaleFor, VDIV_MV } from '../src/device.ts';
 import { addStat, emptyStats, FFT_WINDOWS, fftNotes, fftSpanHz, bodeTone, findPeak, histogram, spanAtLeast, unwrapPhase, measure, peakIn, peakNear, spectrum, spectrumOf, stdDev, yFloor, type FftWindow, type Frame } from '../src/dsp.ts';
 import { parseFrame, parseMeas, screenWindow } from '../src/io/scope.ts';
 import { pointCmds, rerange, scopeRestore, SWEEP_SCOPE } from '../src/io/bode.ts';
@@ -24,22 +24,38 @@ for (const [text, hz] of [
   checks++;
 }
 
-// --- scaleFor: prefix and decimals from the range maximum (25000 / 66000 counts) -----------
-for (const [ref, base, unit, dp] of [
-  [2.5, 'V', 'V', 4], [25, 'V', 'V', 3], [0.25, 'V', 'mV', 2], [0.025, 'V', 'mV', 3], [6.6, 'V', 'V', 4],
-  [9.999e-9, 'F', 'nF', 3], [99.99e-3, 'F', 'mF', 2], [25e6, 'Ω', 'MΩ', 3], [100, '°C', '°C', 1],
+// --- scaleFor: every range of the meter, unit and decimals as its screen shows them (OpenOSC
+// dmm/ranges.cpp, both models) -------------------------------------------------------------
+for (const [base, ranges] of [
+  ['V', [[2.5, 'V', 4], [25, 'V', 3], [250, 'V', 2], [1000, 'V', 1], [750, 'V', 1], [6.6, 'V', 4], [66, 'V', 3], [660, 'V', 2]]],
+  ['V', [[0.025, 'mV', 3], [0.25, 'mV', 2], [0.066, 'mV', 3], [0.66, 'mV', 2]]],
+  ['A', [[2.5, 'A', 4], [10, 'A', 3], [6.6, 'A', 4], [0.025, 'mA', 3], [0.25, 'mA', 2], [0.066, 'mA', 3], [0.66, 'mA', 2]]],
+  ['Ω', [[250, 'Ω', 2], [2500, 'kΩ', 4], [25e3, 'kΩ', 3], [250e3, 'kΩ', 2], [2.5e6, 'MΩ', 4], [25e6, 'MΩ', 3], [250e6, 'MΩ', 1]]],
+  ['Ω', [[660, 'Ω', 2], [6600, 'kΩ', 4], [66e3, 'kΩ', 3], [660e3, 'kΩ', 2], [6.6e6, 'MΩ', 4], [66e6, 'MΩ', 3]]],
+  ['F', [[9.999e-9, 'nF', 3], [99.99e-9, 'nF', 2], [999.9e-9, 'nF', 1], [9.999e-6, 'µF', 3], [99.99e-6, 'µF', 2], [999.9e-6, 'µF', 1], [9.999e-3, 'mF', 3], [99.99e-3, 'mF', 2]]],
+  ['V', [[1, 'V', 4]]], // dmmScale's fallback before the ranges arrive
 ] as const) {
-  const s = scaleFor(ref, base);
-  assert.deepEqual([s.unit, s.dp], [unit, dp], `scaleFor(${ref}, ${base})`);
-  near(s.lsd, s.div * 10 ** -dp, 1e-18, `scaleFor(${ref}, ${base}).lsd`);
+  for (const [ref, unit, dp] of ranges) {
+    const s = scaleFor(ref, base);
+    assert.deepEqual([s.unit, s.dp], [unit, dp], `scaleFor(${ref}, ${base})`);
+    near(s.lsd, s.div * 10 ** -dp, 1e-18, `scaleFor(${ref}, ${base}).lsd`);
+    checks++;
+  }
+}
+
+// --- dmmScale: no range list (continuity, diode, Type K) → one layout, as on the meter -------
+for (const [func, rangeMax, unit, dp] of [
+  ['CONT', undefined, 'Ω', 2], ['DIOD', undefined, 'V', 3], ['TEMP', undefined, '°C', 1],
+  ['RES', 2500, 'kΩ', 4], ['VDC', 1000, 'V', 1], ['VDC', undefined, 'V', 4],
+] as const) {
+  const s = dmmScale(func, rangeMax);
+  assert.deepEqual([s.unit, s.dp], [unit, dp], `dmmScale(${func}, ${rangeMax})`);
+  near(s.lsd, s.div * 10 ** -dp, 1e-18, `dmmScale(${func}, ${rangeMax}).lsd`);
   checks++;
 }
 
-// --- seenRef: no ranges (continuity, diode) → scale from the largest reading so far, never shrinking
-assert.equal(seenRef(0.2, { n: 3, min: 0, max: 5 }), 5, 'seenRef keeps the largest seen');
-assert.equal(seenRef(-7, { n: 3, min: 0, max: 5 }), 7, 'seenRef grows with |v|');
-assert.equal(seenRef(0, { n: 0, min: Infinity, max: -Infinity }), 1, 'seenRef with nothing seen');
-checks += 3;
+assert.deepEqual([dmmScale('TEMP', undefined, true).unit, dmmScale('DIOD', undefined, true).unit], ['°F', 'V'], 'only temperature follows °F');
+checks++;
 
 // --- DMM running stats: match a full rescan, counts keyed by display count -----------------
 {

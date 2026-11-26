@@ -137,8 +137,9 @@ export type DmmFunc =
   | 'VDC' | 'VAC' | 'MVDC' | 'MVAC' | 'ADC' | 'AAC' | 'MADC' | 'MAAC'
   | 'RES' | 'CONT' | 'DIOD' | 'CAP' | 'TEMP';
 
-// Units, ranges and resolution come from the device (SYST:DMM:RANG:LIST?), not from here.
-export const DMM_FUNCS: { id: DmmFunc; label: string; short: string; base: string }[] = [
+// Ranges come from the device (SYST:DMM:RANG:LIST?). `dp`: a function it lists none for shows one
+// layout, base unit and that many decimals (measured on the ZT703S; diode also OpenOSC dmm/scale.hpp).
+export const DMM_FUNCS: { id: DmmFunc; label: string; short: string; base: string; dp?: number }[] = [
   { id: 'VDC', label: 'DC Voltage', short: 'V⎓', base: 'V' },
   { id: 'VAC', label: 'AC Voltage', short: 'V~', base: 'V' },
   { id: 'MVDC', label: 'DC Millivolts', short: 'mV⎓', base: 'V' },
@@ -148,10 +149,10 @@ export const DMM_FUNCS: { id: DmmFunc; label: string; short: string; base: strin
   { id: 'MADC', label: 'DC Milliamps', short: 'mA⎓', base: 'A' },
   { id: 'MAAC', label: 'AC Milliamps', short: 'mA~', base: 'A' },
   { id: 'RES', label: 'Resistance', short: 'Ω', base: 'Ω' },
-  { id: 'CONT', label: 'Continuity', short: '•))', base: 'Ω' },
-  { id: 'DIOD', label: 'Diode', short: '→|', base: 'V' },
+  { id: 'CONT', label: 'Continuity', short: '•))', base: 'Ω', dp: 2 },
+  { id: 'DIOD', label: 'Diode', short: '→|', base: 'V', dp: 3 },
   { id: 'CAP', label: 'Capacitance', short: '⊣⊢', base: 'F' },
-  { id: 'TEMP', label: 'Temperature', short: '°C', base: '°C' },
+  { id: 'TEMP', label: 'Temperature', short: '°C', base: '°C', dp: 1 },
 ];
 
 export const HOLD_MODES = ['MAN', 'DEL', 'STAB', 'AUTO'] as const;
@@ -210,18 +211,25 @@ const PREFIX: [number, string][] = [[1e6, 'M'], [1e3, 'k'], [1, ''], [1e-3, 'm']
 // 5 digits: matches the firmware's range decimals on both models (dmm/ranges.cpp: ZT703S 2.5 V → 4
 // decimals, 25000 counts; ZT706S 6.6 V → 4 decimals, 66000 counts).
 const DIGITS = 5;
+// Ranges the meter shows with one decimal where the digit rule gives two (OpenOSC dmm/ranges.cpp):
+// 750 V AC and the ZT703S's 250 MΩ.
+const ONE_DECIMAL = [750, 250e6];
 
-// DMM display prefix and decimals from a reference magnitude (the active range's maximum).
-// Scale reference when a function has no ranges (continuity, diode): the largest |reading| so far,
-// so the scale only coarsens instead of flipping prefix/decimals on every reading.
-export const seenRef = (v: number, s: { n: number; min: number; max: number }) =>
-  Math.max(Math.abs(v), s.n ? Math.max(Math.abs(s.min), Math.abs(s.max)) : 0) || 1;
+// A function's base unit; temperature follows the meter's °C/°F setting.
+export const dmmBase = (func: DmmFunc, fahrenheit: boolean) => (fahrenheit && func === 'TEMP' ? '°F' : DMM_FUNCS.find((x) => x.id === func)!.base);
 
+// A reading's unit and decimals: the function's fixed layout, else its active range's.
+export function dmmScale(func: DmmFunc, rangeMax?: number, fahrenheit = false) {
+  const base = dmmBase(func, fahrenheit), { dp } = DMM_FUNCS.find((x) => x.id === func)!;
+  return dp === undefined ? scaleFor(rangeMax ?? 1, base) : { div: 1, unit: base, dp, lsd: 10 ** -dp };
+}
+
+// DMM display prefix and decimals from a range's maximum.
 export function scaleFor(ref: number, base: string) {
-  if (base === '°C') return { div: 1, unit: '°C', dp: 1, lsd: 0.1 };
   const r = Math.abs(ref) || 1;
-  const [div, p] = PREFIX.find(([d]) => r / d >= 0.999) ?? PREFIX.at(-1)!;
+  // The meter's 1000 V range is in V; its 999.9 nF and µF ranges stay in nF and µF (just under one).
+  const [div, p] = PREFIX.find(([d]) => r / d >= 1 && !(r === 1000 && d > 1)) ?? PREFIX.at(-1)!;
   const digits = base === 'F' ? 4 : DIGITS; // capacitance ranges are 4-digit (9.999 nF … 99.99 mF) on both models
-  const dp = Math.max(0, digits - 1 - Math.floor(Math.log10(r / div) + 1e-9));
+  const dp = ONE_DECIMAL.includes(r) ? 1 : Math.max(0, digits - 1 - Math.floor(Math.log10(r / div) + 1e-9));
   return { div, unit: p + base, dp, lsd: div * 10 ** -dp };
 }

@@ -2,7 +2,7 @@ import { clsx } from 'clsx';
 import { Download, Pause, Play, Trash2 } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import uPlot from 'uplot';
-import { DMM_FUNCS, HOLD_MODES, scaleFor, seenRef, type DmmFunc } from '../device';
+import { DMM_FUNCS, dmmScale, HOLD_MODES, scaleFor, type DmmFunc } from '../device';
 import { histogram, stdDev, yFloor } from '../dsp';
 import * as io from '../io';
 import { AXIS, Plot } from '../Plot';
@@ -41,8 +41,8 @@ export function Dmm() {
   const f = DMM_FUNCS.find((x) => x.id === dmm.func)!;
   const junctionNeeded = useDev((s) => s.junctionNeeded);
 
-  const ref = ranges[dmm.range] ?? seenRef(reading?.v ?? 0, dstats);
-  const sc = scaleFor(ref, f.base);
+  const fahrenheit = useDev((s) => s.fahrenheit);
+  const sc = dmmScale(dmm.func, ranges[dmm.range], fahrenheit);
   const fmt = (x: number, extra = 0) => `${(x / sc.div).toFixed(sc.dp + extra)} ${sc.unit}`;
   const ac = dmm.func.endsWith('AC');
 
@@ -151,17 +151,15 @@ export function Dmm() {
   );
 }
 
-type Scale = ReturnType<typeof scaleFor>;
+type Scale = ReturnType<typeof dmmScale>;
 
 function Trend({ sc }: { sc: Scale }) {
   const hist = useDev((s) => s.hist);
   const dstats = useDev((s) => s.dstats);
   const center = useDev((s) => s.reading?.v ?? 0);
-  const func = useDev((s) => s.dmm.func);
   const [kind, setKind] = useState<'line' | 'hist'>('line');
   const [win, setWin] = useState(60);
-  const [yMan, setYMan] = useState<{ func: DmmFunc; lo: number; hi: number } | null>(null);
-  const manual = yMan?.func === func ? yMan : null; // units change with the function
+  const [manual, setManual] = useManualY();
   const now = useNow(1000); // the axis keeps rolling while HOLD stops new readings
 
   // A bounded window starts at the first reading while it fills (the trace grows rightward),
@@ -183,7 +181,7 @@ function Trend({ sc }: { sc: Scale }) {
     [kind, bins, hist, end],
   );
 
-  const setY = (lo: number, hi: number) => { if (lo < hi) setYMan({ func, lo, hi }); };
+  const setY = (lo: number, hi: number) => { if (lo < hi) setManual({ lo, hi }); };
   return (
     <Panel
       title={kind === 'line' ? 'Trend' : 'Distribution'}
@@ -197,7 +195,7 @@ function Trend({ sc }: { sc: Scale }) {
       <Plot opts={opts} data={data} x={kind === 'line' ? [x0, x1] : undefined} className="h-64" />
       {kind === 'line' ? (
         <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2">
-          <div className="w-36"><Toggle label="Auto Y" on={!manual} onChange={(auto) => setYMan(auto ? null : { func, ...range(yAuto(...visibleExtent(hist, x0, x1), sc.lsd)) })} /></div>
+          <div className="w-36"><Toggle label="Auto Y" on={!manual} onChange={(auto) => setManual(auto ? null : range(yAuto(...visibleExtent(hist, x0, x1), sc.lsd)))} /></div>
           {manual && <YInput label="Min" v={manual.lo} sc={sc} onCommit={(lo) => setY(lo, manual.hi)} />}
           {manual && <YInput label="Max" v={manual.hi} sc={sc} onCommit={(hi) => setY(manual.lo, hi)} />}
         </div>
@@ -206,6 +204,15 @@ function Trend({ sc }: { sc: Scale }) {
       )}
     </Panel>
   );
+}
+
+// The manual Y range is in one unit: another function or °C ⇄ °F drops back to auto.
+function useManualY() {
+  const func = useDev((s) => s.dmm.func);
+  const fahrenheit = useDev((s) => s.fahrenheit);
+  const key = `${func} ${fahrenheit}`;
+  const [y, setY] = useState<{ key: string; lo: number; hi: number } | null>(null);
+  return [y?.key === key ? y : null, (r: { lo: number; hi: number } | null) => setY(r && { key, ...r })] as const;
 }
 
 const yAuto = (mn: number, mx: number, lsd: number) => uPlot.rangeNum(...yFloor(mn, mx, lsd), 0.1, true) as [number, number];
