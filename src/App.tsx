@@ -261,9 +261,10 @@ function ScreenshotDialog() {
     const t = performance.now();
     const blob = await io.screenshot();
     setMs(Math.round(performance.now() - t));
-    setUrl((old) => { if (old) URL.revokeObjectURL(old); return blob ? URL.createObjectURL(blob) : null; });
+    setUrl(blob ? URL.createObjectURL(blob) : null);
   };
   useEffect(() => { void take(); }, []);
+  useEffect(() => () => { if (url) URL.revokeObjectURL(url); }, [url]); // the BMP leaves with the dialog
   const close = () => useDev.getState().set({ shot: false });
   const model = useDev((s) => s.model);
   const save = () => {

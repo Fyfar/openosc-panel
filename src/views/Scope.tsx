@@ -38,7 +38,7 @@ export function Scope() {
   const canvas = useRef<HTMLCanvasElement>(null);
   const cur = useRef<Cur>({ a: 0.3, b: 0.7, ya: 0.3, yb: 0.55, drag: null });
   const fftCanvas = useRef<HTMLCanvasElement>(null);
-  const [, setDragTick] = useState(0); // the cursor readouts follow a drag
+  const onDrag = useRef(() => {}); // the cursor readouts follow a drag (set by Measurements)
 
   const set = (p: Partial<typeof s>) => patch('scope', p);
   const setCh = (i: 0 | 1, p: Partial<Channel>) => {
@@ -68,7 +68,7 @@ export function Scope() {
     if (e.type === 'pointerup') c.drag = null;
     if (c.drag) {
       c[c.drag] = Math.min(1, Math.max(0, c.drag.startsWith('y') ? y : x));
-      setDragTick((t) => t + 1);
+      onDrag.current();
     }
   };
 
@@ -120,7 +120,7 @@ export function Scope() {
 
         {fft && <SpectrumPanel canvas={fftCanvas} />}
 
-        <Measurements cur={cur} />
+        <Measurements cur={cur} onDrag={onDrag} />
       </div>
 
       <Sidebar s={s} set={set} setCh={setCh} say={say} />
@@ -314,12 +314,15 @@ function readouts(f: Frame): Meas {
   return dev ? { ...dev, rise: host.rise } : host;
 }
 
-function Measurements({ cur }: { cur: React.RefObject<Cur> }) {
+// A cursor drag re-renders only this panel, not the whole Scope view.
+function Measurements({ cur, onDrag }: { cur: React.RefObject<Cur>; onDrag: React.RefObject<() => void> }) {
   const s = useDev((st) => st.scope);
   const cursors = useDev((st) => st.cursors);
   const fft = useDev((st) => st.fft);
   const st = useDev((x) => x.scopeStatus);
   const [rows, setRows] = useState<{ ch: 0 | 1; m: Meas }[]>([]);
+  const [, setDragTick] = useState(0);
+  useEffect(() => { onDrag.current = () => setDragTick((t) => t + 1); }, [onDrag]);
   const exps = useRef(new Map<string, number>()); // sticky SI prefix per readout (fmtStable)
   useEffect(() => {
     let ver = -1;
@@ -383,14 +386,18 @@ function Measurements({ cur }: { cur: React.RefObject<Cur> }) {
   );
 }
 
-// rAF loop reads io.scopeData and the store directly: frames never go through React state.
+// rAF loop reads io.scopeData and the store directly: frames never go through React state. It draws
+// only when something drawn changed: a new frame array, the settings, the cursors, the canvas size.
 function useDrawLoop(ref: React.RefObject<HTMLCanvasElement | null>, cur: React.RefObject<Cur>) {
   useEffect(() => {
-    let raf = 0;
+    let raf = 0, last: unknown[] = [];
     const loop = () => {
       raf = requestAnimationFrame(loop);
-      const st = useDev.getState();
-      draw(ref.current!, st.scope, io.scopeData.frames, cur.current, st.cursors);
+      const st = useDev.getState(), c = ref.current!, k = cur.current;
+      const now = [io.scopeData.frames, st.scope, st.cursors, k.a, k.b, k.ya, k.yb, c.clientWidth, c.clientHeight, devicePixelRatio];
+      if (now.every((v, i) => v === last[i])) return;
+      last = now;
+      draw(c, st.scope, io.scopeData.frames, k, st.cursors);
     };
     raf = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(raf);
@@ -436,11 +443,14 @@ function drawGrid(g: CanvasRenderingContext2D, W: number, H: number, dpr: number
   for (let i = 1; i < 10; i++) { g.moveTo(i * dx, 0); g.lineTo(i * dx, H); }
   for (let i = 1; i < 8; i++) { g.moveTo(0, i * dy); g.lineTo(W, i * dy); }
   strokeGrid(g, dpr);
+  // Centre cross and its ticks: one path, one stroke.
   g.strokeStyle = '#5a6678';
-  line(g, W / 2, 0, W / 2, H);
-  line(g, 0, H / 2, W, H / 2);
-  for (let i = 0; i <= 50; i++) line(g, (i * W) / 50, H / 2 - 3 * dpr, (i * W) / 50, H / 2 + 3 * dpr);
-  for (let i = 0; i <= 40; i++) line(g, W / 2 - 3 * dpr, (i * H) / 40, W / 2 + 3 * dpr, (i * H) / 40);
+  g.beginPath();
+  g.moveTo(W / 2, 0); g.lineTo(W / 2, H);
+  g.moveTo(0, H / 2); g.lineTo(W, H / 2);
+  for (let i = 0; i <= 50; i++) { g.moveTo((i * W) / 50, H / 2 - 3 * dpr); g.lineTo((i * W) / 50, H / 2 + 3 * dpr); }
+  for (let i = 0; i <= 40; i++) { g.moveTo(W / 2 - 3 * dpr, (i * H) / 40); g.lineTo(W / 2 + 3 * dpr, (i * H) / 40); }
+  g.stroke();
 }
 
 // Min/max of the samples (or PEAK buckets) falling in each pixel column.

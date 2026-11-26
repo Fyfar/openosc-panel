@@ -3,7 +3,8 @@
 // loop surviving a timeout (each of these broke or was missing before 0.5.0).
 import assert from 'node:assert/strict';
 import { Link, sleep } from '../src/link.ts';
-import { link, runLoop, stopLoop } from '../src/io/core.ts';
+import { ctl, link, remote, runLoop, stopLoop } from '../src/io/core.ts';
+import '../src/io/index.ts'; // the store → SCPI subscription (drag coalescing)
 import { dmmLogCsv, dmmLoop, flushDmm } from '../src/io/dmm.ts';
 import { scopeData, scopeLoop, scopeRun } from '../src/io/scope.ts';
 import { bodeStop, bodeSweep } from '../src/io/bode.ts';
@@ -14,12 +15,14 @@ const dec = new TextDecoder();
 const IDN = 'OpenOSC,DS1052,TEST0001,0.21.7';
 type Answer = string | Uint8Array | { after: number; reply: string } | null;
 
-// Answers each line in order and only after the previous answer, like the firmware.
+// Answers each line in order and only after the previous answer, like the firmware. `ahead`: the most
+// lines ever received past the last answered query (the firmware parser holds 4).
 function fakePort(answer: (cmd: string) => Answer) {
   let out!: ReadableStreamDefaultController<Uint8Array>;
   let busy = Promise.resolve();
-  let pending = '';
+  let pending = '', answered = -1;
   const written: string[] = [];
+  const seen = { ahead: 0 };
   const emit = (b: Uint8Array) => { try { out.enqueue(b); } catch { /* port closed */ } };
   const port = {
     readable: new ReadableStream<Uint8Array>({ start(c) { out = c; } }),
@@ -27,9 +30,10 @@ function fakePort(answer: (cmd: string) => Answer) {
       write(chunk) {
         pending += dec.decode(chunk);
         for (let i = pending.indexOf('\n'); i >= 0; i = pending.indexOf('\n')) {
-          const cmd = pending.slice(0, i);
+          const cmd = pending.slice(0, i), at = written.length;
           pending = pending.slice(i + 1);
           written.push(cmd);
+          seen.ahead = Math.max(seen.ahead, at - answered);
           busy = busy.then(async () => {
             await sleep(0); // a real port's reads are tasks: a loop that never sleeps must not starve timers
             const a = answer(cmd);
@@ -37,6 +41,7 @@ function fakePort(answer: (cmd: string) => Answer) {
             if (a instanceof Uint8Array) emit(a);
             else if (typeof a === 'string') emit(enc.encode(a + '\n'));
             else { await sleep(a.after); emit(enc.encode(a.reply + '\n')); }
+            if (cmd.includes('?')) answered = at;
           });
         }
       },
@@ -45,7 +50,7 @@ function fakePort(answer: (cmd: string) => Answer) {
     close: async () => {},
     getInfo: () => ({}),
   };
-  return { port: port as unknown as SerialPort, written };
+  return { port: port as unknown as SerialPort, written, seen };
 }
 
 let checks = 0;
@@ -79,6 +84,21 @@ let checks = 0;
   await l.close();
 }
 
+// --- queries go out without waiting for each reply, but never more than the parser's 4 lines past the
+// last answer: behind a blocking query (a ZT706S generator setting, FRAM? waiting for a record) a line
+// left half-received for 3 s resets the firmware parser (-102)
+{
+  const dev = fakePort((c) => (c === 'SLOW?' ? { after: 200, reply: 'slow' } : c.includes('?') ? c.slice(0, -1).toLowerCase() : null));
+  const l = new Link();
+  await l.open(dev.port);
+  const lines = ['SLOW?', 'A?', 'X 1', 'B?', 'C?', 'Y 2', 'D?', 'E?', 'F?', 'G?'];
+  assert.deepEqual((await l.run(lines)).map((r) => r.text), ['slow', 'a', 'b', 'c', 'd', 'e', 'f', 'g']);
+  assert.ok(dev.seen.ahead >= 3, `queries pipelined: at most ${dev.seen.ahead} line(s) ahead of an answer`);
+  assert.ok(dev.seen.ahead <= 4, `${dev.seen.ahead} lines ahead of the last answer: more than the parser holds`);
+  checks += 3;
+  await l.close();
+}
+
 // --- a reply that lands after its timeout must not answer the next query -----------------
 {
   const dev = fakePort((c) => (c === 'SLOW?' ? { after: 1000, reply: 'slow' } : c === '*IDN?' ? IDN : c === 'A?' ? 'a' : null));
@@ -108,7 +128,7 @@ let checks = 0;
   const cfg: Record<string, string> = {
     'FUNC?': '"VOLT"', 'SYST:DMM:RANG:LIST?': '3,2.5,25,250', 'AUTO?': '1', 'SYST:DMM:HOLD?': '0',
     'SYST:DMM:REL?': '0', 'SYST:DMM:HOLD:MODE?': 'MAN', '*IDN?': IDN, 'SYST:ERR?': '0,"No error"',
-    'SYST:DMM:TEMP:CJUN?': '22.5',
+    'SYST:DMM:TEMP:CJUN?': '22.5', 'SYST:REM?': '0',
   };
   const dev = fakePort((c) => {
     if (c === 'FUNC2 FREQ') func2 = true;
@@ -139,7 +159,7 @@ let checks = 0;
     if (c === '*CLS') err = '0,"No error"';
     const cfg: Record<string, string> = {
       'FUNC?': func, 'SYST:DMM:RANG:LIST?': '3,2.5,25,250', 'AUTO?': '1', 'SYST:DMM:HOLD?': '0', 'SYST:DMM:REL?': '0',
-      'SYST:DMM:HOLD:MODE?': 'MAN', 'SYST:DMM:TEMP:CJUN?': 'NAN', 'SYST:ERR?': err, '*IDN?': IDN,
+      'SYST:DMM:HOLD:MODE?': 'MAN', 'SYST:DMM:TEMP:CJUN?': 'NAN', 'SYST:ERR?': err, '*IDN?': IDN, 'SYST:REM?': '0',
     };
     return cfg[c] ?? null;
   });
@@ -270,6 +290,41 @@ async function runScope(fw: string, fft: boolean, samples?: number) {
   assert.deepEqual(scopeData.frames[0].win, { first: 22768, end: 42768, interval: 1e-8 }, 'per-channel frames say where they sit');
   assert.deepEqual(scopeData.frames[0].scale, { yinc: 0.01, zero: 0, yref: 128 });
   checks += 5;
+
+  // WAV:STAR/STOP/POIN/POIN:MODE are session variables, each a device pass while capture is paused:
+  // stated once per channel on the geometry pass, then FRAM? alone while the window holds.
+  const frames = sent.filter((c) => c === 'WAV:FRAM?').length, poin = sent.filter((c) => c === 'WAV:POIN 1024').length;
+  assert.ok(frames >= 3 && poin <= 2, `${frames} WAV:FRAM?, ${poin} WAV:POIN 1024`);
+  checks++;
+}
+
+// --- settings follow the device keys: every 500 ms while they work; under SYST:REM (keys locked) only
+// the status is polled, until Remote ends on the device (MENU hold) and the settings are caught up at once
+async function scopeReads(cfg: Record<string, string>, ms: number, change?: (c: Record<string, string>) => void) {
+  const s = fakeScope();
+  Object.assign(s.cfg, cfg);
+  useDev.setState({ idn: { model: 'DS1052', serial: 'T', fw: '0.21.9' }, fft: false, remote: false });
+  await link.open(s.dev.port);
+  runLoop('scope', scopeLoop);
+  await sleep(ms);
+  const count = (q: string) => s.dev.written.filter((c) => c === q).length;
+  const before = { settings: count('CHAN1:SCAL?'), status: count('TRIG:STAT?') };
+  change?.(s.cfg);
+  return { before, stop: async () => { await stopLoop(); await link.close(); } };
+}
+{
+  const open = await scopeReads({ 'SYST:REM?': '0' }, 2200, (c) => (c['CHAN1:SCAL?'] = '2'));
+  assert.ok(open.before.settings >= 3, `keys working: ${open.before.settings} settings reads in 2.2 s`);
+  await until(() => useDev.getState().scope.ch[0].vdivMv === 2000, 'a V/div turned on the device keys reaches the app', 1500);
+  await open.stop();
+
+  const locked = await scopeReads({ 'SYST:REM?': '1' }, 2200, (c) => { c['SYST:REM?'] = '0'; c['CHAN1:SCAL?'] = '0.5'; });
+  assert.equal(useDev.getState().remote, true, 'Remote seen in the status poll');
+  assert.equal(locked.before.settings, 1, `locked: ${locked.before.settings} settings reads in 2.2 s, want only the first`);
+  assert.ok(locked.before.status >= 3, `locked: status still polled (${locked.before.status})`);
+  await until(() => useDev.getState().scope.ch[0].vdivMv === 500 && !useDev.getState().remote, 'Remote ended on the device: settings caught up', 1500);
+  await locked.stop();
+  checks += 4;
 }
 
 // --- FFT data: every sample of the screen window, a second read at most every 500 ms ---------
@@ -314,8 +369,15 @@ await withScope({ fft: true }, async (s) => {
   assert.ok(scopeData.version > 2 * s.reads.length, 'trace frames keep coming between the reads');
   assert.deepEqual([f.ch, f.volts.length, f.screen, f.xinc, f.clipped, f.lo, f.volts[0]], [0, 20000, 20000, 1e-8, false, undefined, 0]);
   assert.ok(Math.abs(f.xorig + 1e-4) < 1e-12, `window starts 10 000 samples before the trigger: ${f.xorig}`);
-  assert.ok(s.dev.written.join('|').includes('WAV:SOUR CHAN1|WAV:STAR 22769|WAV:STOP 42768|WAV:POIN 0|WAV:DATA?|WAV:SEQ?'), 'one batch, no preamble');
-  checks += 7;
+  assert.ok(s.dev.written.join('|').includes('WAV:POIN 0|WAV:DATA?|WAV:SEQ?'), 'one batch, no preamble');
+  let full = false, stale = 0;
+  for (const c of s.dev.written) {
+    if (c === 'WAV:POIN 0') full = true;
+    if (c === 'WAV:POIN 1024') full = false;
+    if (c === 'WAV:FRAM?' && full) stale++;
+  }
+  assert.equal(stale, 0, 'a trace frame after a full-window read states its WAV:POIN again');
+  checks += 8;
 });
 
 await withScope({ fft: true }, async (s) => {
@@ -396,6 +458,41 @@ await withScope({ fft: true, fw: '0.21.7' }, async (s) => {
   checks += 3;
 }
 
+// --- a slider drag while each batch waits (behind a frame read): one batch in flight, the last value
+// sent last, instead of one queued batch per 60 ms, each restarting the device's capture
+{
+  const dev = fakePort((c) => (c === 'SYST:ERR?' ? { after: 300, reply: '0,"No error"' } : c.includes('?') ? 'NAN' : null));
+  useDev.setState({ idn: { model: 'DS1052', serial: 'T', fw: '0.21.9' }, model: 'ZT703S' });
+  await link.open(dev.port);
+  remote('scope', {}, true); // what the device has: the diff base
+  useDev.setState({ link: 'connected' });
+  for (let k = 1; k <= 30; k++) {
+    useDev.getState().patch('scope', { trig: { ...useDev.getState().scope.trig, level: k / 100 } });
+    await sleep(20);
+  }
+  await sleep(1200);
+  const lev = dev.written.filter((c) => c.startsWith('TRIG:EDGE:LEV'));
+  assert.ok(lev.length <= 4, `${lev.length} level batches for a 0.6 s drag`);
+  assert.equal(lev.at(-1), 'TRIG:EDGE:LEV 0.3', 'the final value is sent');
+  checks += 2;
+
+  const s0 = useDev.getState().scope;
+  remote('scope', { ...s0, trig: { ...s0.trig } }, true);
+  assert.equal(useDev.getState().scope, s0, 'an unchanged readback keeps the slice (no re-render)');
+  checks++;
+  useDev.setState({ link: 'disconnected' });
+
+  // *OPC? waits for the ZT706S module's acknowledge; the ZT703S's own DAC needs no extra round trip.
+  for (const model of ['ZT706S', 'ZT703S'] as const) {
+    useDev.setState({ model });
+    const from = dev.written.length;
+    await ctl(['SOUR:FREQ 100']);
+    assert.equal(dev.written.slice(from).includes('*OPC?'), model === 'ZT706S', `${model}: *OPC? after a generator command`);
+  }
+  checks += 2;
+  await link.close();
+}
+
 // --- Bode sweep: whole records from a fresh acquisition, slow records waited for, generator stop ---
 // The generator plays 0.1 % above the request; CH2 = CH1 at −6 dB, −45°. Each CH1 WAV:PRE? is a newer
 // record (the firmware's repeated PRE?), CH2's reads the same one. `nanAt`: the first two PRE? after that
@@ -455,7 +552,10 @@ async function runBode(setup: (st: ReturnType<typeof fakeBode>['st']) => void, s
   assert.ok(r.sent.includes('CHAN2:SCAL 0.5'), 'CH2 (0.5 V on 1 V/div after starting from CH1\'s V/div) ranged down');
   const tail = r.sent.slice(r.sent.lastIndexOf('WAV:DATA?'));
   for (const c of ['ACQ:ROLL ON', 'ACQ:MDEP 262144', 'CHAN1:COUP DC', 'CHAN2:DISP OFF', 'CHAN2:SCAL 2']) assert.ok(tail.includes(c), `restored ${c}`);
-  checks += 3;
+  const sweep = r.sent.slice(0, r.sent.lastIndexOf('WAV:SNAP')); // before the restore
+  assert.equal(sweep.filter((c) => c === 'TIM:OFFS 0').length, 1, 'TIM:OFFS once, at setup');
+  assert.ok(!sweep.includes('*OPC?'), 'ZT703S: no *OPC? per point');
+  checks += 5;
 
   const fast = await runBode((st) => (st.nanAt = 2), 6); // Scope screen last at 1 µs/div
   assert.deepEqual(fast.points, r.points, 'the Scope screen\'s timebase changes nothing');

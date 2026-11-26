@@ -8,7 +8,7 @@ import { useDev, type State } from '../store';
 import { applying, ctl, current, errText, fail, get, type Key, lastSent, link, localAt, now, on, runLoop, set, stopLoop } from './core';
 import { dmmLoop, flushDmm } from './dmm';
 import { flushGen, readGen } from './gen';
-import { flushScope, scopeLoop } from './scope';
+import { flushScope, forgetWav, scopeLoop } from './scope';
 
 export { download } from './core';
 export { clearDmmLog, exportDmmLog, resetDmmStats } from './dmm';
@@ -28,13 +28,26 @@ useDev.subscribe((s, prev) => {
   }
 });
 
-// Diffs against what was last sent (read at flush time, so edits within 60 ms collapse).
+// Diffs against what was last sent (read at flush time, so edits within 60 ms collapse). One flush per
+// slice at a time: edits made while it waits behind a frame read go out together afterwards, rather than
+// one queued batch per 60 ms, each restarting the device's capture.
+const flushing: Partial<Record<Key, boolean>> = {};
+const again: Partial<Record<Key, boolean>> = {};
 async function flush<K extends Key>(k: K) {
   timers[k] = undefined;
-  const cur = get()[k];
-  const prev = (lastSent[k] ?? cur) as State[K];
-  lastSent[k] = cur as never;
-  await FLUSH[k](prev, cur);
+  if (flushing[k]) { again[k] = true; return; }
+  flushing[k] = true;
+  try {
+    do {
+      again[k] = false;
+      const cur = get()[k];
+      const prev = (lastSent[k] ?? cur) as State[K];
+      lastSent[k] = cur as never;
+      await FLUSH[k](prev, cur);
+    } while (again[k]);
+  } finally {
+    flushing[k] = false;
+  }
 }
 
 // ---------------------------------------------------------------- connection + profile switch
@@ -175,13 +188,17 @@ const clog = (...l: string[]) => set({ consoleLog: [...get().consoleLog, ...l].s
 
 export async function consoleSend(cmd: string) {
   clog(`> ${cmd}`);
+  // It may move WAV:SOUR/STAR/STOP/POIN under the frame reads: forgotten before the next batch runs.
+  const run = (lines: string[], timeout?: number) => link.tx(async (r) => {
+    try { return await r(lines, timeout); } finally { forgetWav(); }
+  });
   try {
     if (cmd.includes('?')) {
-      const [r] = await link.run([cmd], 10000);
+      const [r] = await run([cmd], 10000);
       clog(r.text ?? `<${r.bin!.length}-byte block>`);
     } else {
-      const [e] = await link.texts([cmd, 'SYST:ERR?']);
-      if (!e.startsWith('0,')) clog(e);
+      const [e] = await run([cmd, 'SYST:ERR?']);
+      if (!e.text?.startsWith('0,')) clog(e.text ?? '');
     }
   } catch (e) {
     clog(`<${errText(e)}>`);

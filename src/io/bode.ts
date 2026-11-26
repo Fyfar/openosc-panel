@@ -5,7 +5,7 @@ import { sleep } from '../link';
 import type { State } from '../store';
 import { ctl, errText, fail, get, link, nearest, num, on } from './core';
 import { readGen, SHAPE_CMD } from './gen';
-import { fetchChannel } from './scope';
+import { fetchChannel, forgetWav, wavRun } from './scope';
 
 // The sweep's scope setup, and what each point sends. Everything these touch (plus the
 // CHANn:SCAL re-ranging) must be put back by scopeRestore: scripts/check-logic.mts checks it.
@@ -14,9 +14,11 @@ import { fetchChannel } from './scope';
 // channels are on: half the smallest budget per channel keeps a record about the 10 divisions.
 export const SWEEP_SCOPE = [
   'CHAN1:DISP ON', 'CHAN2:DISP ON', 'CHAN1:COUP AC', 'CHAN2:COUP AC', 'CHAN1:OFFS 0', 'CHAN2:OFFS 0',
-  'ACQ:ROLL OFF', `ACQ:MDEP ${MEM_DEPTHS[0] / 2}`, 'TRIG:EDGE:SOUR CHAN1', 'TRIG:SWE AUTO', 'RUN',
+  'ACQ:ROLL OFF', `ACQ:MDEP ${MEM_DEPTHS[0] / 2}`, 'TIM:OFFS 0', 'TRIG:EDGE:SOUR CHAN1', 'TRIG:SWE AUTO', 'RUN',
 ];
-export const pointCmds = (f: number, tb: number) => [`SOUR:FREQ ${+f.toPrecision(6)}`, `TIM:SCAL ${tb}`, 'TIM:OFFS 0'];
+// The timebase only when it moves (1-2-5 steps: every few points). Each command is a device pass, ~24 ms
+// outside the held-frame window; a fresh record is waited for anyway (freshPair).
+export const pointCmds = (f: number, tb: number, lastTb?: number) => [`SOUR:FREQ ${+f.toPrecision(6)}`, ...(tb === lastTb ? [] : [`TIM:SCAL ${tb}`])];
 
 const SAVE_Q = {
   tb: 'TIM:SCAL?', hoff: 'TIM:OFFS?', swe: 'TRIG:SWE?', stat: 'TRIG:STAT?', src: 'TRIG:EDGE:SOUR?',
@@ -91,7 +93,7 @@ async function untilRecord<T>(until: number, read: (timeout: number) => Promise<
 
 // Sequence of the newest complete record, without reading its data (PRE? leases it, SEQ? names it).
 async function latestSeq(timeout: number) {
-  const [pre, seq] = await link.run(['WAV:SOUR CHAN1', 'WAV:POIN 0', 'WAV:PRE?', 'WAV:SEQ?'], timeout);
+  const [pre, seq] = await wavRun(['WAV:SOUR CHAN1', 'WAV:POIN 0', 'WAV:PRE?', 'WAV:SEQ?'], timeout);
   if (!Number.isFinite(num(seq.text ?? ''))) throw new Error(`preamble "${pre.text}"`);
   return num(seq.text ?? '');
 }
@@ -138,9 +140,9 @@ async function measurePoint(f: number, tb: number, vdiv: number[], probe: number
 
 // Throws (ending the sweep) when the device refuses the point or the generator stopped by itself:
 // the firmware halts the output on a DAC underrun (-240) and the pin then carries something else.
-async function sweepPoint(f: number, vdiv: number[], probe: number[]) {
+async function sweepPoint(f: number, vdiv: number[], probe: number[], prevF?: number) {
   const tb = bodeTimebase(f);
-  if (!(await ctl(pointCmds(f, tb)))) throw new Error(get().error ?? 'the device refused the point');
+  if (!(await ctl(pointCmds(f, tb, prevF && bodeTimebase(prevF))))) throw new Error(get().error ?? 'the device refused the point');
   await sleep(Math.max(80, 5000 / f)); // settle: ≥ 5 periods
   const p = await measurePoint(f, tb, vdiv, probe);
   // ponytail: from the firmware source (output.cpp halt() clears what OUTP? reports); no underrun was seen
@@ -166,10 +168,11 @@ export async function bodeSweep() {
     // disagree by up to 0.5 dB on a ZT703S).
     const probe = [num(saved.p1) || 1, num(saved.p2) || 1], v1 = num(saved.s1) || probe[0];
     const vdiv = [v1, nearest(VDIV_MV.map((m) => (m * probe[1]) / 1000), v1)];
+    forgetWav();
     await link.run(['WAV:MODE RAW', 'WAV:FORM BYTE']);
     if (!(await ctl([`SOUR:FREQ ${freqs[0]}`, 'SOUR:FUNC SINusoid', 'OUTP ON', ...SWEEP_SCOPE, `CHAN1:SCAL ${vdiv[0]}`, `CHAN2:SCAL ${vdiv[1]}`]))) return;
     for (let k = 0; k < freqs.length && get().bode.running; k++) {
-      const p = await sweepPoint(freqs[k], vdiv, probe);
+      const p = await sweepPoint(freqs[k], vdiv, probe, freqs[k - 1]);
       if (p) get().patch('bode', { points: [...get().bode.points, p] });
       else if (get().bode.running) skipped++;
       get().patch('bode', { progress: (k + 1) / freqs.length });
