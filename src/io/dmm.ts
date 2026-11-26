@@ -27,8 +27,13 @@ export function dmmDiff(a: Dmm, b: Dmm): string[] {
   return c;
 }
 
+// dmm::Function, field 0 of SYST:DMM:RES?, in the firmware's order. 13 (Unknown) is none of these.
+const BY_ID: DmmFunc[] = ['VDC', 'VAC', 'RES', 'CONT', 'DIOD', 'CAP', 'ADC', 'AAC', 'MVDC', 'MVAC', 'MADC', 'MAAC', 'TEMP'];
+
 let discardNext = false;
 let lastFunc = '';
+// Outlives the loop: a view change restarts it, and the reading it finds must not be recorded again.
+let lastSeq = NaN;
 const dmmLog: [t: number, func: DmmFunc, v: number, unit: string][] = [];
 const UNIT_Q = 'SYST:DMM:TEMP:UNIT?';
 
@@ -40,7 +45,7 @@ export async function flushDmm(a: Dmm, b: Dmm) {
   if (!conf) return;
   // Only an accepted CONF changes the function: a refused one leaves the old readings valid. Set after
   // the reply, so a RES? already in flight can't consume discardNext (Link answers batches in order).
-  if (ok) { discardNext = true; clearHist(); }
+  if (ok) { discardNext = true; clearReading(); }
   // Type K is refused (-221) while no cold junction is configured (DataAccess::selectDmmFunction). With a
   // manual junction stored, -221 means something else (busy).
   set({ junctionNeeded: b.func === 'TEMP' && !ok && b.cj === null });
@@ -65,8 +70,7 @@ async function readDmmCfg(force = false) {
   const ranges = list.split(',').slice(1).map(Number).filter(Number.isFinite);
   const f = funcFromDevice(func, ranges);
   const fahrenheit = unit === 'F';
-  // Trend and statistics are kept in the shown unit: a new function or temperature unit restarts them.
-  if ((func !== lastFunc && lastFunc) || (f === 'TEMP' && fahrenheit !== get().fahrenheit)) clearHist();
+  if ((func !== lastFunc && lastFunc) || (f === 'TEMP' && fahrenheit !== get().fahrenheit)) clearReading();
   lastFunc = func;
   set({ ranges, fahrenheit });
   const holdMode = HOLD_MODES.find((h) => hmode.toUpperCase().startsWith(h));
@@ -74,10 +78,10 @@ async function readDmmCfg(force = false) {
   remote('dmm', { ...(f ? { func: f } : {}), ...(holdMode ? { holdMode } : {}), auto: on(auto), hold: on(hold), rel: on(rel), cj: Number.isFinite(cj) ? cj : null }, force);
 }
 
-type Poll = { lastSeq: number; n: number; winT: number; cfgDue: number };
+type Poll = { func?: string; n: number; winT: number; cfgDue: number };
 
 export async function dmmLoop(id: number) {
-  const p: Poll = { lastSeq: NaN, n: 0, winT: now(), cfgDue: 0 };
+  const p: Poll = { n: 0, winT: now(), cfgDue: 0 };
   while (alive(id)) {
     try {
       await poll(p);
@@ -98,13 +102,7 @@ async function poll(p: Poll) {
   // SYST:DMM:RES?: func id, value, status, sec value, sec qty, range idx, range mode, HOLD, REL, seq, ts
   const f = (await link.q('SYST:DMM:RES?')).split(',');
   if (f.length >= 10) {
-    if (+f[9] !== p.lastSeq) {
-      p.lastSeq = +f[9];
-      p.n++;
-      // The first reading after CONF is a settling placeholder (read 0 in 3 of 3 tests).
-      if (discardNext) discardNext = false;
-      else pushReading(f);
-    }
+    if (+f[9] !== lastSeq) await take(p, f);
     // Range index is 1-based, 0 = unknown (scpi/meter.cpp): keep the last known one then.
     remote('dmm', { ...(f[6] !== '-1' ? { auto: f[6] === '1' } : {}), ...(+f[5] > 0 ? { range: +f[5] - 1 } : {}), hold: f[7] === '1', rel: f[8] === '1' });
   }
@@ -112,6 +110,19 @@ async function poll(p: Poll) {
     p.cfgDue = now() + 1500;
     await readDeviceSide();
   }
+}
+
+// A reading not seen before.
+async function take(p: Poll, f: string[]) {
+  lastSeq = +f[9];
+  p.n++;
+  // FUNC? says VOLT for V and mV alike (CURR for A and mA): the reading's id shows a change on the
+  // meter's keys. Read the new ranges before the reading is used.
+  if (p.func !== undefined && p.func !== f[0]) await readDmmCfg(true);
+  p.func = f[0];
+  // The first reading after CONF is a settling placeholder (read 0 in 3 of 3 tests).
+  if (discardNext) discardNext = false;
+  else pushReading(f);
 }
 
 // What the device can change by itself: the function on its keys, the temperature unit in its menu,
@@ -136,30 +147,62 @@ function readingOf(f: string[], fahrenheit: boolean): NonNullable<State['reading
 }
 
 function pushReading(f: string[]) {
-  const t = Date.now() / 1000, { hist: h, ranges, dmm, dstats, fahrenheit } = get();
-  const reading = readingOf(f, fahrenheit), v = reading.v;
+  const reading = readingOf(f, get().fahrenheit);
   set({ reading });
-  const last = h.v.at(-1);
-  if (v === null) { // OL or blank
-    // One gap per OL/blank run. The last value is repeated at the gap's start first: a stepped line
-    // only reaches the next point, so the reading before the OL would otherwise draw no step at all.
-    if (last != null) set({ hist: { t: [...h.t, t, t], v: [...h.v, last, null] } });
-    return;
-  }
+  const func = BY_ID[+f[0]];
+  if (func && get().logging) record(func, reading.v, +f[5]);
+}
+
+// Whether a reading of this function and temperature unit belongs with the recorded data.
+export const logMatches = (r: State['recorded'], func: DmmFunc, fahrenheit: boolean) =>
+  !r || (r.func === func && (func !== 'TEMP' || r.fahrenheit === fahrenheit));
+
+// A recording holds one function and unit: a reading of any other ends it. `v` null = OL or blank.
+function record(func: DmmFunc, v: number | null, range: number) {
+  const { recorded, fahrenheit, ranges, dmm, hist: h, dstats } = get();
+  if (!logMatches(recorded, func, fahrenheit)) return stopDmmLog();
   // This reading's own range (the store's is from the previous poll): one stale coarse LSD would
-  // coarsen the histogram for the whole session.
-  const lsd = dmmScale(dmm.func, ranges[+f[5] > 0 ? +f[5] - 1 : dmm.range]).lsd;
+  // coarsen the histogram for the whole recording.
+  const rangeMax = ranges[range > 0 ? range - 1 : dmm.range];
+  if (v === null) {
+    set({ recorded: recorded ?? { func, fahrenheit, rangeMax } });
+    return breakLine();
+  }
+  const t = Date.now() / 1000;
+  dmmLog.push([t, func, v, dmmBase(func, fahrenheit)]);
   // ponytail: copy-on-push, 20k cap (~1.8 h at 3 readings/s); chunked store when "all" must be unbounded.
-  set({ hist: { t: [...h.t, t].slice(-20000), v: [...h.v, v].slice(-20000) }, dstats: addStat(dstats, v, lsd) });
-  if (get().logging) { dmmLog.push([t, dmm.func, v, dmmBase(dmm.func, fahrenheit)]); set({ logged: dmmLog.length }); }
+  set({
+    recorded: { func, fahrenheit, rangeMax },
+    hist: { t: [...h.t, t].slice(-20000), v: [...h.v, v].slice(-20000) },
+    dstats: addStat(dstats, v, dmmScale(func, rangeMax).lsd),
+    logged: dmmLog.length,
+  });
 }
 
-function clearHist() {
-  set({ hist: { t: [], v: [] }, dstats: emptyStats(), reading: null, junctionNeeded: false });
+// One gap per run of OL, blank or paused. The last value is repeated at the gap's start first: a stepped
+// line only reaches the next point, so the reading before the gap would otherwise draw no step at all.
+function breakLine() {
+  const h = get().hist, last = h.v.at(-1), t = Date.now() / 1000;
+  if (last != null) set({ hist: { t: [...h.t, t, t], v: [...h.v, last, null] } });
 }
 
-export async function resetDmmStats() {
-  set({ hist: { t: [], v: [] }, dstats: emptyStats() });
+function clearReading() {
+  set({ reading: null, junctionNeeded: false });
+}
+
+export function startDmmLog() {
+  set({ logging: true, ...(get().logged ? {} : { recorded: null }) });
+}
+
+export function stopDmmLog() {
+  if (!get().logging) return;
+  breakLine();
+  set({ logging: false });
+}
+
+export async function clearDmmData() {
+  dmmLog.length = 0;
+  set({ logged: 0, recorded: null, hist: { t: [], v: [] }, dstats: emptyStats() });
   await ctl(['SYST:DMM:STAT:RES']);
 }
 
@@ -171,9 +214,4 @@ export function dmmLogCsv(): string {
 
 export function exportDmmLog() {
   download(`dmm-${Date.now()}.csv`, new Blob([dmmLogCsv()], { type: 'text/csv' }));
-}
-
-export function clearDmmLog() {
-  dmmLog.length = 0;
-  set({ logged: 0 });
 }

@@ -2,7 +2,7 @@
 // scope measurements and generator command order. Run: `npm run check`.
 import assert from 'node:assert/strict';
 import { bodeEta, bodePlan, dmmScale, fmtStable, fwAtLeast, genMaxHz, interleaveBlockers, parseHz, scaleFor, VDIV_MV } from '../src/device.ts';
-import { addStat, emptyStats, FFT_WINDOWS, fftNotes, fftSpanHz, bodeTone, findPeak, histogram, spanAtLeast, unwrapPhase, measure, peakIn, peakNear, spectrum, spectrumOf, stdDev, yFloor, type FftWindow, type Frame } from '../src/dsp.ts';
+import { addStat, emptyStats, FFT_WINDOWS, fftNotes, fftSpanHz, bodeTone, findPeak, histogram, spanAtLeast, unwrapPhase, measure, peakIn, peakNear, spectrum, spectrumOf, stdDev, yFloor, windowExtent, type FftWindow, type Frame } from '../src/dsp.ts';
 import { parseFrame, parseMeas, screenWindow } from '../src/io/scope.ts';
 import { pointCmds, rerange, scopeRestore, SWEEP_SCOPE } from '../src/io/bode.ts';
 import { dmmDiff } from '../src/io/dmm.ts';
@@ -95,6 +95,17 @@ checks++;
   assert.deepEqual(yFloor(0, 1, 1e-4), [0, 1], 'yFloor keeps a real spread');
   assert.deepEqual(yFloor(Infinity, -Infinity, 1e-4), [-20e-4, 20e-4], 'yFloor with no data');
   checks += 3;
+}
+
+// --- windowExtent: what a stepped trend draws inside the window, including the value held into it ---
+{
+  const t = [0, 1, 2, 3], v = [5, 1, 9, 2];
+  assert.deepEqual(windowExtent(t, v, 1.5, 2.5), [1, 9], 'inside, plus the one held at the left edge');
+  assert.deepEqual(windowExtent(t, v, 10, 20), [2, 2], 'only a value held from before the window');
+  assert.deepEqual(windowExtent(t, v, -5, 0.5), [5, 5], 'later readings are outside');
+  assert.deepEqual(windowExtent([0, 1, 1], [5, 5, null], 10, 20), [Infinity, -Infinity], 'a gap holds nothing');
+  assert.deepEqual(windowExtent([], [], 0, 1), [Infinity, -Infinity], 'no data');
+  checks += 5;
 }
 
 // --- bodePlan: log-spaced, both ends included ---------------------------------------------

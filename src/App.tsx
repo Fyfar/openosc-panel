@@ -84,6 +84,8 @@ function Header() {
         ))}
       </nav>
 
+      <RecButton />
+
       {gen.out && mode !== 'gen' && (
         <button onClick={() => void io.setMode('gen')} className="flex items-center gap-1.5 rounded border border-success/40 px-2 py-0.5 font-mono text-xs text-success" title="Generator output is on">
           <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-success" />
@@ -117,6 +119,18 @@ function Header() {
         </div>
       </div>
     </header>
+  );
+}
+
+// A DMM log goes on in the generator view: say so outside the multimeter, and lead back to it.
+function RecButton() {
+  const show = useDev((s) => s.logging && s.mode !== 'dmm');
+  if (!show) return null;
+  return (
+    <button onClick={() => void io.setMode('dmm')} className="flex items-center gap-1.5 rounded border border-danger/50 px-2 py-0.5 font-mono text-xs text-danger" title="The multimeter is logging">
+      <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-danger" />
+      REC
+    </button>
   );
 }
 

@@ -6,12 +6,12 @@ import { PROFILE_OF, type Mode, type Profile } from '../device';
 import { matches, sleep, VID } from '../link';
 import { useDev, type State } from '../store';
 import { applying, ctl, current, errText, fail, get, type Key, lastSent, link, localAt, now, on, runLoop, set, stopLoop } from './core';
-import { dmmLoop, flushDmm } from './dmm';
+import { dmmLoop, flushDmm, stopDmmLog } from './dmm';
 import { flushGen, readGen } from './gen';
 import { flushScope, forgetWav, scopeLoop } from './scope';
 
 export { download } from './core';
-export { clearDmmLog, exportDmmLog, resetDmmStats } from './dmm';
+export { clearDmmData, exportDmmLog, logMatches, startDmmLog, stopDmmLog } from './dmm';
 export { exportScopeCsv, scopeAuto, scopeData, scopeForce, scopeRun, scopeSingle, scopeStop } from './scope';
 export { bodeStop, bodeSweep } from './bode';
 
@@ -49,6 +49,10 @@ async function flush<K extends Key>(k: K) {
     flushing[k] = false;
   }
 }
+
+// Nothing reads the meter once the link leaves 'connected' (profile switch, disconnect, lost cable):
+// a log stops there and keeps its data.
+useDev.subscribe((s, prev) => { if (prev.link === 'connected' && s.link !== 'connected') stopDmmLog(); });
 
 // ---------------------------------------------------------------- connection + profile switch
 let switching = false;
@@ -158,10 +162,11 @@ export async function setMode(m: Mode) {
   }
 }
 
-// One loop at a time, chosen by mode + profile; the generator and Bode views run none.
+// One loop at a time, chosen by mode + profile; the generator view runs one only for a DMM log (it
+// keeps the meter profile if opened from it), the Bode view none.
 function startLoop() {
-  const { mode, profile } = get();
-  if (mode === 'dmm' && profile === 'XDM1041') runLoop('dmm', dmmLoop);
+  const { mode, profile, logging } = get();
+  if ((mode === 'dmm' || (mode === 'gen' && logging)) && profile === 'XDM1041') runLoop('dmm', dmmLoop);
   else if (mode === 'scope' && profile === 'DS1052') runLoop('scope', scopeLoop);
   else set({ stats: `CDC · ${profile} profile · idle` });
 }
