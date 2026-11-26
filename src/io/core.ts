@@ -22,14 +22,16 @@ export function fail(msg: string) {
 }
 
 // Command batch wrapped in *CLS … SYST:ERR? so failures surface. Returns false on error.
-// Generator commands are each followed by *OPC?: on the ZT706S every one waits ~0.6 s for the
-// module's acknowledge (up to 6 s), and the firmware queues only 4 parsed commands.
+// ZT706S generator commands are each followed by *OPC?: every one waits ~0.6 s for the module's
+// acknowledge (up to 6 s), and the firmware queues only 4 parsed commands. The ZT703S's own DAC needs
+// no wait: the next command is dispatched after the setting is applied either way (scpi/engine.cpp).
 const isGen = (c: string) => /^(SOUR|OUTP)/i.test(c) && !c.includes('?');
 export async function ctl(cmds: string[], timeout = 3000): Promise<boolean> {
   if (link.closed) return false;
   if (cmds.some(isGen)) timeout = Math.max(timeout, 8000);
+  const opc = get().model === 'ZT706S';
   try {
-    const out = await link.texts(['*CLS', ...cmds.flatMap((c) => (isGen(c) ? [c, '*OPC?'] : [c])), 'SYST:ERR?'], timeout);
+    const out = await link.texts(['*CLS', ...cmds.flatMap((c) => (opc && isGen(c) ? [c, '*OPC?'] : [c])), 'SYST:ERR?'], timeout);
     const err = out.at(-1)!;
     if (!err.startsWith('0,')) { fail(`${cmds.join('; ')} → ${err}`); return false; }
     return true;
@@ -47,10 +49,13 @@ export let applying = false;
 
 // Device → store without echoing back as commands. Skipped right after a local edit so a
 // slow readback doesn't yank a slider the user is still dragging (unless forced).
+// An unchanged readback leaves the slice alone, so its subscribers don't re-render every poll.
 export function remote<K extends Key>(k: K, p: Partial<State[K]>, force = false) {
   if (!force && now() - localAt[k] < 1200) return;
+  const cur = get()[k] as Record<string, unknown>;
+  const changed = Object.entries(p).some(([key, v]) => JSON.stringify(v) !== JSON.stringify(cur[key]));
   applying = true;
-  get().patch(k, p);
+  if (changed) get().patch(k, p);
   lastSent[k] = get()[k] as never;
   applying = false;
 }

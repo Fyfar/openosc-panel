@@ -370,6 +370,8 @@ checks += 6;
 {
   const head = (c: string) => c.split(' ')[0];
   const touched = new Set([...SWEEP_SCOPE, ...pointCmds(1000, 1e-3), 'CHAN1:SCAL 1', 'CHAN2:SCAL 1'].map(head).filter((h) => !h.startsWith('SOUR') && h !== 'RUN'));
+  assert.deepEqual(pointCmds(1000, 1e-3, 1e-3), ['SOUR:FREQ 1000'], 'an unchanged timebase is not sent again');
+  checks++;
   const saved = {
     tb: '0.001', hoff: '0', swe: 'NORMal', stat: 'STOP', src: 'CHAN2', d1: '1', d2: '0',
     s1: '0.5', s2: '2', o1: '0.1', o2: '-0.4', p1: '10', p2: '1', c1: 'DC', c2: 'GND', roll: '1', mdep: '2.58048e+5',

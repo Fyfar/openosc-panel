@@ -1,7 +1,7 @@
 // Oscilloscope: settings read/write, windowed frame fetch, the live loop, run control, CSV.
 import { DESKTOP_FW, fwAtLeast, TIMEBASES, VDIV_MV } from '../device';
 import type { Frame, Meas, RecordWindow } from '../dsp';
-import { sleep } from '../link';
+import { sleep, type Run } from '../link';
 import type { State } from '../store';
 import { alive, ctl, download, errText, fail, get, link, nearest, now, num, on, remote, set } from './core';
 
@@ -22,8 +22,49 @@ const MEAS_MS = 300;
 const FRAME_MAX_MS = 1000;
 const desktop = () => fwAtLeast(get().idn?.fw, DESKTOP_FW);
 const dec = new TextDecoder();
-let cfgDue = 0; // reset to 0 to force a settings read on the next loop pass
+// Status (run state, sample rate, counters, Remote) every 500 ms. Settings as often while the device
+// keys work; under SYST:REM only the app changes them (MENU hold ends Remote, seen in the status), so
+// then once 1.3 s after an edit (remote() ignores the device for 1.2 s) and every 5 s as a safety net.
+const STATUS_MS = 500, SETTINGS_MS = 500, LOCKED_SETTINGS_MS = 5000, EDIT_READ_MS = 1300;
+const due = { status: 0, settings: 0 }; // 0 = read on the next loop pass
 let paused = 0;
+
+// After the app's own command: status at once (sample rate, run state), settings to catch a clamp.
+function readSoon() {
+  due.status = 0;
+  if (get().remote) due.settings = now() + EDIT_READ_MS;
+}
+
+// WAV:SOUR/STAR/STOP/POIN/POIN:MODE only set session variables (scpi/waveform.cpp), yet each costs a
+// device pass inside the held-frame window, where capture is paused: send only the ones that change.
+// Forgotten when a batch fails and when a loop or sweep starts (a new port is a new session).
+const wavSent = new Map<string, string>();
+const WAV_SESSION = /^WAV:(SOUR|STAR|STOP|POIN|POIN:MODE) /;
+export const forgetWav = () => wavSent.clear();
+
+function unsent(lines: string[]) {
+  return lines.filter((c) => {
+    if (!WAV_SESSION.test(c)) return true;
+    const [head, value] = c.split(' ');
+    if (wavSent.get(head) === value) return false;
+    wavSent.set(head, value);
+    return true;
+  });
+}
+
+// Filtered when the batch runs, not when it is queued: an earlier batch in the chain may move the
+// variables. Inside link.tx pass its `run`.
+export function wavRun(lines: string[], timeout: number, run?: Run) {
+  const go = async (r: Run) => {
+    try {
+      return await r(unsent(lines), timeout);
+    } catch (e) {
+      forgetWav();
+      throw e;
+    }
+  };
+  return run ? go(run) : link.tx(go);
+}
 
 function scopeDiff(a: Scope, b: Scope): string[] {
   const c: string[] = [];
@@ -54,16 +95,24 @@ function scopeDiff(a: Scope, b: Scope): string[] {
 
 export async function flushScope(a: Scope, b: Scope) {
   const c = scopeDiff(a, b);
-  if (c.length) { await ctl(c); cfgDue = 0; }
+  if (c.length) { await ctl(c); readSoon(); }
 }
 
-const SCOPE_Q = {
-  tb: 'TIM:SCAL?', hoff: 'TIM:OFFS?', stat: 'TRIG:STAT?', swe: 'TRIG:SWE?', src: 'TRIG:EDGE:SOUR?', slope: 'TRIG:EDGE:SLOP?',
-  lev: 'TRIG:EDGE:LEV?', nrej: 'TRIG:EDGE:NREJ?', pos: 'TRIG:POS?', srate: 'ACQ:SRAT?', mdep: 'ACQ:MDEP?', roll: 'ACQ:ROLL?',
-  int: 'ACQ:INT?', ist: 'ACQ:INT:STAT?', prog: 'ACQ:PROG?', fc1: 'CHAN1:FCNT?', fc2: 'CHAN2:FCNT?', qual: 'MEAS:FCNT:QUAL?',
+const STATUS_Q = {
+  stat: 'TRIG:STAT?', swe: 'TRIG:SWE?', srate: 'ACQ:SRAT?', ist: 'ACQ:INT:STAT?', prog: 'ACQ:PROG?',
+  fc1: 'CHAN1:FCNT?', fc2: 'CHAN2:FCNT?', qual: 'MEAS:FCNT:QUAL?', rem: 'SYST:REM?',
+};
+const SETTINGS_Q = {
+  tb: 'TIM:SCAL?', hoff: 'TIM:OFFS?', src: 'TRIG:EDGE:SOUR?', slope: 'TRIG:EDGE:SLOP?', lev: 'TRIG:EDGE:LEV?',
+  nrej: 'TRIG:EDGE:NREJ?', pos: 'TRIG:POS?', mdep: 'ACQ:MDEP?', roll: 'ACQ:ROLL?', int: 'ACQ:INT?',
   d1: 'CHAN1:DISP?', c1: 'CHAN1:COUP?', p1: 'CHAN1:PROB?', s1: 'CHAN1:SCAL?', o1: 'CHAN1:OFFS?',
   d2: 'CHAN2:DISP?', c2: 'CHAN2:COUP?', p2: 'CHAN2:PROB?', s2: 'CHAN2:SCAL?', o2: 'CHAN2:OFFS?',
 };
+type Settings = Record<keyof typeof SETTINGS_Q, string>;
+type StatusReply = Record<keyof typeof STATUS_Q, string>;
+
+const byKey = <K extends string>(q: Record<K, string>, vals: string[]) =>
+  Object.fromEntries(Object.keys(q).map((k, i) => [k, vals[i]])) as Record<K, string>;
 
 // ACQ:INT? answers 1, 0 or AUTO. The wiki says AUTO is ZT706S-only; the firmware offers it on both
 // boards (backend.cpp interleave(), since ≤ 0.21.4; a ZT703S on 0.21.9 answers AUTO).
@@ -85,12 +134,33 @@ function captureOf(r: string, prev: Status['capture']): Status['capture'] {
 
 const sweepOf = (r: string): Scope['sweep'] => (r.startsWith('SING') ? 'SING' : r.startsWith('NORM') ? 'NORM' : 'AUTO');
 
-// ~1 ms per query inside the held-frame window, ~24 ms outside it.
-async function readScope(force = false) {
-  const keys = Object.keys(SCOPE_Q) as (keyof typeof SCOPE_Q)[];
+// One device pass per query: ~1 ms inside the held-frame window, ~24 ms outside it.
+async function readScope(force = false, settings = true) {
+  const status = Object.values(STATUS_Q), more = settings ? Object.values(SETTINGS_Q) : [];
   // *CLS: the counter queues -230 when there's no signal; don't let the queue fill.
-  const vals = await link.texts([...Object.values(SCOPE_Q), '*CLS']);
-  const r = Object.fromEntries(keys.map((k, i) => [k, vals[i]])) as Record<keyof typeof SCOPE_Q, string>;
+  const vals = await link.texts([...status, ...more, '*CLS']);
+  const s = byKey(STATUS_Q, vals), swe = s.swe.toUpperCase();
+  if (settings) remote('scope', { ...settingsOf(byKey(SETTINGS_Q, vals.slice(status.length))), sweep: sweepOf(swe) }, force);
+  else if (swe !== 'NAN') remote('scope', { sweep: sweepOf(swe) }, force);
+  applyStatus(s, swe);
+}
+
+function applyStatus(r: StatusReply, swe: string) {
+  const st = get().scopeStatus;
+  set({
+    scopeStatus: {
+      stat: r.stat, srate: num(r.srate),
+      lastSweep: swe.startsWith('NORM') ? 'NORM' : swe.startsWith('AUTO') ? 'AUTO' : st.lastSweep,
+      fcnt: [num(r.fc1), num(r.fc2)], qual: r.qual.split(',')[0],
+      interleave: interleaveState(r.ist), capture: captureOf(r.prog, st.capture),
+    },
+  });
+  if (r.rem === 'NAN' || on(r.rem) === get().remote) return;
+  set({ remote: on(r.rem) });
+  if (!on(r.rem)) due.settings = 0; // Remote ended on the device (MENU hold): its keys may have moved things
+}
+
+function settingsOf(r: Settings): Partial<Scope> {
   const cur = get().scope;
   const ch = (i: 0 | 1) => {
     const n = i + 1, probe = num(r[`p${n}` as 'p1']), vd = num(r[`s${n}` as 's1']), offs = num(r[`o${n}` as 'o1']);
@@ -103,12 +173,11 @@ async function readScope(force = false) {
       offsetDiv: Number.isFinite(offs) && vd > 0 ? +(offs / vd).toFixed(2) : c.offsetDiv,
     };
   };
-  const tb = num(r.tb), swe = r.swe.toUpperCase();
-  remote('scope', {
+  const tb = num(r.tb);
+  return {
     ch: [ch(0), ch(1)],
     ...(Number.isFinite(tb) ? { tb: TIMEBASES.indexOf(nearest(TIMEBASES, tb)) } : {}),
     ...(Number.isFinite(num(r.hoff)) ? { hoff: num(r.hoff) } : {}),
-    sweep: sweepOf(swe),
     trig: {
       src: r.src.endsWith('2') ? 2 : 1,
       slope: r.slope.startsWith('NEG') ? 'NEG' : 'POS',
@@ -119,16 +188,17 @@ async function readScope(force = false) {
     ...(Number.isFinite(num(r.mdep)) ? { mdepth: num(r.mdep) } : {}),
     roll: on(r.roll),
     interleave: interleaveOf(r.int),
-  }, force);
-  const st = get().scopeStatus;
-  set({
-    scopeStatus: {
-      stat: r.stat, srate: num(r.srate),
-      lastSweep: swe.startsWith('NORM') ? 'NORM' : swe.startsWith('AUTO') ? 'AUTO' : st.lastSweep,
-      fcnt: [num(r.fc1), num(r.fc2)], qual: r.qual.split(',')[0],
-      interleave: interleaveState(r.ist), capture: captureOf(r.prog, st.capture),
-    },
-  });
+  };
+}
+
+// Status when due, settings with it when those are due too (see STATUS_MS).
+async function readDue(force = false) {
+  const t = now();
+  if (!force && t <= due.status && t <= due.settings) return;
+  const settings = force || t > due.settings;
+  await readScope(force, settings);
+  due.status = now() + STATUS_MS;
+  if (settings) due.settings = now() + (get().remote ? LOCKED_SETTINGS_MS : SETTINGS_MS);
 }
 
 // While a record is still filling, frame reads fail and readScope (which runs inside the
@@ -216,12 +286,12 @@ const modeCmd = (peak: boolean) => (desktop() ? [`WAV:POIN:MODE ${peak ? 'PEAK' 
 // One transaction: a command slipped in between (WAV:SOUR, CHAN:SCAL) would mislabel the frame.
 export function fetchChannel(i: 0 | 1, pts: number, timeout: number, full = false, peak = false): Promise<Frame> {
   return link.tx(async (run) => {
-    const [pre] = await run([`WAV:SOUR CHAN${i + 1}`, 'WAV:POIN 0', 'WAV:PRE?'], timeout);
+    const [pre] = await wavRun([`WAV:SOUR CHAN${i + 1}`, 'WAV:POIN 0', 'WAV:PRE?'], timeout, run);
     const rec = parsePre(pre.text ?? '');
     lastRecord = { samples: rec.points, interval: rec.xinc, origin0: rec.xorig };
     const w = full ? { first: 0, end: rec.points } : screenWindow(rec.points, rec.xinc, rec.xorig, get().scope);
     const n = full ? 0 : pts, stride = strideOf(w.end - w.first, n), pk = peak && desktop() && stride > 1;
-    const [data, seq] = await run([`WAV:STAR ${w.first + 1}`, `WAV:STOP ${w.end}`, `WAV:POIN ${n}`, ...modeCmd(pk), 'WAV:DATA?', 'WAV:SEQ?'], timeout);
+    const [data, seq] = await wavRun([`WAV:STAR ${w.first + 1}`, `WAV:STOP ${w.end}`, `WAV:POIN ${n}`, ...modeCmd(pk), 'WAV:DATA?', 'WAV:SEQ?'], timeout, run);
     if (!data.bin) throw new Error(`WAV:DATA? gave "${data.text}"`);
     const p = { ...rec, type: pk ? 1 : 0, xinc: rec.xinc * stride, xorig: rec.xorig + rec.xinc * w.first };
     return { ...toFrame(i, +(seq.text ?? 0), p, data.bin), win: { ...w, interval: rec.xinc } };
@@ -248,7 +318,7 @@ async function fetchFrame(geo: Geo): Promise<Frame[]> {
   const w = screenWindow(geo.samples, geo.interval, geo.origin0, get().scope);
   const pk = strideOf(w.end - w.first, LIVE_PTS) > 1;
   const timeout = 1500 + recordMs(geo); // a fresh record: the firmware waits 1 s + its duration
-  const [r] = await link.run([`WAV:STAR ${w.first + 1}`, `WAV:STOP ${w.end}`, `WAV:POIN ${LIVE_PTS}`, ...modeCmd(pk), 'WAV:FRAM?'], timeout);
+  const [r] = await wavRun([`WAV:STAR ${w.first + 1}`, `WAV:STOP ${w.end}`, `WAV:POIN ${LIVE_PTS}`, ...modeCmd(pk), 'WAV:FRAM?'], timeout);
   if (!r.bin) throw new Error(`WAV:FRAM? gave "${r.text}"`);
   const frames = parseFrame(r.bin);
   if (frames.length) geo.origin0 = frames[0].xorig - geo.interval * w.first; // exact preamble: origin0 + interval·first
@@ -270,9 +340,9 @@ export function parseMeas(text: string): Meas | null {
 // The device's screen readouts over the window just fetched (WAV:STAR/STOP still set, the frame
 // still leased), so the numbers match the device's own footer.
 async function measureLive(chans: (0 | 1)[]) {
-  const replies = await link.texts(chans.flatMap((i) => [`WAV:SOUR CHAN${i + 1}`, 'WAV:MEAS? SCR']), 3000);
+  const replies = await wavRun(chans.flatMap((i) => [`WAV:SOUR CHAN${i + 1}`, 'WAV:MEAS? SCR']), 3000);
   const meas: (Meas | null)[] = [null, null];
-  chans.forEach((i, k) => (meas[i] = parseMeas(replies[k])));
+  chans.forEach((i, k) => (meas[i] = parseMeas(replies[k].text ?? '')));
   scopeData.meas = meas;
 }
 
@@ -286,6 +356,7 @@ export async function scopeLoop(id: number) {
   scopeData.meas = [null, null];
   scopeData.fft = null;
   scopeData.version++;
+  forgetWav();
   const st: Live = { ready: false, lastSeq: NaN, seen: 0, missed: 0, winN: 0, winT: now(), geo: null, measDue: 0, how: '', fftCh: -1, fftDue: 0 };
   try {
     while (alive(id)) {
@@ -295,7 +366,7 @@ export async function scopeLoop(id: number) {
       } catch {
         if (link.closed) break;
         st.geo = null;
-        cfgDue = 0;
+        due.status = due.settings = 0;
         await readWaiting().catch(() => {});
         await sleep(50); // Single/Normal waiting for a trigger, a slow record, channel just toggled: try again
       }
@@ -314,18 +385,17 @@ export async function scopeLoop(id: number) {
 async function livePass(st: Live) {
   if (!st.ready) {
     await link.run(['WAV:MODE RAW', 'WAV:FORM BYTE']);
-    await readScope(true);
+    await readDue(true);
     st.ready = true;
-    cfgDue = now() + 500;
   }
   const s = get().scope;
   const chans = ([0, 1] as const).filter((i) => s.ch[i].on);
   const got = chans.length && !paused ? await fetchLive(st, chans) : [];
+  const complete = got.length > 0 && got.length === chans.length;
+  if (complete) publish(got, st); // to the screen before the reads below, which only need the held frame
   // Still inside the held-frame window: device measurements and settings reads are cheap here.
   if (got.length && desktop() && now() > st.measDue) { await measureLive(chans); st.measDue = now() + MEAS_MS; }
-  if (now() > cfgDue) { await readScope(); cfgDue = now() + 500; }
-  const complete = got.length > 0 && got.length === chans.length;
-  if (complete) publish(got, st);
+  await readDue();
   await readSpectrum(st, complete ? got : []);
   if (!chans.length) await sleep(300);
   if (get().scopeStatus.stat === 'STOP') await sleep(250); // nothing new is coming
@@ -389,7 +459,7 @@ async function readSpectrum(st: Live, got: Frame[]) {
   if (!spectrumDue(st, live, win)) return;
   st.fftCh = live.ch;
   st.fftDue = now() + FFT_MS; // from the attempt: a dropped or failed read can't repeat every pass
-  const [data, seq] = await link.run(
+  const [data, seq] = await wavRun(
     [`WAV:SOUR CHAN${live.ch + 1}`, `WAV:STAR ${win.first + 1}`, `WAV:STOP ${win.end}`, 'WAV:POIN 0', 'WAV:DATA?', 'WAV:SEQ?'], 1500);
   const bytes = data.bin, points = win.end - win.first;
   if (bytes?.length !== points || Number(seq.text) !== live.seq) return;
@@ -407,7 +477,7 @@ async function withReadsPaused<T>(fn: () => Promise<T>): Promise<T> {
     return await fn();
   } finally {
     paused--;
-    cfgDue = 0;
+    due.status = 0;
   }
 }
 
@@ -416,11 +486,11 @@ export async function scopeRun() {
   // SING makes Single the sweep mode itself; RUN alone would just re-arm another single. State the
   // sweep every time: right after Single the store may not know yet (no frames while waiting).
   await ctl([`TRIG:SWE ${scope.sweep === 'SING' ? scopeStatus.lastSweep : scope.sweep}`, 'RUN']);
-  cfgDue = 0;
+  readSoon();
 }
-export const scopeStop = async () => { await ctl(['STOP']); cfgDue = 0; };
-export const scopeSingle = async () => { await ctl(['SING']); cfgDue = 0; };
-export const scopeForce = async () => { await ctl(['TFORce']); cfgDue = 0; };
+export const scopeStop = async () => { await ctl(['STOP']); readSoon(); };
+export const scopeSingle = async () => { await ctl(['SING']); readSoon(); };
+export const scopeForce = async () => { await ctl(['TFORce']); readSoon(); };
 
 // Auto Setup fails ("cannot apply acquisition") if frames are read meanwhile, and *OPC?
 // reports success either way, so pause reads and compare settings ourselves.

@@ -107,8 +107,16 @@ async function poll(p: Poll) {
   }
   if (now() > p.cfgDue) {
     p.cfgDue = now() + 1500;
-    if ((await link.q('FUNC?')) !== lastFunc) await readDmmCfg(true); // changed on the device keys
+    await readDeviceSide();
   }
+}
+
+// What the device can change by itself: the function on its keys, Remote ending (MENU hold) or
+// starting from its menu.
+async function readDeviceSide() {
+  const [func, rem] = await link.texts(['FUNC?', 'SYST:REM?']);
+  if (rem !== 'NAN' && on(rem) !== get().remote) set({ remote: on(rem) });
+  if (func !== lastFunc) await readDmmCfg(true);
 }
 
 function pushReading(f: string[]) {

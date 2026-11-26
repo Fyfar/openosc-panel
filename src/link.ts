@@ -6,6 +6,8 @@ const enc = new TextEncoder();
 const dec = new TextDecoder();
 export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+const IN_FLIGHT = 4; // the firmware parser's queue (scpi/parser.cpp)
+
 export const VID = 0x0483;
 const PID = 0x572a;
 
@@ -99,8 +101,8 @@ export class Link {
     });
   }
 
-  private send(lines: string[]) {
-    return this.writer!.write(enc.encode(lines.map((l) => l + '\n').join('')));
+  private async send(lines: string[]) {
+    if (lines.length) await this.writer!.write(enc.encode(lines.map((l) => l + '\n').join('')));
   }
 
   // Holds the FIFO chain for the whole of `fn`, so a multi-batch exchange (preamble, then data)
@@ -120,13 +122,30 @@ export class Link {
     return this.tx((run) => run(lines, timeout));
   }
 
+  // Queries don't wait for the previous reply: the firmware dispatches one command a main-loop pass and
+  // only once the last reply has gone out, so answers stay in order (scpi/engine.cpp poll). At most
+  // IN_FLIGHT lines go out past the last answered query: they all fit its 4-command parser queue, so no
+  // line is ever left half-received behind a blocking command (3 s of that resets the parser: -102).
   private async batch(lines: string[], timeout = 3000): Promise<Reply[]> {
-    const out: Reply[] = [];
+    const out: Reply[] = [], queries: number[] = [];
+    let answered = -1, chunk: string[] = [];
+    const answer = async () => {
+      const at = queries.shift()!;
+      out.push(await this.next(timeout));
+      answered = at;
+    };
     try {
-      for (const l of lines) {
-        await this.send([l]);
-        if (l.includes('?')) out.push(await this.next(timeout));
+      for (let i = 0; i < lines.length; i++) {
+        if (i - answered > IN_FLIGHT && queries.length) {
+          await this.send(chunk);
+          chunk = [];
+          while (i - answered > IN_FLIGHT && queries.length) await answer();
+        }
+        chunk.push(lines[i]);
+        if (lines[i].includes('?')) queries.push(i);
       }
+      await this.send(chunk);
+      while (queries.length) await answer();
     } catch (e) {
       if (!this.closed) await this.sync(3);
       throw e;
