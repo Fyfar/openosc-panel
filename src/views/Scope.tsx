@@ -141,9 +141,6 @@ function TriggerBody({ s, set, say }: { s: State['scope']; set: (p: Partial<Stat
   };
   return (
     <div className="space-y-3">
-        <Row label="Source">
-          <Seg size="xs" value={s.trig.src} options={[{ id: 1, label: 'CH1', disabled: !s.ch[0].on }, { id: 2, label: 'CH2', disabled: !s.ch[1].on }]} onChange={(src) => set({ trig: { ...s.trig, src } })} />
-        </Row>
         <Row label="Slope">
           <Seg size="xs" value={s.trig.slope} options={[{ id: 'POS', label: '↑ Rising' }, { id: 'NEG', label: '↓ Falling' }]} onChange={(slope) => set({ trig: { ...s.trig, slope } })} />
         </Row>
@@ -175,7 +172,6 @@ function ChannelBody({ i, c, onChange }: { i: 0 | 1; c: Channel; onChange: (p: P
   const color = CH_COLOR[i];
   return (
     <div className={clsx('space-y-3', !c.on && 'pointer-events-none opacity-40')}>
-      <Row label="Coupling"><Seg size="xs" value={c.coup} options={[{ id: 'DC', label: 'DC' }, { id: 'AC', label: 'AC' }]} onChange={(coup) => onChange({ coup })} /></Row>
       <Stepper label="Volts/div" value={VDIV_MV.indexOf(c.vdivMv)} count={VDIV_MV.length} display={fmtVolt(vdiv(c))} color={color} onChange={(k) => onChange({ vdivMv: VDIV_MV[k] })} />
       <Slider label="Position" value={c.offsetDiv} min={-4} max={4} step={0.05} show={`${c.offsetDiv.toFixed(2)} div`} color={color} onChange={(offsetDiv) => onChange({ offsetDiv })} />
       <Row label="Probe">
@@ -186,8 +182,9 @@ function ChannelBody({ i, c, onChange }: { i: 0 | 1; c: Channel; onChange: (p: P
 }
 
 // A sidebar section that folds to one line of its current values; each opens and closes on its own.
-function Fold({ title, summary, open, onToggle, color, lead, children }: {
-  title: string; summary: string; open: boolean; onToggle: () => void; color?: string; lead?: React.ReactNode; children: React.ReactNode;
+// `tail` is a control shown in the header while open, in place of the summary.
+function Fold({ title, summary, open, onToggle, color, lead, tail, children }: {
+  title: string; summary: string; open: boolean; onToggle: () => void; color?: string; lead?: React.ReactNode; tail?: React.ReactNode; children: React.ReactNode;
 }) {
   return (
     <section className="rounded-lg border border-border bg-panel" style={{ borderColor: open && color ? `${color}55` : undefined }}>
@@ -198,6 +195,7 @@ function Fold({ title, summary, open, onToggle, color, lead, children }: {
           <span style={{ color }}>{title}</span>
           {!open && <span className="ml-auto truncate font-mono text-[11px] font-normal text-muted">{summary}</span>}
         </button>
+        {open && tail}
       </div>
       {open && <div className="border-t border-border px-4 py-3">{children}</div>}
     </section>
@@ -210,7 +208,7 @@ const SWEEP_LABEL = { AUTO: 'Auto', NORM: 'Normal', SING: 'Single' };
 function Sidebar({ s, set, setCh, say }: {
   s: State['scope']; set: (p: Partial<State['scope']>) => void; setCh: (i: 0 | 1, p: Partial<Channel>) => void; say: (m: string) => void;
 }) {
-  const [open, setOpen] = useState<Set<FoldId>>(() => new Set(['ch0']));
+  const [open, setOpen] = useState<Set<FoldId>>(() => new Set(['ch0', 'hor', 'trig']));
   const fold = (id: FoldId) => ({
     open: open.has(id),
     onToggle: () => setOpen((o) => { const n = new Set(o); if (!n.delete(id)) n.add(id); return n; }),
@@ -235,8 +233,11 @@ function Sidebar({ s, set, setCh, say }: {
           </button>
         );
         const summary = c.on ? `${fmtVolt(vdiv(c))}/div · ${c.coup} · ×${c.probe} · ${c.offsetDiv.toFixed(2)} div` : 'off';
+        const coupling = (
+          <Seg size="xs" value={c.coup} options={[{ id: 'DC', label: 'DC', disabled: !c.on }, { id: 'AC', label: 'AC', disabled: !c.on }]} onChange={(coup) => setCh(i, { coup })} />
+        );
         return (
-          <Fold key={i} title={`CH${i + 1}`} color={CH_COLOR[i]} lead={lead} summary={summary} {...fold(i ? 'ch1' : 'ch0')}>
+          <Fold key={i} title={`CH${i + 1}`} color={CH_COLOR[i]} lead={lead} tail={coupling} summary={summary} {...fold(i ? 'ch1' : 'ch0')}>
             <ChannelBody i={i} c={c} onChange={(p) => setCh(i, p)} />
           </Fold>
         );
@@ -247,7 +248,9 @@ function Sidebar({ s, set, setCh, say }: {
           <Slider label="Offset" value={s.hoff / tb} min={-5} max={5} step={0.1} show={fmtTime(s.hoff)} onChange={(d) => set({ hoff: d * tb })} />
         </div>
       </Fold>
-      <Fold title="Trigger" summary={`CH${s.trig.src} ${s.trig.slope === 'POS' ? '↑' : '↓'} ${fmtVolt(s.trig.level)} · ${SWEEP_LABEL[s.sweep]}`} {...fold('trig')}>
+      <Fold title="Trigger" summary={`CH${s.trig.src} ${s.trig.slope === 'POS' ? '↑' : '↓'} ${fmtVolt(s.trig.level)} · ${SWEEP_LABEL[s.sweep]}`} {...fold('trig')}
+        tail={<Seg size="xs" value={s.trig.src} options={[{ id: 1, label: 'CH1', disabled: !s.ch[0].on }, { id: 2, label: 'CH2', disabled: !s.ch[1].on }]} onChange={(src) => set({ trig: { ...s.trig, src } })} />}
+      >
         <TriggerBody s={s} set={set} say={say} />
       </Fold>
       <Fold title="Acquisition" summary={`${(s.mdepth / 1024).toFixed(0)}K · ${fmtSps(srate)}${s.roll ? ' · roll' : ''}`} {...fold('acq')}>
