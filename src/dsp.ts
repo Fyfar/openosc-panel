@@ -68,6 +68,68 @@ export function unwrapPhase(ph: number[]): number[] {
   return out;
 }
 
+// --- Bode analysis: a port of the meter's own (OpenOSC acquisition/bode_analysis.cpp, 0.21.14) so both
+// report the same numbers for the same points. Points are all valid here (io/bode.ts drops the rest).
+export type BodePt = { f: number; db: number; ph: number };
+type At = { f: number; v: number } | null; // a crossing: its frequency and the value it reports
+export type BodeResults = { centre: { f: number; db: number; notch: boolean } | null; f1: number | null; f2: number | null; bw: number | null; gm: At; pm: At };
+
+const NOTCH_DB = 6;
+export const wrap180 = (d: number) => d - 360 * Math.ceil((d - 180) / 360); // (-180, 180]
+// Where `level` lies between a and b (0 at a, 1 at b); a flat pair crosses nothing.
+const between = (a: number, b: number, level: number) => (a === b || (level < a && level < b) || (level > a && level > b) ? null : (level - a) / (b - a));
+const logF = (p: BodePt, q: BodePt, t: number) => p.f * (q.f / p.f) ** t; // log-f interpolation
+
+// The highest (or lowest) gain from `at` outwards on one side, `at` included.
+function extreme(pts: BodePt[], at: number, dir: 1 | -1, highest: boolean): number {
+  let v = pts[at].db;
+  for (let i = at + dir; i >= 0 && i < pts.length; i += dir) v = highest ? Math.max(v, pts[i].db) : Math.min(v, pts[i].db);
+  return v;
+}
+
+// The −3 dB bound on one side of the centre: the first crossing of `level` outwards, interpolated; none if
+// the sweep ends first (nothing is extrapolated).
+function bound(pts: BodePt[], centre: number, dir: 1 | -1, level: number, notch: boolean): number | null {
+  for (let i = centre, j = i + dir; j >= 0 && j < pts.length; i = j, j += dir) {
+    const beyond = notch ? pts[j].db >= level : pts[j].db <= level;
+    const t = beyond ? between(pts[i].db, pts[j].db, level) : null;
+    if (t !== null) return logF(pts[i], pts[j], t);
+  }
+  return null;
+}
+
+// The smaller margin wins (equal: the lower frequency).
+const worst = (kept: At, f: number, v: number): At => (!kept || v < kept.v || (v === kept.v && f < kept.f) ? { f, v } : kept);
+
+// Gain margin at each phase crossover (−180 + k·360), phase margin at each 0 dB gain crossover.
+function margins(pts: BodePt[]): { gm: At; pm: At } {
+  let gm: At = null, pm: At = null;
+  for (let i = 0; i + 1 < pts.length; i++) {
+    const p = pts[i], q = pts[i + 1], a = p.ph, b = a + wrap180(q.ph - a);
+    for (let level = Math.ceil((Math.min(a, b) - 180) / 360) * 360 + 180; level <= Math.max(a, b); level += 360) {
+      const t = between(a, b, level);
+      if (t !== null) gm = worst(gm, logF(p, q, t), -(p.db + t * (q.db - p.db)));
+    }
+    const t = between(p.db, q.db, 0);
+    if (t !== null) pm = worst(pm, logF(p, q, t), wrap180(180 + a + t * (b - a)));
+  }
+  return { gm, pm };
+}
+
+export function bodeResults(pts: BodePt[]): BodeResults {
+  const { gm, pm } = margins(pts);
+  if (!pts.length) return { centre: null, f1: null, f2: null, bw: null, gm, pm };
+  let high = 0, low = 0;
+  pts.forEach((p, i) => { if (p.db > pts[high].db) high = i; if (p.db < pts[low].db) low = i; });
+  const below = extreme(pts, low, -1, true), above = extreme(pts, low, 1, true);
+  const rise = Math.min(below, above) - pts[low].db;
+  const drop = pts[high].db - Math.max(extreme(pts, high, -1, false), extreme(pts, high, 1, false));
+  const notch = rise >= NOTCH_DB && rise > drop, c = notch ? low : high;
+  const f1 = bound(pts, c, -1, notch ? below - 3 : pts[high].db - 3, notch);
+  const f2 = bound(pts, c, 1, notch ? above - 3 : pts[high].db - 3, notch);
+  return { centre: { f: pts[c].f, db: pts[c].db, notch }, f1, f2, bw: f1 !== null && f2 !== null ? f2 - f1 : null, gm, pm };
+}
+
 // The device's readout set (WAV:MEAS? order, SCPI_DESKTOP.md) plus rise time, which only the
 // browser computes. NaN = not measured. src: EDGE/SPEC/CNT from the device, HOST when computed here.
 export type Meas = {

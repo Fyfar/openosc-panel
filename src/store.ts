@@ -44,6 +44,7 @@ export type State = {
   fftSrc: 0 | 1;
   fftSpan: FftSpan;
   fftMarkers: boolean;
+  bodeCursors: boolean;
   logging: boolean;
   armed: boolean; // waiting for `trig.start`; never while logging
   trig: Trig; // app-only: never in the `dmm` slice, which is diffed into SCPI
@@ -111,6 +112,7 @@ export const useDev = create<State>((set) => ({
   fftSrc: 0,
   fftSpan: 'AUTO',
   fftMarkers: false,
+  bodeCursors: false,
   logging: false,
   armed: false,
   trig: NO_TRIG,
