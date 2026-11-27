@@ -8,6 +8,7 @@ export type Channel = { on: boolean; coup: 'DC' | 'AC'; probe: number; vdivMv: n
 export type Sweep = 'AUTO' | 'NORM' | 'SING';
 export type CursorMode = 'OFF' | 'T' | 'V' | 'TV'; // the device's Off / Time / Level / Time+Level
 export type FftScale = 'DBV' | 'DBFS' | 'LIN';
+export type SaveOff = 'unavailable' | 'full' | 'other-tab' | 'failed'; // why the DMM recording isn't saved
 
 // Mirrors the device. io.ts writes device state here and turns user edits of the
 // `dmm` / `scope` / `gen` settings into SCPI (diff-based, see io.ts sync()).
@@ -39,10 +40,12 @@ export type State = {
   ranges: number[]; // SI maxima from SYST:DMM:RANG:LIST?
   fahrenheit: boolean; // SYST:DMM:TEMP:UNIT?
   reading: { v: number | null; over: boolean; blank: boolean; sec: number | null; seq: number } | null;
-  hist: { t: number[]; v: (number | null)[] }; // recorded readings; null = OL, blank or pause gap
-  dstats: DmmStats; // of every recorded reading, not capped like `hist`
+  recRev: number; // moves on every change of the recording (io/dmm.ts `dmmRec`, kept out of the store)
+  dstats: DmmStats; // of every recorded reading; `n` is the recording's count
   recorded: { func: DmmFunc; fahrenheit: boolean; rangeMax?: number } | null; // what the recording holds
-  logged: number;
+  // A recording found in storage at page load, not restored or discarded yet (io/saved.ts).
+  savedOffer: { func: DmmFunc; fahrenheit: boolean; valid: number; last: number; known: boolean } | null;
+  saveState: { kind: 'idle' } | { kind: 'saved'; at: number } | { kind: 'off'; why: SaveOff };
   junctionNeeded: boolean; // CONF:TEMP was refused: Type K has no cold junction configured
 
   scope: {
@@ -71,7 +74,7 @@ export type State = {
 };
 
 // What a reload or close would lose: the DMM log and Bode results exist only in memory.
-export const unsavedData = (s: State) => s.logged > 0 || s.bode.running || s.bode.points.length > 0;
+export const unsavedData = (s: State) => s.dstats.n > 0 || s.bode.running || s.bode.points.length > 0;
 
 export const useDev = create<State>((set) => ({
   link: 'disconnected',
@@ -100,11 +103,12 @@ export const useDev = create<State>((set) => ({
   ranges: [],
   fahrenheit: false,
   reading: null,
-  hist: { t: [], v: [] },
+  recRev: 0,
   dstats: emptyStats(),
   recorded: null,
   junctionNeeded: false,
-  logged: 0,
+  savedOffer: null,
+  saveState: { kind: 'idle' },
 
   scope: {
     sweep: 'AUTO',

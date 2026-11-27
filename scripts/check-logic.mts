@@ -8,6 +8,7 @@ import { pointCmds, rerange, scopeRestore, SWEEP_SCOPE } from '../src/io/bode.ts
 import { dmmDiff } from '../src/io/dmm.ts';
 import { genDiff } from '../src/io/gen.ts';
 import { unsavedData, useDev } from '../src/store.ts';
+import { decimate, flushPlan, Recording, REC_MAX } from '../src/recording.ts';
 
 let checks = 0;
 const near = (got: number, want: number, tol: number, what: string) => {
@@ -448,11 +449,140 @@ const s0 = useDev.getInitialState();
 for (const [s, want, what] of [
   [s0, false, 'fresh state'],
   [{ ...s0, logging: true }, false, 'logging armed, no rows yet'],
-  [{ ...s0, logged: 1 }, true, 'DMM log rows'],
+  [{ ...s0, dstats: { ...s0.dstats, n: 1 } }, true, 'DMM recorded readings'],
   [{ ...s0, bode: { ...s0.bode, running: true } }, true, 'Bode sweep running'],
   [{ ...s0, bode: { ...s0.bode, points: [{ f: 1, db: 0, ph: 0 }] } }, true, 'Bode result'],
 ] as const) {
   assert.equal(unsavedData(s), want, `unsavedData: ${what}`);
+  checks++;
+}
+
+// --- Recording: chunked columns, one NaN entry per gap, `gen` moves on clear and load ------------
+{
+  const r = new Recording();
+  for (let i = 0; i < 1500; i++) r.push(1000 + i, i % 7);
+  assert.equal(r.gap(2500), true, 'a gap after a value');
+  assert.equal(r.gap(2501), false, 'never two gaps in a row');
+  r.push(2400, 5); // the clock stepped back
+  assert.deepEqual([r.length, r.valid, r.chunks.length], [1502, 1501, 2], 'across a chunk boundary');
+  assert.ok(Number.isNaN(r.v(1500)) && r.t(1500) === 2500 && r.v(1499) === 1499 % 7, 'the gap is one entry, no repeated value');
+  assert.equal(r.t(1501), 2500, 'a timestamp never goes back');
+  const g = r.gen;
+  const copy = new Recording();
+  copy.load([r.chunk(0), r.chunk(1)]);
+  assert.deepEqual([copy.length, copy.valid, copy.t(1501), copy.v(1023), copy.v(1024)], [r.length, r.valid, 2500, 1023 % 7, 1024 % 7], 'chunk export → load round trip');
+  assert.ok(Number.isNaN(copy.v(1500)) && copy.gen !== 0, 'load keeps gaps and moves gen');
+  assert.equal(r.chunk(1).t.length, 1502 - 1024, 'the tail is saved at its length');
+  r.clear();
+  assert.deepEqual([r.length, r.valid, r.chunks.length, r.gen !== g], [0, 0, 0, true], 'clear empties and moves gen');
+  assert.equal(REC_MAX, 1_800_000);
+  checks += 9;
+}
+
+// --- CSV parts: header once, one row per reading, no row for a break, columns as before --------
+{
+  const r = new Recording();
+  r.push(0, 1.5); r.push(1, 1.25); r.gap(2); r.push(3, 2);
+  const csv = r.csvParts('DC Voltage', 'V').join('');
+  assert.equal(csv, 'time,function,value,unit\n1970-01-01T00:00:00.000Z,DC Voltage,1.5,V\n1970-01-01T00:00:01.000Z,DC Voltage,1.25,V\n1970-01-01T00:00:03.000Z,DC Voltage,2,V\n');
+  checks++;
+}
+
+// --- flushPlan: what a flush writes; a wrong plan corrupts the saved copy silently ---------------
+{
+  const plan = (saved: { gen: number; length: number }, gen: number, length: number, valid = length) => flushPlan(saved, { gen, length, valid });
+  for (const [got, want, what] of [
+    [plan({ gen: 1, length: 0 }, 1, 10), { clear: false, from: 0 }, 'first flush'],
+    [plan({ gen: 1, length: 10 }, 1, 20), { clear: false, from: 0 }, 'append within the tail rewrites it'],
+    [plan({ gen: 1, length: 1000 }, 1, 1030), { clear: false, from: 0 }, 'a tail sealed since the last flush is written once more'],
+    [plan({ gen: 1, length: 1024 }, 1, 1030), { clear: false, from: 1 }, 'a chunk saved full is not rewritten'],
+    [plan({ gen: 1, length: 3000 }, 2, 5), { clear: true, from: 0 }, 'clear then refill: old chunks must not survive'],
+    [plan({ gen: 1, length: 3000 }, 2, 0, 0), { clear: true, from: null }, 'empty recording clears storage'],
+    [plan({ gen: 1, length: 3000 }, 1, 3, 0), { clear: true, from: null }, 'no valid reading counts as empty'],
+    [plan({ gen: 2, length: 0 }, 2, 0, 0), null, 'nothing saved, nothing recorded'],
+    [plan({ gen: 1, length: 30 }, 1, 30), null, 'nothing changed'],
+    [plan({ gen: 7, length: 1502 }, 7, 1502), null, 'just loaded'],
+  ] as const) {
+    assert.deepEqual(got, want, `flushPlan: ${what}`);
+    checks++;
+  }
+}
+
+// --- decimate: each column's real min and max at their own times; a gap breaks the line ----------
+{
+  const rec = (vals: number[], dt = 1) => { const r = new Recording(); vals.forEach((v, i) => (Number.isNaN(v) ? r.gap(i * dt) : r.push(i * dt, v))); return r; };
+  const pairs = (d: { t: number[]; v: (number | null)[] }) => d.t.map((t, i) => [t, d.v[i]]);
+  assert.deepEqual(pairs(decimate(rec([1, 2, 3, 4, 5]), 0, 10, 1200)), [[0, 1], [1, 2], [2, 3], [3, 4], [4, 5]], 'sparse columns are the readings as they are');
+  assert.deepEqual(pairs(decimate(rec([1, 2, NaN, 3]), 0, 10, 1200)), [[0, 1], [1, 2], [2, 2], [2, null], [3, 3]], 'a gap: the held value to its time, then a break');
+  const spike = Array.from({ length: 10000 }, (_, i) => (i === 5000 ? 9 : i === 7000 ? -4 : 1));
+  const wide = decimate(rec(spike), 0, 10000, 10);
+  assert.ok(wide.t.length <= 20 && wide.v.includes(9) && wide.v.includes(-4), 'a spike survives a wide column');
+  assert.equal(wide.t[wide.v.indexOf(9)], 5000, 'at its own time');
+  const desc = decimate(rec([5, 9, 1, 3]), 0, 4, 1);
+  assert.deepEqual(pairs(desc), [[1, 9], [2, 1]], 'min and max in time order');
+  const gapWide = decimate(rec([...Array(500).fill(1), NaN, ...Array(499).fill(2)]), 0, 1000, 1);
+  assert.deepEqual(pairs(gapWide), [[0, 1], [500, 1], [500, null], [999, 2]], 'a gap inside a wide column breaks it');
+  assert.deepEqual(decimate(rec([1, 2, 3, 4, 5, 6]), 2.5, 4.5, 1200).t, [2, 3, 4], 'the reading held into the window is included');
+  assert.deepEqual(decimate(new Recording(), 0, 10).t, [], 'empty');
+  assert.deepEqual(decimate(rec([1, NaN, 2, NaN, 3, NaN, 4]), 0, 6, 1200).gaps, [1, 3, 5], 'a marker per gap in sparse columns');
+  assert.deepEqual(decimate(rec([...Array(300).fill(1), NaN, 1, NaN, ...Array(300).fill(1)]), 0, 600, 2).gaps, [300], 'one marker per wide column, at its first gap');
+  checks += 10;
+
+  // The block-summary path equals a plain per-column scan, gaps and ties included.
+  const columnPoints = (r: Recording, idx: number[]) => {
+    const vals = idx.filter((i) => !Number.isNaN(r.v(i))), gaps = idx.filter((i) => Number.isNaN(r.v(i)));
+    const pts: [number, number | null][] = [];
+    if (vals.length) {
+      const lo = vals.reduce((a, i) => (r.v(i) < r.v(a) ? i : a)), hi = vals.reduce((a, i) => (r.v(i) >= r.v(a) ? i : a));
+      pts.push([r.t(lo), r.v(lo)]);
+      if (hi !== lo) pts.push([r.t(hi), r.v(hi)]);
+      if (r.t(hi) < r.t(lo)) pts.reverse();
+    }
+    for (const g of new Set([gaps[0], gaps.at(-1)].filter((g) => g !== undefined))) {
+      if (g > 0 && !Number.isNaN(r.v(g - 1))) pts.push([r.t(g), r.v(g - 1)]);
+      pts.push([r.t(g), null]);
+    }
+    return pts.sort((p, q) => p[0] - q[0]);
+  };
+  const naive = (r: Recording, x0: number, x1: number, cols: number) => {
+    const w = x1 > x0 ? (x1 - x0) / cols : 1, byCol = new Map<number, number[]>();
+    let i0 = 0;
+    while (i0 + 1 < r.length && r.t(i0 + 1) <= x0) i0++;
+    for (let i = i0; i < r.length && r.t(i) <= x1; i++) {
+      const c = Math.floor((r.t(i) - x0) / w);
+      if (!byCol.has(c)) byCol.set(c, []);
+      byCol.get(c)!.push(i);
+    }
+    return [...byCol.values()].flatMap((idx) => columnPoints(r, idx));
+  };
+  let seed = 7;
+  const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+  const r = new Recording();
+  for (let i = 0; i < 200_000; i++) (rnd() < 0.001 ? r.gap(i / 3) : r.push(i / 3, Math.round(rnd() * 50) / 10));
+  for (const [x0, x1, cols] of [[0, r.t(r.length - 1), 1200], [100, 5000, 300], [-50, 70_000, 7], [20_000, 20_010, 1200], [1234.5, 60_000, 1200]]) {
+    assert.deepEqual(pairs(decimate(r, x0, x1, cols)), naive(r, x0, x1, cols), `summary path = plain scan for [${x0}, ${x1}] / ${cols}`);
+    checks++;
+  }
+}
+
+// --- decimate cost: a week at the limit reads block summaries, not every reading. A ratio, not a
+// time, so a slow CI runner can't fail it (measured 4×; with the summary path off it is below 1×).
+{
+  const r = new Recording();
+  for (let i = 0; i < REC_MAX; i++) (i % 9000 === 0 ? r.gap(i / 3) : r.push(i / 3, Math.sin(i / 1e4)));
+  const x1 = r.t(r.length - 1), cols = 1200, w = x1 / cols;
+  const rawScan = () => {
+    const lo = new Float64Array(cols + 1).fill(Infinity), hi = new Float64Array(cols + 1).fill(-Infinity);
+    for (const ch of r.chunks) for (let j = 0; j < ch.t.length; j++) { const c = Math.floor(ch.t[j] / w), v = ch.v[j]; if (v < lo[c]) lo[c] = v; if (v >= hi[c]) hi[c] = v; }
+    return lo;
+  };
+  const median = (f: () => unknown) => {
+    const ms: number[] = [];
+    for (let k = 0; k < 15; k++) { const s = performance.now(); f(); ms.push(performance.now() - s); }
+    return ms.sort((a, b) => a - b)[7];
+  };
+  const fast = median(() => decimate(r, 0, x1, cols)), raw = median(rawScan);
+  assert.ok(raw / fast >= 2, `decimate ${fast.toFixed(2)} ms vs raw scan ${raw.toFixed(2)} ms`);
   checks++;
 }
 

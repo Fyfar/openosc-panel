@@ -1,6 +1,6 @@
 {
   "name": "openosc-panel",
-  "version": "0.13.0",
+  "version": "0.14.0",
   "description": "Browser control panel for ZOYI ZT703S / ZT706S on OpenOSC firmware over Web Serial: oscilloscope, signal generator, Bode plotter and multimeter.",
   "private": true,
   "license": "MIT",
@@ -37,7 +37,7 @@
     "preview": "vite preview",
     "fallow": "fallow",
     "typecheck": "tsc --noEmit",
-    "check": "node --import ./scripts/ts-resolve.mjs scripts/check-logic.mts && node --import ./scripts/ts-resolve.mjs scripts/check-link.mts"
+    "check": "node scripts/check-asserts.mjs && node --import ./scripts/ts-resolve.mjs scripts/check-logic.mts && node --import ./scripts/ts-resolve.mjs scripts/check-link.mts"
   },
   "dependencies": {
     "@fontsource-variable/geist": "^5.3.0",

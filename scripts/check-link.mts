@@ -5,7 +5,9 @@ import assert from 'node:assert/strict';
 import { Link, sleep } from '../src/link.ts';
 import { ctl, link, remote, runLoop, stopLoop } from '../src/io/core.ts';
 import { setMode } from '../src/io/index.ts'; // also: the store → SCPI subscription (drag coalescing)
-import { clearDmmData, dmmLogCsv, dmmLoop, flushDmm, logMatches, startDmmLog, stopDmmLog } from '../src/io/dmm.ts';
+import { clearDmmData, dmmCsvParts, dmmLoop, dmmRec, flushDmm, logMatches, startDmmLog, stopDmmLog } from '../src/io/dmm.ts';
+import { REC_MAX } from '../src/recording.ts';
+import { emptyStats } from '../src/dsp.ts';
 import { scopeData, scopeLoop, scopeRun } from '../src/io/scope.ts';
 import { bodeStop, bodeSweep } from '../src/io/bode.ts';
 import { useDev } from '../src/store.ts';
@@ -57,6 +59,10 @@ let checks = 0;
 
 // Recorded data outlives a loop and a link: each DMM section starts from none.
 const freshDmm = async () => { stopDmmLog(); await clearDmmData(); };
+const dmmCsv = () => dmmCsvParts().join('');
+// The recorded entries; NaN = a break (OL, blank or pause).
+const recValues = () => Array.from({ length: dmmRec.length }, (_, i) => dmmRec.v(i));
+const lastValue = () => dmmRec.v(dmmRec.length - 1);
 
 // --- framing: a binary block is cut by its length, not by the 0x0a bytes inside it --------
 {
@@ -148,7 +154,7 @@ const freshDmm = async () => { stopDmmLog(); await clearDmmData(); };
   assert.equal(useDev.getState().dmm.cj, 22.5, 'stored manual junction is read back');
   checks += 3;
 
-  const csv = dmmLogCsv().trim().split('\n');
+  const csv = dmmCsv().trim().split('\n');
   assert.equal(csv[0], 'time,function,value,unit');
   assert.match(csv[1], /^\d{4}-\d\d-\d\dT[\d:.]+Z,AC Voltage,1\.234,V$/);
   checks++;
@@ -170,10 +176,13 @@ const freshDmm = async () => { stopDmmLog(); await clearDmmData(); };
   const v = { ...useDev.getState().dmm, func: 'VDC' as const, cj: null };
   await flushDmm({ ...v, cj: 21 }, { ...v, func: 'TEMP', cj: 21 });
   assert.equal(useDev.getState().junctionNeeded, false, 'with a manual junction stored, -221 is not about the junction');
-  useDev.setState({ hist: { t: [1, 2], v: [1.5, 1.6] }, logging: true });
+  dmmRec.push(1, 1.5);
+  dmmRec.push(2, 1.6);
+  const kept = dmmRec.length;
+  useDev.setState({ logging: true });
   await flushDmm(v, { ...v, func: 'TEMP' });
   assert.equal(useDev.getState().junctionNeeded, true, 'refused CONF:TEMP asks for a junction');
-  assert.equal(useDev.getState().hist.v.length, 2, 'a refused CONF keeps the current trend');
+  assert.equal(dmmRec.length, kept, 'a refused CONF keeps the current trend');
   assert.equal(useDev.getState().logging, true, 'and keeps logging');
   func = '"RES"'; // the user turns the meter's own keys
   await flushDmm(v, { ...v, func: 'RES' });
@@ -225,14 +234,14 @@ const freshDmm = async () => { stopDmmLog(); await clearDmmData(); };
   runLoop('dmm', dmmLoop);
   await shows(77, '25 °C shows as 77 °F');
   assert.equal(useDev.getState().dstats.min, 77, 'statistics are in °F too');
-  assert.match(dmmLogCsv().trim().split('\n').at(-1)!, /,Temperature,77,°F$/);
+  assert.match(dmmCsv().trim().split('\n').at(-1)!, /,Temperature,77,°F$/);
   rel = 1; value = 10;
   await shows(18, 'a REL difference converts without +32');
   rel = 0; value = 25; unit = 'C';
   await shows(25, 'back to °C after the unit changes on the meter');
   assert.equal(useDev.getState().logging, false, 'a unit change stops logging');
-  assert.ok(useDev.getState().hist.v.every((v) => v === null || v === 77 || v === 18) && useDev.getState().dstats.max === 77, 'no °C in the °F data');
-  assert.ok(dmmLogCsv().trim().split('\n').slice(1).every((row) => row.endsWith(',°F')));
+  assert.ok(recValues().every((v) => Number.isNaN(v) || v === 77 || v === 18) && useDev.getState().dstats.max === 77, 'no °C in the °F data');
+  assert.ok(dmmCsv().trim().split('\n').slice(1).every((row) => row.endsWith(',°F')));
   assert.equal(logMatches(useDev.getState().recorded, 'TEMP', false), false, '°C does not match °F data');
   await stopLoop();
   await link.close();
@@ -256,15 +265,15 @@ function fakeMeter() {
   return { m, dev, VDC, RES };
 }
 const dmmState = () => useDev.getState();
-const nulls = () => dmmState().hist.v.filter((v) => v === null).length;
+const nulls = () => recValues().filter(Number.isNaN).length;
 
 // --- recording: only while logging; stop pauses; a function change stops it; Clear is the only reset
 {
   const { m, dev, VDC, RES } = fakeMeter();
   // Three more readings have been through the loop.
   const polled = async () => { const to = m.seq + 3; await until(() => (dmmState().reading?.seq ?? 0) >= to, 'readings keep coming'); };
-  const recorded = () => [dmmState().logged, dmmState().dstats.n, dmmState().hist.v.length];
-  const rows = () => dmmLogCsv().trim().split('\n').slice(1);
+  const recorded = () => [dmmState().dstats.n, dmmRec.valid, dmmRec.length];
+  const rows = () => dmmCsv().trim().split('\n').slice(1);
   useDev.setState({ reading: null });
   await link.open(dev.port);
   await freshDmm();
@@ -274,52 +283,53 @@ const nulls = () => dmmState().hist.v.filter((v) => v === null).length;
   assert.equal(dmmState().reading?.v, 1.5, 'the readout is live without logging');
 
   startDmmLog();
-  await until(() => dmmState().logged >= 3, 'logging records');
-  assert.equal(dmmState().dstats.n, dmmState().logged, 'statistics and CSV hold the same readings');
+  await until(() => dmmState().dstats.n >= 3, 'logging records');
+  assert.deepEqual([dmmRec.valid, rows().length], [dmmState().dstats.n, dmmState().dstats.n], 'statistics, recording and CSV hold the same readings');
   assert.deepEqual(dmmState().recorded, { func: 'VDC', fahrenheit: false, rangeMax: 2.5 }, 'what the data is');
 
   Object.assign(m, { value: 'NAN', status: 6 });
   await until(() => dmmState().reading?.over === true, 'OL');
-  let n = dmmState().logged;
+  let n = dmmState().dstats.n;
   await polled();
-  assert.deepEqual([dmmState().logged, dmmState().dstats.n, dmmState().hist.v.at(-1)], [n, n, null], 'OL breaks the line and is not counted');
+  assert.deepEqual([dmmState().dstats.n, dmmRec.valid, Number.isNaN(lastValue())], [n, n, true], 'OL breaks the line and is not counted');
   Object.assign(m, VDC);
-  await until(() => dmmState().hist.v.at(-1) === 1.5, 'recording again after OL');
+  await until(() => lastValue() === 1.5, 'recording again after OL');
+  assert.equal(rows().length, dmmState().dstats.n, 'one CSV row per counted reading, none for the break');
 
   stopDmmLog();
   const [rows0, , points] = recorded();
-  assert.deepEqual([dmmState().logging, dmmState().hist.v.at(-1)], [false, null], 'stop breaks the line');
+  assert.deepEqual([dmmState().logging, Number.isNaN(lastValue())], [false, true], 'stop breaks the line');
   await polled();
-  assert.deepEqual([dmmState().logged, dmmState().hist.t.length], [rows0, points], 'stopped: nothing is added');
+  assert.deepEqual([dmmState().dstats.n, dmmRec.length], [rows0, points], 'stopped: nothing is added');
   startDmmLog();
-  await until(() => dmmState().logged > rows0, 'starting again adds to the data');
-  assert.equal(dmmState().hist.v[points - 1], null, 'the break stays between the two runs');
+  await until(() => dmmState().dstats.n > rows0, 'starting again adds to the data');
+  assert.ok(Number.isNaN(dmmRec.v(points - 1)), 'the break stays between the two runs');
 
   m.id = 13; // dmm::Function::Unknown
   await polled();
-  n = dmmState().logged;
+  n = dmmState().dstats.n;
   await polled();
-  assert.deepEqual([dmmState().logging, dmmState().logged], [true, n], 'an unknown function is neither recorded nor a change');
+  assert.deepEqual([dmmState().logging, dmmState().dstats.n], [true, n], 'an unknown function is neither recorded nor a change');
   m.id = 0;
-  await until(() => dmmState().logged > n, 'recording goes on');
+  await until(() => dmmState().dstats.n > n, 'recording goes on');
 
   Object.assign(m, RES);
   await until(() => !dmmState().logging, 'a function change stops logging');
   await until(() => dmmState().dmm.func === 'RES', 'the panel follows');
-  n = dmmState().logged;
+  n = dmmState().dstats.n;
   await polled();
-  assert.equal(dmmState().logged, n);
-  assert.ok(rows().every((r) => r.includes(',DC Voltage,')) && !dmmState().hist.v.includes(100), 'no reading of the new function in the data');
+  assert.equal(dmmState().dstats.n, n);
+  assert.ok(rows().every((r) => r.includes(',DC Voltage,')) && !recValues().includes(100), 'no reading of the new function in the data');
   assert.equal(logMatches(dmmState().recorded, dmmState().dmm.func, false), false, 'resistance does not match volt data');
   Object.assign(m, VDC);
   await until(() => dmmState().dmm.func === 'VDC', 'switched back');
   assert.equal(logMatches(dmmState().recorded, 'VDC', false), true);
 
   startDmmLog();
-  await until(() => dmmState().logged > n, 'resumed on the same function');
+  await until(() => dmmState().dstats.n > n, 'resumed on the same function');
   Object.assign(m, { id: 8, ranges: '2,0.025,0.25', value: '0.0012' }); // FUNC? still says VOLT
   await until(() => !dmmState().logging && dmmState().dmm.func === 'MVDC', 'V → mV on the meter keys stops logging and is followed');
-  assert.ok(!dmmState().hist.v.includes(0.0012));
+  assert.ok(!recValues().includes(0.0012));
 
   await clearDmmData();
   assert.deepEqual([...recorded(), dmmState().recorded, rows().filter(Boolean).length], [0, 0, 0, null, 0], 'Clear data empties everything');
@@ -329,13 +339,13 @@ const nulls = () => dmmState().hist.v.filter((v) => v === null).length;
   Object.assign(m, VDC);
   await until(() => dmmState().dmm.func === 'VDC', 'back on V');
   startDmmLog();
-  await until(() => dmmState().logged >= 3, 'logging');
-  n = dmmState().logged;
+  await until(() => dmmState().dstats.n >= 3, 'logging');
+  n = dmmState().dstats.n;
   const cleared = clearDmmData();
-  assert.equal(dmmState().logged, 0);
+  assert.equal(dmmState().dstats.n, 0);
   await cleared;
-  await until(() => dmmState().logged >= 1, 'Clear while logging keeps logging');
-  assert.deepEqual([dmmState().logging, dmmState().dstats.n], [true, dmmState().logged]);
+  await until(() => dmmState().dstats.n >= 1, 'Clear while logging keeps logging');
+  assert.deepEqual([dmmState().logging, dmmRec.valid], [true, dmmState().dstats.n]);
 
   await freshDmm();
   Object.assign(m, RES, { value: 'NAN', status: 6 });
@@ -346,7 +356,7 @@ const nulls = () => dmmState().hist.v.filter((v) => v === null).length;
   await until(() => !dmmState().logging, 'a change stops logging with nothing recorded yet');
   startDmmLog();
   await polled();
-  assert.deepEqual([dmmState().logging, dmmState().logged], [true, 0], 'with no data, any function can be logged');
+  assert.deepEqual([dmmState().logging, dmmState().dstats.n], [true, 0], 'with no data, any function can be logged');
 
   // The meter goes away: a profile switch or a lost link.
   for (const gone of ['switching', 'disconnected'] as const) {
@@ -355,14 +365,14 @@ const nulls = () => dmmState().hist.v.filter((v) => v === null).length;
     await until(() => dmmState().dmm.func === 'VDC' && dmmState().reading?.v === 1.5, 'back on V');
     useDev.setState({ link: 'connected' });
     startDmmLog();
-    await until(() => dmmState().logged >= 1, 'logging');
+    await until(() => dmmState().dstats.n >= 1, 'logging');
     useDev.setState({ link: gone });
-    assert.deepEqual([dmmState().logging, dmmState().logged > 0, dmmState().hist.v.at(-1)], [false, true, null], `link ${gone}: logging stops, data kept`);
+    assert.deepEqual([dmmState().logging, dmmState().dstats.n > 0, Number.isNaN(lastValue())], [false, true, true], `link ${gone}: logging stops, data kept`);
   }
 
   await stopLoop();
   await link.close();
-  checks += 22;
+  checks += 23;
 }
 
 // --- the generator view keeps the meter profile: logging goes on there, each reading once, no break
@@ -374,17 +384,17 @@ const nulls = () => dmmState().hist.v.filter((v) => v === null).length;
   useDev.setState({ link: 'connected', profile: 'XDM1041', mode: 'dmm', reading: null });
   await setMode('dmm');
   startDmmLog();
-  await until(() => dmmState().logged >= 2, 'logging in the multimeter view');
+  await until(() => dmmState().dstats.n >= 2, 'logging in the multimeter view');
   m.held = true; // no new reading across the view change
   await sleep(300);
-  const n = dmmState().logged, breaks = nulls();
+  const n = dmmState().dstats.n, breaks = nulls();
   await setMode('gen');
   await sleep(400);
-  assert.equal(dmmState().logged, n, 'a view change records no reading twice');
+  assert.equal(dmmState().dstats.n, n, 'a view change records no reading twice');
   m.held = false;
-  await until(() => dmmState().logged > n + 2, 'the generator view keeps recording');
+  await until(() => dmmState().dstats.n > n + 2, 'the generator view keeps recording');
   await setMode('dmm');
-  await until(() => dmmState().logged > n + 4, 'and back');
+  await until(() => dmmState().dstats.n > n + 4, 'and back');
   assert.deepEqual([dmmState().logging, nulls()], [true, breaks], 'no break from switching views');
   stopDmmLog();
   await setMode('gen');
@@ -394,6 +404,43 @@ const nulls = () => dmmState().hist.v.filter((v) => v === null).length;
   await stopLoop();
   await link.close();
   useDev.setState({ link: 'disconnected', mode: 'scope', profile: 'DS1052' });
+  await freshDmm();
+  checks += 3;
+}
+
+// --- the reading limit: logging stops at REC_MAX with the data kept, and starts again only after Clear
+{
+  const { dev } = fakeMeter();
+  await link.open(dev.port);
+  await freshDmm();
+  for (let i = 0; i < REC_MAX - 2; i++) dmmRec.push(i / 3, 1.5);
+  useDev.setState({ dstats: { ...emptyStats(), n: dmmRec.valid }, recorded: { func: 'VDC', fahrenheit: false, rangeMax: 2.5 }, reading: null });
+  runLoop('dmm', dmmLoop);
+  startDmmLog();
+  await until(() => !dmmState().logging, 'logging stops at the limit');
+  assert.deepEqual([dmmState().dstats.n, dmmRec.valid], [REC_MAX, REC_MAX], 'exactly the limit is recorded');
+  startDmmLog();
+  assert.equal(dmmState().logging, false, 'Start is refused at the limit');
+  await clearDmmData();
+  startDmmLog();
+  assert.equal(dmmState().logging, true, 'after Clear data logging starts');
+  await stopLoop();
+  await link.close();
+  await freshDmm();
+  checks += 4;
+}
+
+// --- a saved recording on offer is never overwritten: Start is refused until Restore or Discard.
+// Under Node there is no IndexedDB, so saving reports itself unavailable and nothing else changes.
+{
+  await freshDmm();
+  assert.deepEqual(dmmState().saveState, { kind: 'off', why: 'unavailable' }, 'no storage under Node');
+  useDev.setState({ savedOffer: { func: 'VDC', fahrenheit: false, valid: 10, last: 1, known: true } });
+  startDmmLog();
+  assert.equal(dmmState().logging, false, 'Start is refused while a saved recording is offered');
+  useDev.setState({ savedOffer: null });
+  startDmmLog();
+  assert.equal(dmmState().logging, true, 'and works once it is gone');
   await freshDmm();
   checks += 3;
 }

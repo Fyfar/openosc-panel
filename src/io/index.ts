@@ -11,7 +11,8 @@ import { flushGen, readGen } from './gen';
 import { flushScope, forgetWav, scopeLoop } from './scope';
 
 export { download } from './core';
-export { clearDmmData, exportDmmLog, logMatches, startDmmLog, stopDmmLog } from './dmm';
+export { atLimit, clearDmmData, dmmRec, exportDmmLog, logMatches, startDmmLog, stopDmmLog } from './dmm';
+export { discardSaved, restoreSaved } from './saved';
 export { exportScopeCsv, scopeAuto, scopeData, scopeForce, scopeRun, scopeSingle, scopeStop } from './scope';
 export { bodeStop, bodeSweep } from './bode';
 
