@@ -265,23 +265,34 @@ function useTimeWindow(win: number) {
 
 // Text over the plot: how to fill an empty chart, and which side of a manual Y range cuts readings off.
 function ChartNotes({ manual, trace, x0, x1, sc }: { manual: { lo: number; hi: number } | null; trace: Trace; x0: number; x1: number; sc: Scale }) {
-  const logging = useDev((s) => s.logging);
-  if (!io.dmmRec.length) {
-    return logging ? null : (
-      <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center pr-3 pb-6 pl-18">
-        <p className="rounded-md border border-border bg-panel px-3 py-2 text-center text-sm text-muted">Press "Start logging" to chart readings and collect statistics</p>
-      </div>
-    );
-  }
+  if (!io.dmmRec.length) return <EmptyNote sc={sc} />;
   if (!manual) return null;
   const [lo, hi] = windowExtent(trace.t, trace.v, x0, x1);
-  const value = (x: number) => `${(x / sc.div).toFixed(sc.dp)} ${sc.unit}`;
+  const value = (x: number) => fmtIn(x, sc);
   const label = 'pointer-events-none absolute right-2 z-10 rounded border border-amber/50 bg-panel px-2 py-0.5 font-mono text-[11px] text-amber';
   return (
     <>
       {hi > manual.hi && <span className={clsx(label, 'top-1')}>▲ above range: {value(hi)}</span>}
       {lo < manual.lo && <span className={clsx(label, 'bottom-14')}>▼ below range: {value(lo)}</span>}
     </>
+  );
+}
+
+const fmtIn = (x: number, sc: Scale) => `${(x / sc.div).toFixed(sc.dp)} ${sc.unit}`;
+
+// An empty chart names the start control as it reads now, or, armed, the condition it waits for.
+function EmptyNote({ sc }: { sc: Scale }) {
+  const logging = useDev((s) => s.logging);
+  const armed = useDev(shownArmed);
+  const start = useDev((s) => io.liveTrig(s).start);
+  if (logging) return null;
+  const text = armed && start
+    ? `Waiting for the start condition: ${start.above ? 'above' : 'below'} ${fmtIn(start.v, sc)}`
+    : `Press "${start ? 'Arm' : 'Start logging'}" to chart readings and collect statistics`;
+  return (
+    <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center pr-3 pb-6 pl-18">
+      <p className="rounded-md border border-border bg-panel px-3 py-2 text-center text-sm text-muted">{text}</p>
+    </div>
   );
 }
 
