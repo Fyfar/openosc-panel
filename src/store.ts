@@ -9,6 +9,10 @@ export type Sweep = 'AUTO' | 'NORM' | 'SING';
 export type CursorMode = 'OFF' | 'T' | 'V' | 'TV'; // the device's Off / Time / Level / Time+Level
 export type FftScale = 'DBV' | 'DBFS' | 'LIN';
 export type SaveOff = 'unavailable' | 'full' | 'other-tab' | 'failed'; // why the DMM recording isn't saved
+export type Cond = { above: boolean; v: number }; // a logging trigger condition, `v` in the base unit
+// The logging trigger (io/dmm.ts). `key`: the function and unit the conditions were entered in.
+export type Trig = { key: string; start: Cond | null; stop: Cond | null; repeat: boolean };
+export const NO_TRIG: Trig = { key: '', start: null, stop: null, repeat: false };
 
 // Mirrors the device. io.ts writes device state here and turns user edits of the
 // `dmm` / `scope` / `gen` settings into SCPI (diff-based, see io.ts sync()).
@@ -34,6 +38,8 @@ export type State = {
   fftSpan: FftSpan;
   fftMarkers: boolean;
   logging: boolean;
+  armed: boolean; // waiting for `trig.start`; never while logging
+  trig: Trig; // app-only: never in the `dmm` slice, which is diffed into SCPI
   update: boolean; // a newer deploy exists (src/pwa.ts); the user decides when to reload
 
   dmm: { func: DmmFunc; auto: boolean; range: number; hold: boolean; holdMode: HoldMode; rel: boolean; cj: number | null };
@@ -98,6 +104,8 @@ export const useDev = create<State>((set) => ({
   fftSpan: 'AUTO',
   fftMarkers: false,
   logging: false,
+  armed: false,
+  trig: NO_TRIG,
 
   dmm: { func: 'VDC', auto: true, range: 0, hold: false, holdMode: 'MAN', rel: false, cj: null },
   ranges: [],

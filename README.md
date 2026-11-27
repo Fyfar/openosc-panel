@@ -27,6 +27,8 @@ install, no backend. Your data never leaves your machine.
   and every spike and overload still visible.
 - **Your measurements are safe.** After a page reload, a tab or browser crash or a power cut, the
   panel offers to restore the recording and you carry on logging.
+- **Start and stop logging on the reading itself**: log only while a current is above or a
+  voltage below a value you set, once or every time it happens. No need to watch the meter.
 - Trend chart, histogram and statistics describe exactly the readings you logged; one click
   exports them as CSV.
 

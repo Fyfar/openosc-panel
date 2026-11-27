@@ -7,7 +7,7 @@ import { heldIdx, histogram, stdDev, windowExtent, yFloor } from '../dsp';
 import * as io from '../io';
 import { AXIS, legendIn, legendValue, Plot } from '../Plot';
 import { decimate, REC_MAX, type Trace } from '../recording';
-import { useDev, type SaveOff } from '../store';
+import { useDev, type Cond, type SaveOff, type State } from '../store';
 import { Btn, Panel, Seg, Stat, Toggle } from '../ui';
 
 // In the meter's key order: F1 V, F2 Ω → •)) → →| → ⊣⊢, F3 A, F4 mV → Type K (mA with the probe in
@@ -38,7 +38,6 @@ export function Dmm() {
   const patch = useDev((s) => s.patch);
   const ranges = useDev((s) => s.ranges);
   const reading = useDev((s) => s.reading);
-  const logging = useDev((s) => s.logging);
   const dstats = useDev((s) => s.dstats);
   const f = DMM_FUNCS.find((x) => x.id === dmm.func)!;
   const junctionNeeded = useDev((s) => s.junctionNeeded);
@@ -62,7 +61,7 @@ export function Dmm() {
               {dmm.auto && ranges.length > 0 && <Badge tone="muted">AUTO</Badge>}
               {dmm.rel && <Badge tone="accent">REL Δ</Badge>}
               {dmm.hold && <Badge tone="amber">HOLD</Badge>}
-              {logging && <Badge tone="danger" pulse>REC</Badge>}
+              <LogBadge />
               {!dmm.hold && live && <Badge tone="success">LIVE</Badge>}
             </div>
           }
@@ -139,7 +138,7 @@ export function Dmm() {
           </Panel>
         )}
 
-        <LogPanel />
+        <LogPanel sc={sc} />
       </aside>
     </div>
   );
@@ -340,7 +339,7 @@ function trendOpts(kind: 'line' | 'hist', sc: Scale, manual: { lo: number; hi: n
 const range = ([lo, hi]: [number, number]) => ({ lo, hi });
 
 // Typed in the display unit; an unparseable or crossing value snaps back to the current one.
-function YInput({ label, v, sc, onCommit }: { label: string; v: number; sc: Scale; onCommit: (x: number) => void }) {
+function YInput({ label, v, sc, onCommit, disabled }: { label: string; v: number; sc: Scale; onCommit: (x: number) => void; disabled?: boolean }) {
   const shown = (v / sc.div).toFixed(sc.dp);
   return (
     <label className="flex items-center gap-2 text-xs">
@@ -350,13 +349,14 @@ function YInput({ label, v, sc, onCommit }: { label: string; v: number; sc: Scal
         type="number"
         step={10 ** -sc.dp}
         defaultValue={shown}
+        disabled={disabled}
         onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur(); }}
         onBlur={(e) => {
           const x = e.target.value.trim() === '' ? NaN : +e.target.value * sc.div;
           if (Number.isFinite(x)) onCommit(x);
           e.target.value = shown;
         }}
-        className="w-24 rounded border border-border bg-canvas px-2 py-1 text-right font-mono"
+        className="w-24 rounded border border-border bg-canvas px-2 py-1 text-right font-mono disabled:opacity-40"
       />
       <span className="text-muted">{sc.unit}</span>
     </label>
@@ -440,7 +440,18 @@ function RangePanel() {
   );
 }
 
-function LogPanel() {
+// Armed as the panel shows it: not for conditions of another function, cleared by its first reading.
+const shownArmed = (s: State) => s.armed && io.liveTrig(s) === s.trig;
+
+// REC while logging, ARM while waiting for the start condition.
+function LogBadge() {
+  const logging = useDev((s) => s.logging);
+  const armed = useDev(shownArmed);
+  if (logging) return <Badge tone="danger" pulse>REC</Badge>;
+  return armed ? <Badge tone="amber">ARM</Badge> : null;
+}
+
+function LogPanel({ sc }: { sc: Scale }) {
   const logged = useDev((s) => s.dstats.n);
   const logging = useDev((s) => s.logging);
   const link = useDev((s) => s.link);
@@ -461,10 +472,8 @@ function LogPanel() {
       <div className="space-y-2">
         <Row2 label="Logged rows" value={logged.toLocaleString('en')} />
         <SaveStatus />
-        <Btn tone={logging ? 'danger' : 'success'} className="w-full" disabled={!logging && !!blocked} onClick={logging ? io.stopDmmLog : io.startDmmLog}>
-          {logging ? <><Pause size={13} /> Stop logging</> : <><Play size={13} /> Start logging</>}
-        </Btn>
-        {!logging && blocked && <p className="text-[11px] text-amber">{blocked}</p>}
+        <TriggerRows sc={sc} />
+        <StartButton blocked={blocked || null} />
         <div className="grid grid-cols-2 gap-2">
           <Btn disabled={!logged} onClick={io.exportDmmLog}><Download size={13} /> CSV</Btn>
           {/* Also resets the meter's own statistics, so it works with nothing recorded. */}
@@ -472,6 +481,53 @@ function LogPanel() {
         </div>
       </div>
     </Panel>
+  );
+}
+
+// Start logging / Arm while idle (refused with the reason when `blocked`), Disarm / Stop logging after.
+function StartButton({ blocked }: { blocked: string | null }) {
+  const logging = useDev((s) => s.logging);
+  const armed = useDev(shownArmed);
+  const arms = useDev((s) => io.liveTrig(s).start !== null);
+  if (logging || armed) {
+    return <Btn tone={logging ? 'danger' : 'amber'} className="w-full" onClick={io.stopDmmLog}><Pause size={13} /> {logging ? 'Stop logging' : 'Disarm'}</Btn>;
+  }
+  return (
+    <>
+      <Btn tone="success" className="w-full" disabled={!!blocked} onClick={io.startDmmLog}><Play size={13} /> {arms ? 'Arm' : 'Start logging'}</Btn>
+      {blocked && <p className="text-[11px] text-amber">{blocked}</p>}
+    </>
+  );
+}
+
+// Start and stop conditions in the live function's unit. The start is locked once armed or logging.
+function TriggerRows({ sc }: { sc: Scale }) {
+  const trig = useDev(io.liveTrig);
+  const locked = useDev((s) => s.armed || s.logging);
+  return (
+    <div className="space-y-2 border-t border-border pt-2">
+      <CondRow label="Start when" c={trig.start} sc={sc} disabled={locked} onChange={(start) => io.setTrig({ start })} />
+      <CondRow label="Stop when" c={trig.stop} sc={sc} onChange={(stop) => io.setTrig({ stop })} />
+      {trig.start && <Toggle label="Repeat (arm again after each stop)" on={trig.repeat} onChange={(repeat) => io.setTrig({ repeat })} />}
+    </div>
+  );
+}
+
+const DIRS = [{ id: 'above' as const, label: 'above' }, { id: 'below' as const, label: 'below' }];
+
+function CondRow({ label, c, sc, disabled, onChange }: { label: string; c: Cond | null; sc: Scale; disabled?: boolean; onChange: (c: Cond | null) => void }) {
+  // Starts at the reading now: the value the user is most likely to want near.
+  const turnOn = () => onChange({ above: true, v: useDev.getState().reading?.v ?? 0 });
+  return (
+    <div className="space-y-1.5">
+      <Toggle label={label} on={c !== null} disabled={disabled} onChange={(on) => (on ? turnOn() : onChange(null))} />
+      {c && (
+        <div className="flex items-center justify-between gap-2">
+          <Seg size="xs" value={c.above ? 'above' : 'below'} options={DIRS.map((d) => ({ ...d, disabled }))} onChange={(d) => onChange({ ...c, above: d === 'above' })} />
+          <YInput label="" v={c.v} sc={sc} disabled={disabled} onCommit={(v) => onChange({ ...c, v })} />
+        </div>
+      )}
+    </div>
   );
 }
 

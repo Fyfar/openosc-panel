@@ -11,7 +11,7 @@ import { flushGen, readGen } from './gen';
 import { flushScope, forgetWav, scopeLoop } from './scope';
 
 export { download } from './core';
-export { atLimit, clearDmmData, dmmRec, exportDmmLog, logMatches, startDmmLog, stopDmmLog } from './dmm';
+export { atLimit, clearDmmData, dmmRec, exportDmmLog, liveTrig, logMatches, setTrig, startDmmLog, stopDmmLog } from './dmm';
 export { discardSaved, restoreSaved } from './saved';
 export { exportScopeCsv, scopeAuto, scopeData, scopeForce, scopeRun, scopeSingle, scopeStop } from './scope';
 export { bodeStop, bodeSweep } from './bode';
@@ -163,11 +163,11 @@ export async function setMode(m: Mode) {
   }
 }
 
-// One loop at a time, chosen by mode + profile; the generator view runs one only for a DMM log (it
-// keeps the meter profile if opened from it), the Bode view none.
+// One loop at a time, chosen by mode + profile; the generator view runs one only for a DMM log or an
+// armed trigger (it keeps the meter profile if opened from it), the Bode view none.
 function startLoop() {
-  const { mode, profile, logging } = get();
-  if ((mode === 'dmm' || (mode === 'gen' && logging)) && profile === 'XDM1041') runLoop('dmm', dmmLoop);
+  const { mode, profile, logging, armed } = get();
+  if ((mode === 'dmm' || (mode === 'gen' && (logging || armed))) && profile === 'XDM1041') runLoop('dmm', dmmLoop);
   else if (mode === 'scope' && profile === 'DS1052') runLoop('scope', scopeLoop);
   else set({ stats: `CDC · ${profile} profile · idle` });
 }

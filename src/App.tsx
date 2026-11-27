@@ -122,14 +122,20 @@ function Header() {
   );
 }
 
-// A DMM log goes on in the generator view: say so outside the multimeter, and lead back to it.
+// A DMM log, or a trigger waiting to start one, goes on in the generator view: say so outside the
+// multimeter, and lead back to it.
 function RecButton() {
-  const show = useDev((s) => s.logging && s.mode !== 'dmm');
-  if (!show) return null;
+  const state = useDev((s) => (s.mode === 'dmm' ? null : s.logging ? 'REC' : s.armed ? 'ARM' : null));
+  if (!state) return null;
+  const rec = state === 'REC';
   return (
-    <button onClick={() => void io.setMode('dmm')} className="flex items-center gap-1.5 rounded border border-danger/50 px-2 py-0.5 font-mono text-xs text-danger" title="The multimeter is logging">
-      <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-danger" />
-      REC
+    <button
+      onClick={() => void io.setMode('dmm')}
+      className={clsx('flex items-center gap-1.5 rounded border px-2 py-0.5 font-mono text-xs', rec ? 'border-danger/50 text-danger' : 'border-amber/50 text-amber')}
+      title={rec ? 'The multimeter is logging' : 'The multimeter waits for its start condition'}
+    >
+      {rec && <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-danger" />}
+      {state}
     </button>
   );
 }
