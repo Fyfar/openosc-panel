@@ -3,7 +3,7 @@ import { Info, Power } from 'lucide-react';
 import { useEffect, useRef, useState, type RefObject } from 'react';
 import { ampLimit, fmtHz, genHalvesScope, genMaxHz, HALVED_NOTE, MODELS, parseHz, SHAPES, startsFreqEntry, type Model, type Shape } from '../device';
 import { useDev, type State } from '../store';
-import { Panel, Row, Seg, Toggle } from '../ui';
+import { Panel, Row, Seg, SiField, Toggle } from '../ui';
 
 // One period of each shape, y in [0,1].
 const WAVE: Record<Shape, (p: number, duty: number) => number> = {
@@ -63,10 +63,8 @@ export function Generator() {
   const shape = SHAPES.find((s) => s.id === g.shape)!;
   const max = spec.maxHz[g.shape];
   const [note, setNote] = useState<string | null>(null);
-  const [draft, setDraft] = useState<string | null>(null);
   const freqField = useRef<HTMLInputElement>(null);
   useTypeToFocus(freqField);
-  const shownOnFocus = useRef('');
   const over = g.freq > max;
   const clampFreq = (f: number) => Math.min(max, Math.max(spec.minHz, f));
 
@@ -77,10 +75,6 @@ export function Generator() {
     set({ shape: id, freq: r.freq });
   };
   const commitFreq = (text: string) => {
-    setDraft(null);
-    // The field shows 5 digits: applying it untouched would round the frequency, or undo a value
-    // that changed while the field was focused.
-    if (text === shownOnFocus.current) return;
     const f = parseHz(text);
     if (f === null) setNote(`"${text.trim()}" is not a frequency: try 1k, 2.5 MHz or 500 mHz.`);
     else if (f < spec.minHz) setNote(`${fmtHz(f)} is below the ${fmtHz(spec.minHz)} minimum.`);
@@ -116,14 +110,12 @@ export function Generator() {
           right={<span className={clsx('rounded border px-2 py-0.5 text-xs font-semibold', g.out ? 'border-success/40 text-success' : 'border-border text-muted')}>{g.out ? 'OUTPUT ON' : 'OUTPUT OFF'}</span>}
         >
           <div className="flex flex-col items-center gap-4 py-4">
-            <input
-              ref={freqField}
-              aria-label="Frequency"
-              value={draft ?? fmtHz(g.freq)}
-              onFocus={(e) => { shownOnFocus.current = fmtHz(g.freq); setDraft(shownOnFocus.current); e.target.select(); }}
-              onChange={(e) => setDraft(e.target.value)}
-              onBlur={(e) => commitFreq(e.target.value)}
-              onKeyDown={(e) => e.key === 'Enter' && e.currentTarget.blur()}
+            <SiField
+              inputRef={freqField}
+              label="Frequency"
+              value={g.freq}
+              fmt={fmtHz}
+              onCommit={commitFreq}
               className={clsx(
                 'w-full max-w-xl bg-transparent text-center font-mono text-[length:clamp(2.5rem,7vw,5.5rem)] leading-none font-bold tabular-nums outline-none',
                 over ? 'text-danger' : g.out ? 'text-success' : 'text-accent',

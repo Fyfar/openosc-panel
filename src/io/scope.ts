@@ -1,9 +1,9 @@
 // Oscilloscope: settings read/write, windowed frame fetch, the live loop, run control, CSV.
-import { DESKTOP_FW, fwAtLeast, TIMEBASES, VDIV_MV } from '../device';
+import { fwHas, isBand, TIMEBASES, TRIG_TYPES, VDIV_MV, type TrigWhen } from '../device';
 import type { Frame, Meas, RecordWindow } from '../dsp';
 import { sleep, type Run } from '../link';
 import type { State } from '../store';
-import { alive, ctl, download, errText, fail, get, link, nearest, now, num, on, remote, set } from './core';
+import { alive, ctl, download, errText, fail, finite, get, link, nearest, now, num, on, remote, set } from './core';
 
 type Scope = State['scope'];
 type Status = State['scopeStatus'];
@@ -20,7 +20,7 @@ const MEAS_MS = 300;
 // WAV:FRAM? waits for a fresh record and holds the link meanwhile; longer records use the
 // per-channel path, whose waits end after 1 s, so a settings change never queues behind a record.
 const FRAME_MAX_MS = 1000;
-const desktop = () => fwAtLeast(get().idn?.fw, DESKTOP_FW);
+const desktop = () => fwHas(get().idn?.fw, 'desktop');
 const dec = new TextDecoder();
 // Status (run state, sample rate, counters, Remote) every 500 ms. Settings as often while the device
 // keys work; under SYST:REM only the app changes them (MENU hold ends Remote, seen in the status), so
@@ -80,17 +80,52 @@ function scopeDiff(a: Scope, b: Scope): string[] {
   });
   if (a.tb !== b.tb) c.push(`TIM:SCAL ${TIMEBASES[b.tb]}`);
   if (a.hoff !== b.hoff) c.push(`TIM:OFFS ${+b.hoff.toPrecision(4)}`);
-  const t = a.trig, u = b.trig;
-  if (t.src !== u.src) c.push(`TRIG:EDGE:SOUR CHAN${u.src}`);
-  if (t.slope !== u.slope) c.push(`TRIG:EDGE:SLOP ${u.slope}`);
-  if (t.level !== u.level) c.push(`TRIG:EDGE:LEV ${+u.level.toPrecision(4)}`);
-  if (t.nrej !== u.nrej) c.push(`TRIG:EDGE:NREJ ${u.nrej ? 'ON' : 'OFF'}`);
-  if (t.pos !== u.pos) c.push(`TRIG:POS ${u.pos}`);
+  c.push(...trigDiff(a.trig, b.trig, qualTrig()));
   if (a.sweep !== b.sweep && b.sweep !== 'SING') c.push(`TRIG:SWE ${b.sweep}`);
   if (a.mdepth !== b.mdepth) c.push(`ACQ:MDEP ${b.mdepth}`);
   if (a.roll !== b.roll) c.push(`ACQ:ROLL ${b.roll ? 'ON' : 'OFF'}`);
   if (a.interleave !== b.interleave) c.push(`ACQ:INT ${b.interleave}`);
   return c;
+}
+
+type Trig = Scope['trig'];
+const volts = (v: number) => +v.toPrecision(4);
+
+// qual: the firmware has the qualified types (FW.qualTrig); without it only Edge settings go out.
+// TRIG:MODE goes first: the meter may move the levels on a type change (measured 0.21.19), and
+// flushScope's readSoon reads them back. TRIG:EDGE:LEV in a band type writes a raw band end, so the
+// band types set their levels with LEV:LOW/HIGH only.
+export function trigDiff(t: Trig, u: Trig, qual: boolean): string[] {
+  const c: string[] = [];
+  const band = qual && isBand(u.type);
+  if (qual && t.type !== u.type) c.push(`TRIG:MODE ${u.type}`);
+  if (t.src !== u.src) c.push(`TRIG:EDGE:SOUR CHAN${u.src}`);
+  if (t.slope !== u.slope) c.push(`TRIG:EDGE:SLOP ${u.slope}`); // also TRIG:POL: one firmware field
+  if (qual) c.push(...qualDiff(t, u));
+  if (band) c.push(...bandCmds(t, u));
+  else if (t.level !== u.level) c.push(`TRIG:EDGE:LEV ${volts(u.level)}`);
+  if (t.nrej !== u.nrej) c.push(`TRIG:EDGE:NREJ ${u.nrej ? 'ON' : 'OFF'}`);
+  if (t.pos !== u.pos) c.push(`TRIG:POS ${u.pos}`);
+  return c;
+}
+
+function qualDiff(t: Trig, u: Trig): string[] {
+  const c: string[] = [];
+  if (t.when !== u.when) c.push(`TRIG:WHEN ${u.when}`);
+  if (t.tLow !== u.tLow) c.push(`TRIG:TIME:LOW ${u.tLow}`);
+  if (t.tUpp !== u.tUpp) c.push(`TRIG:TIME:UPP ${u.tUpp}`);
+  return c;
+}
+
+// The band's changed ends as `TRIG:LEV:LOW <v>` / `TRIG:LEV:HIGH <v>` (volts via `volts()`).
+// The meter refuses (-222) a HIGH below its current LOW, or a LOW above its current HIGH (measured
+// 0.21.19), so the order must keep every intermediate band valid, for a move up, a move down, a widen
+// and a narrow. `t` is what the meter has now, `u` what we want.
+function bandCmds(t: Pick<Trig, 'lvLow' | 'lvHigh'>, u: Pick<Trig, 'lvLow' | 'lvHigh'>): string[] {
+  const low = t.lvLow !== u.lvLow ? [`TRIG:LEV:LOW ${volts(u.lvLow)}`] : [];
+  const high = t.lvHigh !== u.lvHigh ? [`TRIG:LEV:HIGH ${volts(u.lvHigh)}`] : [];
+  // Rising, the new high is above the old low; otherwise the new low goes first, below the old high.
+  return u.lvHigh > t.lvHigh ? [...high, ...low] : [...low, ...high];
 }
 
 export async function flushScope(a: Scope, b: Scope) {
@@ -108,8 +143,15 @@ const SETTINGS_Q = {
   d1: 'CHAN1:DISP?', c1: 'CHAN1:COUP?', p1: 'CHAN1:PROB?', s1: 'CHAN1:SCAL?', o1: 'CHAN1:OFFS?',
   d2: 'CHAN2:DISP?', c2: 'CHAN2:COUP?', p2: 'CHAN2:PROB?', s2: 'CHAN2:SCAL?', o2: 'CHAN2:OFFS?',
 };
+// Qualified trigger settings (FW.qualTrig): never sent to older firmware, which answers -113. No TRIG:POL?:
+// it is TRIG:EDGE:SLOP? (one field). LEV:LOW/HIGH answer in every type (measured 0.21.19).
+const QUAL_Q = {
+  type: 'TRIG:MODE?', when: 'TRIG:WHEN?', tLow: 'TRIG:TIME:LOW?', tUpp: 'TRIG:TIME:UPP?', lvLow: 'TRIG:LEV:LOW?', lvHigh: 'TRIG:LEV:HIGH?',
+};
 type Settings = Record<keyof typeof SETTINGS_Q, string>;
+type QualReply = Record<keyof typeof QUAL_Q, string>;
 type StatusReply = Record<keyof typeof STATUS_Q, string>;
+const qualTrig = () => fwHas(get().idn?.fw, 'qualTrig');
 
 const byKey = <K extends string>(q: Record<K, string>, vals: string[]) =>
   Object.fromEntries(Object.keys(q).map((k, i) => [k, vals[i]])) as Record<K, string>;
@@ -136,11 +178,14 @@ const sweepOf = (r: string): Scope['sweep'] => (r.startsWith('SING') ? 'SING' : 
 
 // One device pass per query: ~1 ms inside the held-frame window, ~24 ms outside it.
 async function readScope(force = false, settings = true) {
-  const status = Object.values(STATUS_Q), more = settings ? Object.values(SETTINGS_Q) : [];
+  const status = Object.values(STATUS_Q), base = Object.values(SETTINGS_Q), qual = settings && qualTrig();
+  const more = settings ? [...base, ...(qual ? Object.values(QUAL_Q) : [])] : [];
   // *CLS: the counter queues -230 when there's no signal; don't let the queue fill.
   const vals = await link.texts([...status, ...more, '*CLS']);
   const s = byKey(STATUS_Q, vals), swe = s.swe.toUpperCase();
-  if (settings) remote('scope', { ...settingsOf(byKey(SETTINGS_Q, vals.slice(status.length))), sweep: sweepOf(swe) }, force);
+  const at = status.length + base.length;
+  const q = qual ? byKey(QUAL_Q, vals.slice(at)) : null;
+  if (settings) remote('scope', { ...settingsOf(byKey(SETTINGS_Q, vals.slice(status.length, at)), q), sweep: sweepOf(swe) }, force);
   else if (swe !== 'NAN') remote('scope', { sweep: sweepOf(swe) }, force);
   applyStatus(s, swe);
 }
@@ -160,7 +205,19 @@ function applyStatus(r: StatusReply, swe: string) {
   if (!on(r.rem)) due.settings = 0; // Remote ended on the device (MENU hold): its keys may have moved things
 }
 
-function settingsOf(r: Settings): Partial<Scope> {
+const TRIG_TYPE_IDS = TRIG_TYPES.map((t) => t.id);
+const TRIG_WHENS: TrigWhen[] = ['ANY', 'LESS', 'GRE', 'INS', 'OUTS'];
+const oneOf = <T extends string>(r: string, all: readonly T[], cur: T) => all.find((x) => x === r.toUpperCase()) ?? cur;
+
+function qualOf(r: QualReply, t: Scope['trig']): Partial<Scope['trig']> {
+  return {
+    type: oneOf(r.type, TRIG_TYPE_IDS, t.type), when: oneOf(r.when, TRIG_WHENS, t.when),
+    tLow: finite(r.tLow, t.tLow), tUpp: finite(r.tUpp, t.tUpp), lvLow: finite(r.lvLow, t.lvLow), lvHigh: finite(r.lvHigh, t.lvHigh),
+  };
+}
+
+// q: the qualified trigger replies, null on firmware without them (the fields then keep their value).
+function settingsOf(r: Settings, q: QualReply | null): Partial<Scope> {
   const cur = get().scope;
   const ch = (i: 0 | 1) => {
     const n = i + 1, probe = num(r[`p${n}` as 'p1']), vd = num(r[`s${n}` as 's1']), offs = num(r[`o${n}` as 'o1']);
@@ -179,6 +236,8 @@ function settingsOf(r: Settings): Partial<Scope> {
     ...(Number.isFinite(tb) ? { tb: TIMEBASES.indexOf(nearest(TIMEBASES, tb)) } : {}),
     ...(Number.isFinite(num(r.hoff)) ? { hoff: num(r.hoff) } : {}),
     trig: {
+      ...cur.trig,
+      ...(q ? qualOf(q, cur.trig) : {}),
       src: r.src.endsWith('2') ? 2 : 1,
       slope: r.slope.startsWith('NEG') ? 'NEG' : 'POS',
       level: Number.isFinite(num(r.lev)) ? num(r.lev) : cur.trig.level,

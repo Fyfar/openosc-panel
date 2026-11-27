@@ -1,15 +1,17 @@
 import { clsx } from 'clsx';
 import { ChevronRight, Crosshair, Info, Download, ImageDown, Play, Sparkles, Square, StepForward, Waves, Zap } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
-import { fmtStable, fmtTime, fmtVolt, genHalvesScope, HALVED_NOTE, interleaveBlockers, MEM_DEPTHS, PROBES, TIMEBASES, vdiv, VDIV_MV } from '../device';
-import { extent, measure, type Frame, type Meas } from '../dsp';
+import { decidesHigh, fmtStable, fmtTime, fmtVolt, genHalvesScope, HALVED_NOTE, interleaveBlockers, isBand, MEM_DEPTHS, PROBES, TIMEBASES, vdiv, VDIV_MV } from '../device';
+import { measure, type Frame, type Meas } from '../dsp';
 import * as io from '../io';
 import { useDev, type Channel, type CursorMode, type State } from '../store';
-import { Btn, CH_COLOR, Columns, M, Panel, Row, Seg, Select, Stepper, strokeGrid, Toggle } from '../ui';
+import { Btn, CH_COLOR, Columns, M, Panel, Row, Seg, Select, Slider, Stepper, strokeGrid, Toggle } from '../ui';
 import { COLOR as FFT_COLOR, fftPngText, FONT, SpectrumPanel, SpectrumReadout, wrap } from './ScopeFft';
+import { TriggerBody, trigText } from './ScopeTrigger';
 
-// Roll runs with Auto sweep from 200 ms/div (wiki: Oscilloscope → Roll mode).
-const isRolling = (s: State['scope']) => s.roll && s.sweep === 'AUTO' && TIMEBASES[s.tb] >= 0.2;
+// Roll runs with Auto sweep from 200 ms/div (wiki: Oscilloscope → Roll mode), Edge trigger only
+// (firmware request.hpp rolling(): a qualified type takes finite records).
+const isRolling = (s: State['scope']) => s.roll && s.sweep === 'AUTO' && TIMEBASES[s.tb] >= 0.2 && s.trig.type === 'EDGE';
 
 // Cursor lines: time a/b and level ya/yb, normalized to the plot (0 = left / top).
 type CurLine = 'a' | 'b' | 'ya' | 'yb';
@@ -102,7 +104,7 @@ export function Scope() {
                 <span className="text-amber"> · {status.stat === 'WAIT' ? 'waiting' : 'capturing'} {Math.round((performance.now() - status.capture.since) / 1000)} s</span>
               )}
             </span>
-            <span>T {s.trig.slope === 'POS' ? '↑' : '↓'} CH{s.trig.src} {fmtVolt(s.trig.level)}</span>
+            <span>T {trigText(s.trig)}</span>
           </div>
           <canvas
             ref={canvas}
@@ -128,38 +130,6 @@ export function Scope() {
   );
 }
 
-function TriggerBody({ s, set, say }: { s: State['scope']; set: (p: Partial<State['scope']>) => void; say: (m: string) => void }) {
-  const src = s.ch[s.trig.src - 1], srcVd = vdiv(src);
-  // TIM:OFFS and TRIG:POS set the same firmware value (the trigger position), so both go to centre.
-  const center = () => set({ hoff: 0, trig: { ...s.trig, pos: 50 } });
-  // The device's hold-F3 / "Trigger 50%": level to the signal midpoint, pretrigger 50 %.
-  const trigger50 = () => {
-    const f = io.scopeData.frames.find((fr) => fr.ch === s.trig.src - 1);
-    if (!f) return say('No frame from the trigger channel yet');
-    const lo = extent(f.lo ?? f.volts).mn, hi = extent(f.hi ?? f.volts).mx;
-    set({ hoff: 0, trig: { ...s.trig, level: +((lo + hi) / 2).toPrecision(4), pos: 50 } });
-  };
-  return (
-    <div className="space-y-3">
-        <Row label="Slope">
-          <Seg size="xs" value={s.trig.slope} options={[{ id: 'POS', label: '↑ Rising' }, { id: 'NEG', label: '↓ Falling' }]} onChange={(slope) => set({ trig: { ...s.trig, slope } })} />
-        </Row>
-        <Row label="Sweep">
-          <Seg size="xs" value={s.sweep} options={[{ id: 'AUTO', label: 'Auto' }, { id: 'NORM', label: 'Normal' }, { id: 'SING', label: 'Single' }]} onChange={(sweep) => (sweep === 'SING' ? void io.scopeSingle() : set({ sweep }))} />
-        </Row>
-        <Slider
-          label="Level" value={s.trig.level} min={(-4 - src.offsetDiv) * srcVd} max={(4 - src.offsetDiv) * srcVd} step={srcVd / 25}
-          show={fmtVolt(s.trig.level)} color={CH_COLOR[s.trig.src - 1]} onChange={(level) => set({ trig: { ...s.trig, level } })}
-        />
-        <Slider label="Position" value={s.trig.pos} min={0} max={100} step={0.5} show={`${s.trig.pos.toFixed(1)} %`} onChange={(pos) => set({ trig: { ...s.trig, pos } })} />
-        <Toggle label="Noise reject" on={s.trig.nrej} onChange={(nrej) => set({ trig: { ...s.trig, nrej } })} />
-        <div className="flex gap-2">
-          <Btn className="flex-1" title="Level to the signal midpoint, pretrigger 50 %" onClick={trigger50}>Trigger 50 %</Btn>
-          <Btn className="flex-1" title="Trigger mark to the middle of the screen (pretrigger 50 %)" onClick={center}>Center trigger</Btn>
-        </div>
-    </div>
-  );
-}
 
 function InterleaveState({ requested, state }: { requested: State['scope']['interleave']; state: State['scopeStatus']['interleave'] }) {
   if (requested === 'OFF' || !state) return null;
@@ -248,7 +218,7 @@ function Sidebar({ s, set, setCh, say }: {
           <Slider label="Offset" value={s.hoff / tb} min={-5} max={5} step={0.1} show={fmtTime(s.hoff)} onChange={(d) => set({ hoff: d * tb })} />
         </div>
       </Fold>
-      <Fold title="Trigger" summary={`CH${s.trig.src} ${s.trig.slope === 'POS' ? '↑' : '↓'} ${fmtVolt(s.trig.level)} · ${SWEEP_LABEL[s.sweep]}`} {...fold('trig')}
+      <Fold title="Trigger" summary={`${trigText(s.trig)} · ${SWEEP_LABEL[s.sweep]}`} {...fold('trig')}
         tail={<Seg size="xs" value={s.trig.src} options={[{ id: 1, label: 'CH1', disabled: !s.ch[0].on }, { id: 2, label: 'CH2', disabled: !s.ch[1].on }]} onChange={(src) => set({ trig: { ...s.trig, src } })} />}
       >
         <TriggerBody s={s} set={set} say={say} />
@@ -285,19 +255,6 @@ function AcquisitionBody({ s, set }: { s: State['scope']; set: (p: Partial<State
   );
 }
 
-function Slider({ label, value, min, max, step, show, onChange, color }: {
-  label: string; value: number; min: number; max: number; step: number; show: string; onChange: (v: number) => void; color?: string;
-}) {
-  return (
-    <label className="block text-xs">
-      <div className="mb-1 flex justify-between">
-        <span className="text-muted">{label}</span>
-        <span className="font-mono tabular-nums" style={{ color }}>{show}</span>
-      </div>
-      <input type="range" min={min} max={max} step={step} value={value} onChange={(e) => onChange(+e.target.value)} onDoubleClick={() => onChange(0)} className="w-full" style={{ accentColor: color ?? '#3b82f6' }} />
-    </label>
-  );
-}
 
 const SRC_HINT: Record<string, string> = {
   EDGE: 'device: from edges in the screen window',
@@ -475,6 +432,18 @@ function drawTrace(g: CanvasRenderingContext2D, W: number, H: number, f: Frame, 
   g.stroke();
 }
 
+// tag: 'T' on the level the trigger decides on (the Edge look); a band's other end is dotted, tagged H
+// or L. Dots carry less ink than dashes, so that line is stronger to read alike (owner, bench 0.17.0).
+function levelLine(g: CanvasRenderingContext2D, W: number, y: number, color: string, tag: 'T' | 'H' | 'L', dpr: number) {
+  const decides = tag === 'T';
+  g.strokeStyle = color + (decides ? '55' : 'cc');
+  g.setLineDash(decides ? [6 * dpr, 6 * dpr] : [2 * dpr, 3 * dpr]);
+  g.lineWidth = decides ? 1 : dpr;
+  line(g, 0, y, W, y);
+  g.setLineDash([]);
+  marker(g, W, y, decides ? color : color + 'cc', tag, 'left', dpr);
+}
+
 function drawMarkers(g: CanvasRenderingContext2D, W: number, H: number, s: State['scope'], dpr: number) {
   const dy = H / 8;
   s.ch.forEach((ch, i) => {
@@ -483,13 +452,11 @@ function drawMarkers(g: CanvasRenderingContext2D, W: number, H: number, s: State
     const Y = (v: number) => H / 2 - ((v + offs) / vd) * dy;
     marker(g, 0, clampY(Y(0), H), CH_COLOR[i], String(i + 1), 'right', dpr);
     if (s.trig.src !== i + 1) return;
-    const yl = clampY(Y(s.trig.level), H);
-    g.strokeStyle = CH_COLOR[i] + '55';
-    g.setLineDash([6 * dpr, 6 * dpr]);
-    g.lineWidth = 1;
-    line(g, 0, yl, W, yl);
-    g.setLineDash([]);
-    marker(g, W, yl, CH_COLOR[i], 'T', 'left', dpr);
+    const t = s.trig;
+    if (!isBand(t.type)) return levelLine(g, W, clampY(Y(t.level), H), CH_COLOR[i], 'T', dpr);
+    const high = decidesHigh(t);
+    levelLine(g, W, clampY(Y(t.lvHigh), H), CH_COLOR[i], high ? 'T' : 'H', dpr);
+    levelLine(g, W, clampY(Y(t.lvLow), H), CH_COLOR[i], high ? 'L' : 'T', dpr);
   });
   const xTrig = (s.trig.pos / 100) * W;
   g.fillStyle = '#f59e0b';
@@ -559,7 +526,7 @@ function pngLines(g: CanvasRenderingContext2D, width: number, withFft: boolean) 
   const add = (parts: string[], sep: string, color: string) => { for (const text of wrap(g, parts, sep, width)) lines.push({ text, color }); };
   add([
     `${fmtTime(TIMEBASES[s.tb])}/div`, fmtSps(scopeStatus.srate), `${(s.mdepth / 1024).toFixed(0)}K pts`,
-    `trigger CH${s.trig.src} ${s.trig.slope === 'POS' ? '↑' : '↓'} ${fmtVolt(s.trig.level)}`,
+    `trigger ${trigText(s.trig)}`,
   ], ' · ', '#8b949e');
   s.ch.forEach((c, i) => {
     if (!c.on) return;

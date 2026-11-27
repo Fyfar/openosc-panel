@@ -1,10 +1,10 @@
 // Self-check for the pure logic: typed frequency, DMM scaling, Bode maths/plan/restore,
 // scope measurements and generator command order. Run: `npm run check`.
 import assert from 'node:assert/strict';
-import { bodeEta, bodePlan, bodeSlow, dmmScale, fmtStable, fwAtLeast, genMaxHz, interleaveBlockers, parseHz, scaleFor, startsFreqEntry, VDIV_MV } from '../src/device.ts';
+import { bodeEta, bodePlan, bodeSlow, decidesHigh, dmmScale, fmtStable, fwAtLeast, fwHas, genMaxHz, interleaveBlockers, parseHz, parseSI, scaleFor, startsFreqEntry, VDIV_MV, type TrigType } from '../src/device.ts';
 import { addStat, emptyStats, FFT_WINDOWS, fftNotes, fftSpanHz, bodeTone, findPeak, histogram, spanAtLeast, unwrapPhase, measure, peakIn, peakNear, spectrum, spectrumOf, stdDev, yFloor, windowExtent, heldIdx, type FftWindow, type Frame } from '../src/dsp.ts';
-import { parseFrame, parseMeas, screenWindow } from '../src/io/scope.ts';
-import { pointCmds, rerange, scopeRestore, SWEEP_SCOPE } from '../src/io/bode.ts';
+import { parseFrame, parseMeas, screenWindow, trigDiff } from '../src/io/scope.ts';
+import { pointCmds, rerange, scopeRestore, sweepScope } from '../src/io/bode.ts';
 import { dmmDiff } from '../src/io/dmm.ts';
 import { genDiff } from '../src/io/gen.ts';
 import { unsavedData, useDev } from '../src/store.ts';
@@ -22,6 +22,16 @@ for (const [text, hz] of [
   ['1.0000 kHz', 1e3], ['.5k', 500], ['50', 50], ['1.2.3', null], ['abc', null], ['', null], ['0', null], ['-5', null],
 ] as const) {
   assert.equal(parseHz(text), hz, `parseHz("${text}")`);
+  checks++;
+}
+
+// --- parseSI: the one notation for typed numbers; unit optional, any case; m milli, M mega -----
+for (const [text, unit, v] of [
+  ['50us', 's', 50e-6], ['50 µs', 's', 50e-6], ['50 μs', 's', 50e-6], ['1.2ms', 's', 0.0012], ['2e-6', 's', 2e-6],
+  ['1 S', 's', 1], ['5 m', 's', 0.005], ['3Ms', 's', 3e6], ['-1.5 V', 'V', -1.5], ['1G', 'Hz', 1e9], ['7 ns', 's', 7e-9],
+  ['5 Hz', 's', null], ['5 ss', 's', null], ['5 x', 's', null], ['us', 's', null], ['1e', 's', null], ['5 constructor', 's', null],
+] as const) {
+  assert.equal(parseSI(text, unit), v, `parseSI("${text}", ${unit})`);
   checks++;
 }
 
@@ -352,6 +362,16 @@ assert.equal(genMaxHz('ZT703S', '0.21.8').POS, 223_214);
 assert.equal(genMaxHz('ZT703S', '0.21.8').HALF, 129_000);
 assert.equal(genMaxHz('ZT703S', '0.21.7').SIN, 343_999);
 assert.equal(genMaxHz('ZT706S', '0.21.9').SIN, 10_000_000);
+assert.equal(genMaxHz('ZT703S', undefined).SIN, 343_999, 'unknown firmware keeps the old ceiling');
+// fwHas: each feature from its version; below the minimum or unreadable, none.
+for (const [fw, f, want] of [
+  ['0.21.19', 'qualTrig', true], ['0.22.4', 'qualTrig', true], ['0.21.14', 'qualTrig', false],
+  ['0.21.14', 'desktop', true], ['0.21.7', 'desktop', false], ['0.21.4', 'min', true],
+  ['0.21.3', 'min', false], ['0.20.9', 'min', false], ['garbage', 'min', false], [undefined, 'desktop', false],
+] as const) {
+  assert.equal(fwHas(fw, f), want, `fwHas(${fw}, ${f})`);
+  checks++;
+}
 assert.deepEqual(interleaveBlockers(4 | 8 | 64), ['timebase', 'not CH1 alone', 'generator DAC']);
 checks += 6;
 
@@ -393,6 +413,42 @@ checks += 6;
   checks += 4;
 }
 
+// --- trigDiff: the meter refuses (-222) a band end that crosses the other (measured 0.21.19). Replaying the
+// commands on that rule, every move must end at the target with no refusal. EDGE:LEV never in a band type.
+{
+  const T0 = useDev.getState().scope.trig;
+  const at = (type: TrigType, lvLow: number, lvHigh: number) => ({ ...T0, type, lvLow, lvHigh });
+  const replay = (from: { lvLow: number; lvHigh: number }, cmds: string[]) => {
+    const band = { low: from.lvLow, high: from.lvHigh };
+    for (const c of cmds) {
+      const [, end, v] = c.match(/^TRIG:LEV:(LOW|HIGH) (\S+)$/) ?? [];
+      if (!end) continue;
+      if (end === 'LOW' ? +v > band.high : +v < band.low) assert.fail(`-222: ${c} with band ${band.low}..${band.high} (${cmds.join(' | ')})`);
+      band[end === 'LOW' ? 'low' : 'high'] = +v;
+    }
+    return [band.low, band.high];
+  };
+  for (const [what, from, to] of [
+    ['up past the old high', [0.5, 1], [1.5, 2]], ['down past the old low', [1.5, 2], [0.5, 1]],
+    ['widen', [1, 1.5], [0.5, 2]], ['narrow', [0.5, 2], [1, 1.5]], ['high only', [0.5, 1], [0.5, 3]], ['low only', [0.5, 1], [0.8, 1]],
+  ] as const) {
+    for (const type of ['RUNT', 'SLOP'] as const) {
+      const cmds = trigDiff(at(type, ...from), at(type, ...to), true);
+      assert.deepEqual(replay({ lvLow: from[0], lvHigh: from[1] }, cmds), [...to], `${type} band ${what}`);
+      assert.ok(!cmds.some((c) => c.startsWith('TRIG:EDGE:LEV')), `${type}: no EDGE:LEV for a band`);
+      checks += 2;
+    }
+  }
+  assert.deepEqual(trigDiff(at('RUNT', 0.5, 1), at('RUNT', 0.5, 1), true), [], 'unchanged band sends nothing');
+  // The deciding level (firmware docs/SCOPE_TRIGGERS.md): runt + low, runt − high, rise high, fall low.
+  assert.deepEqual((['RUNT', 'SLOP'] as const).flatMap((type) => (['POS', 'NEG'] as const).map((slope) => decidesHigh({ type, slope }))), [false, true, true, false]);
+  // A type change goes first; Pulse keeps the single level.
+  assert.deepEqual(trigDiff(at('EDGE', 0, 0), { ...at('PULS', 0, 0), when: 'LESS', level: 2 }, true), ['TRIG:MODE PULS', 'TRIG:WHEN LESS', 'TRIG:EDGE:LEV 2']);
+  // Older firmware: whatever the store says, only the Edge settings go out.
+  assert.deepEqual(trigDiff(at('EDGE', 0, 0), { ...at('RUNT', 0.5, 1), when: 'ANY', tUpp: 2e-6, level: 1 }, false), ['TRIG:EDGE:LEV 1']);
+  checks += 4;
+}
+
 // --- genDiff: SOUR:FUNC must never be sent while the frequency is over the new shape's limit
 {
   const g = useDev.getState().gen;
@@ -430,12 +486,13 @@ checks += 6;
 // --- Bode restore covers everything the sweep touches on the scope -------------------------
 {
   const head = (c: string) => c.split(' ')[0];
-  const touched = new Set([...SWEEP_SCOPE, ...pointCmds(1000, 1e-3), 'CHAN1:SCAL 1', 'CHAN2:SCAL 1'].map(head).filter((h) => !h.startsWith('SOUR') && h !== 'RUN'));
+  const touched = new Set([...sweepScope(true), ...pointCmds(1000, 1e-3), 'CHAN1:SCAL 1', 'CHAN2:SCAL 1'].map(head).filter((h) => !h.startsWith('SOUR') && h !== 'RUN'));
   assert.deepEqual(pointCmds(1000, 1e-3, 1e-3), ['SOUR:FREQ 1000'], 'an unchanged timebase is not sent again');
   checks++;
   const saved = {
     tb: '0.001', hoff: '0', swe: 'NORMal', stat: 'STOP', src: 'CHAN2', d1: '1', d2: '0',
     s1: '0.5', s2: '2', o1: '0.1', o2: '-0.4', p1: '10', p2: '1', c1: 'DC', c2: 'GND', roll: '1', mdep: '2.58048e+5',
+    slope: 'NEG', nrej: '1', lev: '1.44375e+0', mode: 'RUNT',
   };
   const restore = scopeRestore(saved);
   // ACQ:MDEP? is the planned length: 258 048 sent back would select 512K (measured), so snap it.
@@ -443,7 +500,7 @@ checks += 6;
   const at = (h: string) => restore.findIndex((c) => c.startsWith(h));
   assert.ok(at('ACQ:MDEP') > at('CHAN1:DISP') && at('ACQ:MDEP') > at('CHAN2:DISP'), 'depth restored after the channels');
   assert.ok(!scopeRestore({ ...saved, c1: '', mdep: 'NAN' }).some((c) => c.startsWith('CHAN1:COUP') || c.startsWith('ACQ:MDEP')), 'unreported coupling/depth skipped');
-  assert.ok(SWEEP_SCOPE.indexOf('ACQ:MDEP 32768') > SWEEP_SCOPE.indexOf('CHAN2:DISP ON'), 'sweep: 32 768 per channel of two = the 64K budget, the smallest');
+  assert.ok(sweepScope(true).indexOf('ACQ:MDEP 32768') > sweepScope(true).indexOf('CHAN2:DISP ON'), 'sweep: 32 768 per channel of two = the 64K budget, the smallest');
   // ACQ:MDEP is per enabled channel (firmware RecordBudget::covering): 2 channels on a 64K budget report 32 768.
   const two = (mdep: string) => scopeRestore({ ...saved, d2: '1', mdep }).find((c) => c.startsWith('ACQ:MDEP'));
   assert.deepEqual([two('3.2768e+4'), two('1.26976e+5'), two('2.58048e+5')], ['ACQ:MDEP 32768', 'ACQ:MDEP 131072', 'ACQ:MDEP 262144']);
@@ -453,6 +510,18 @@ checks += 6;
   assert.ok(scopeRestore({ ...saved, swe: 'SINGle', stat: 'WAIT' }).at(-1) === 'SING', 'single is restored with SING');
   assert.ok(!scopeRestore({ ...saved, s1: '' }).some((c) => c.startsWith('CHAN1:SCAL')), 'missing value is skipped');
   checks += 4;
+  // The trigger type: Edge before any channel change, the user's type back only after the channels and the
+  // level (in Runt/Rise-fall a V/div or offset change clamps the band's other level to the screen).
+  const sweep = sweepScope(true), first = (list: string[], re: RegExp) => list.findIndex((c) => re.test(c));
+  const last = (list: string[], re: RegExp) => list.findLastIndex((c) => re.test(c));
+  assert.ok(first(sweep, /^TRIG:MODE EDGE$/) === 0 && first(sweep, /^CHAN\d:(SCAL|OFFS)/) > 0, `sweep: Edge first (${sweep.join('; ')})`);
+  assert.ok(!sweepScope(false).some((c) => c.startsWith('TRIG:MODE')), 'older firmware: no TRIG:MODE');
+  assert.ok(sweep.includes('TRIG:EDGE:LEV 0') && sweep.includes('TRIG:EDGE:SLOP POS') && sweep.includes('TRIG:EDGE:NREJ OFF'), 'an edge the AC sine always crosses');
+  const lev = first(restore, /^TRIG:EDGE:LEV /), mode = first(restore, /^TRIG:MODE /);
+  assert.ok(lev > last(restore, /^CHAN\d:(SCAL|OFFS|PROB)/) && mode > lev, `restore: channels, then level, then type (${restore.join('; ')})`);
+  assert.ok(restore.includes('TRIG:EDGE:LEV 1.44375') && restore.includes('TRIG:MODE RUNT') && restore.includes('TRIG:EDGE:SLOP NEG') && restore.includes('TRIG:EDGE:NREJ ON'));
+  assert.ok(!scopeRestore({ ...saved, mode: '' }).some((c) => c.startsWith('TRIG:MODE')), 'no type read (older firmware): none restored');
+  checks += 6;
 }
 
 // --- unsavedData: the reload/close guard fires exactly when a log or Bode result would be lost

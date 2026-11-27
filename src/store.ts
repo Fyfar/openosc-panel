@@ -1,11 +1,17 @@
 import { create } from 'zustand';
-import type { DmmFunc, HoldMode, Mode, Model, Profile, Shape } from './device';
+import type { DmmFunc, HoldMode, Mode, Model, Profile, Shape, TrigType, TrigWhen } from './device';
 import { emptyStats, type DmmStats, type FftSpan, type FftWindow } from './dsp';
 
 export type LinkState = 'disconnected' | 'connecting' | 'connected' | 'switching';
 
 export type Channel = { on: boolean; coup: 'DC' | 'AC'; probe: number; vdivMv: number; offsetDiv: number };
 export type Sweep = 'AUTO' | 'NORM' | 'SING';
+// slope: also the qualified types' polarity (one firmware field). level: Edge and Pulse; lvLow/lvHigh:
+// the Runt and Rise/fall band (volts); tLow/tUpp: time limits (seconds).
+export type ScopeTrig = {
+  type: TrigType; src: 1 | 2; slope: 'POS' | 'NEG'; level: number; nrej: boolean; pos: number;
+  when: TrigWhen; tLow: number; tUpp: number; lvLow: number; lvHigh: number;
+};
 export type CursorMode = 'OFF' | 'T' | 'V' | 'TV'; // the device's Off / Time / Level / Time+Level
 export type FftScale = 'DBV' | 'DBFS' | 'LIN';
 export type SaveOff = 'unavailable' | 'full' | 'other-tab' | 'failed'; // why the DMM recording isn't saved
@@ -21,6 +27,7 @@ export type State = {
   error: string | null;
   errors: number;
   idn: { model: string; serial: string; fw: string } | null;
+  fwWarn: string | null; // firmware below FW.min or unreadable ('' then): connect waits for answerFw
   model: Model; // detected on connect (SOUR:VOLT? exists on ZT706S only)
   profile: Profile;
   mode: Mode;
@@ -59,7 +66,7 @@ export type State = {
     ch: [Channel, Channel];
     tb: number; // index into TIMEBASES
     hoff: number; // seconds, time at screen centre
-    trig: { src: 1 | 2; slope: 'POS' | 'NEG'; level: number; nrej: boolean; pos: number };
+    trig: ScopeTrig;
     mdepth: number;
     roll: boolean;
     interleave: 'OFF' | 'ON' | 'AUTO'; // AUTO: the firmware's rule (both boards, measured ZT703S 0.21.9)
@@ -87,6 +94,7 @@ export const useDev = create<State>((set) => ({
   error: null,
   errors: 0,
   idn: null,
+  fwWarn: null,
   model: 'ZT703S',
   profile: 'DS1052',
   mode: 'scope',
@@ -126,7 +134,7 @@ export const useDev = create<State>((set) => ({
     ],
     tb: 15,
     hoff: 0,
-    trig: { src: 1, slope: 'POS', level: 0, nrej: false, pos: 50 },
+    trig: { type: 'EDGE', src: 1, slope: 'POS', level: 0, nrej: false, pos: 50, when: 'GRE', tLow: 1e-6, tUpp: 1e-5, lvLow: 0, lvHigh: 0 },
     mdepth: 131072,
     roll: false,
     interleave: 'OFF',
