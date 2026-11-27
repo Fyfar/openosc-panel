@@ -68,13 +68,26 @@ export function unwrapPhase(ph: number[]): number[] {
   return out;
 }
 
-// --- Bode analysis: a port of the meter's own (OpenOSC acquisition/bode_analysis.cpp, 0.21.14) so both
-// report the same numbers for the same points. Points are all valid here (io/bode.ts drops the rest).
+// --- Bode analysis: the meter's own (OpenOSC acquisition/bode_analysis.cpp, 0.21.14) with one deliberate
+// difference: the meter puts every −3 dB level under the peak, which is wrong for a low-pass or high-pass
+// whose peak rises above its passband (Q > 0.707: f2 22 % low at Q = 2) and biased low by noise (the
+// highest of many noisy points). Here a flat end of the sweep is the passband, as in the textbook.
+// Points are all valid here (io/bode.ts drops the rest).
 export type BodePt = { f: number; db: number; ph: number };
 type At = { f: number; v: number } | null; // a crossing: its frequency and the value it reports
-export type BodeResults = { centre: { f: number; db: number; notch: boolean } | null; f1: number | null; f2: number | null; bw: number | null; gm: At; pm: At };
+export type BodeResults = {
+  centre: { f: number; db: number; notch: boolean } | null;
+  ref: 'passband' | 'peak'; // what f1/f2 are 3 dB under (a notch: each side's highest gain)
+  f1: number | null; f2: number | null; bw: number | null; gm: At; pm: At;
+  slope: number | null; // dB/decade over the last decade swept (the whole sweep when shorter)
+};
 
 const NOTCH_DB = 6;
+// A passband end: |slope| under 3 dB/decade over its first 0.3 decade (≥ 2 points at 5 points/decade,
+// 0.5 dB/decade of slope noise at 0.1 dB per point and 10/decade), and within 20 dB of the peak: a deeper
+// flat end is the noise floor. ponytail: a low-pass with Q > 10 (peak > 20 dB) is read as a band-pass,
+// then f1/f2 are its resonance's half-power width, the number that matters there.
+const FLAT_DB_DEC = 3, FLAT_SPAN_DEC = 0.3, PASSBAND_DB = 20;
 export const wrap180 = (d: number) => d - 360 * Math.ceil((d - 180) / 360); // (-180, 180]
 // Where `level` lies between a and b (0 at a, 1 at b); a flat pair crosses nothing.
 const between = (a: number, b: number, level: number) => (a === b || (level < a && level < b) || (level > a && level > b) ? null : (level - a) / (b - a));
@@ -116,18 +129,41 @@ function margins(pts: BodePt[]): { gm: At; pm: At } {
   return { gm, pm };
 }
 
+// The gain at one end of the sweep (dir 1: low end, −1: high end) when that end is a passband, else null.
+function passbandEnd(pts: BodePt[], dir: 1 | -1, peak: number): number | null {
+  const e = dir === 1 ? 0 : pts.length - 1, span = (j: number) => Math.abs(Math.log10(pts[j].f / pts[e].f));
+  let j = e + dir;
+  while (j >= 0 && j < pts.length && span(j) < FLAT_SPAN_DEC) j += dir;
+  if (j < 0 || j >= pts.length) return null; // the sweep is shorter than the span: can't tell
+  const flat = Math.abs(pts[j].db - pts[e].db) / span(j) < FLAT_DB_DEC;
+  return flat && pts[e].db >= peak - PASSBAND_DB ? pts[e].db : null;
+}
+
+// Average slope over the last decade swept: from the gain at a tenth of the last frequency (log-f
+// interpolated), or from the first point when the sweep is shorter.
+function rolloff(pts: BodePt[]): number | null {
+  if (pts.length < 2) return null;
+  const b = pts[pts.length - 1], i = pts.findIndex((p) => p.f >= b.f / 10);
+  if (i < 1) return (b.db - pts[0].db) / Math.log10(b.f / pts[0].f);
+  const p = pts[i - 1], q = pts[i], t = Math.log(b.f / 10 / p.f) / Math.log(q.f / p.f);
+  return b.db - (p.db + t * (q.db - p.db));
+}
+
 export function bodeResults(pts: BodePt[]): BodeResults {
-  const { gm, pm } = margins(pts);
-  if (!pts.length) return { centre: null, f1: null, f2: null, bw: null, gm, pm };
+  const { gm, pm } = margins(pts), slope = rolloff(pts);
+  if (!pts.length) return { centre: null, ref: 'peak', f1: null, f2: null, bw: null, gm, pm, slope };
   let high = 0, low = 0;
   pts.forEach((p, i) => { if (p.db > pts[high].db) high = i; if (p.db < pts[low].db) low = i; });
   const below = extreme(pts, low, -1, true), above = extreme(pts, low, 1, true);
   const rise = Math.min(below, above) - pts[low].db;
   const drop = pts[high].db - Math.max(extreme(pts, high, -1, false), extreme(pts, high, 1, false));
   const notch = rise >= NOTCH_DB && rise > drop, c = notch ? low : high;
-  const f1 = bound(pts, c, -1, notch ? below - 3 : pts[high].db - 3, notch);
-  const f2 = bound(pts, c, 1, notch ? above - 3 : pts[high].db - 3, notch);
-  return { centre: { f: pts[c].f, db: pts[c].db, notch }, f1, f2, bw: f1 !== null && f2 !== null ? f2 - f1 : null, gm, pm };
+  const ends = [passbandEnd(pts, 1, pts[high].db), passbandEnd(pts, -1, pts[high].db)].filter((v) => v !== null);
+  const level = (ends.length ? Math.max(...ends) : pts[high].db) - 3;
+  const f1 = bound(pts, c, -1, notch ? below - 3 : level, notch);
+  const f2 = bound(pts, c, 1, notch ? above - 3 : level, notch);
+  const ref = ends.length && !notch ? 'passband' : 'peak';
+  return { centre: { f: pts[c].f, db: pts[c].db, notch }, ref, f1, f2, bw: f1 !== null && f2 !== null ? f2 - f1 : null, gm, pm, slope };
 }
 
 // The device's readout set (WAV:MEAS? order, SCPI_DESKTOP.md) plus rise time, which only the

@@ -156,20 +156,20 @@ function SlowPoint({ f }: { f: number }) {
   );
 }
 
-// The meter's result set (labels as on its Results page), then roll-off and progress. '—': not crossed.
+// The meter's result set, f1/f2 labelled with what they are 3 dB under, then roll-off and progress.
+// '—': not crossed.
 function Results({ pts, res, planned }: { pts: Point[]; res: BodeResults; planned: number }) {
-  const notch = res.centre?.notch;
+  const notch = res.centre?.notch, under = notch ? 'notch −3 dB' : `−3 dB vs ${res.ref}`;
   const atHz = (v: string, f: number) => `${v} @ ${fmtHz(f, true)}`;
-  const slope = pts.length > 3 ? (pts.at(-1)!.db - pts.at(-4)!.db) / Math.log10(pts.at(-1)!.f / pts.at(-4)!.f) : null;
   return (
     <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
       <Stat label={notch ? 'Notch (f0)' : 'Peak (f0)'} value={res.centre ? atHz(`${res.centre.db.toFixed(2)} dB`, res.centre.f) : '—'} tone="text-ch1" />
-      <Stat label={notch ? 'f1 (notch −3 dB)' : 'f1 (−3 dB below)'} value={hzOrDash(res.f1)} />
-      <Stat label={notch ? 'f2 (notch −3 dB)' : 'f2 (−3 dB above)'} value={hzOrDash(res.f2)} />
+      <Stat label={`f1 (${under})`} value={hzOrDash(res.f1)} />
+      <Stat label={`f2 (${under})`} value={hzOrDash(res.f2)} />
       <Stat label={notch ? 'Notch width' : 'Bandwidth'} value={hzOrDash(res.bw)} />
       <Stat label="Gain margin" value={res.gm ? atHz(`${res.gm.v.toFixed(1)} dB`, res.gm.f) : '—'} />
       <Stat label="Phase margin" value={res.pm ? atHz(`${res.pm.v.toFixed(1)}°`, res.pm.f) : '—'} tone="text-ch2" />
-      <Stat label="Roll-off (last decade)" value={slope ? `${slope.toFixed(1)} dB/dec` : '—'} />
+      <Stat label="Roll-off (last decade)" value={res.slope !== null ? `${res.slope.toFixed(1)} dB/dec` : '—'} />
       <Stat label="Points" value={`${pts.length} / ${planned}`} />
     </div>
   );
@@ -275,6 +275,8 @@ function LimitsNote({ top }: { top: string }) {
         <li>About ±0.5 dB and ±1°, down to about −40 dB. Calibrating the scope on the device improves it: Settings → Device → Scope calibration → Gain → Match to other channel.</li>
         <li>Inputs are AC coupled: DC gain isn't measured.</li>
         <li>Low frequencies are slow: 1 Hz takes about 20 s per point.</li>
+        <li>Gain and phase margins assume CH2/CH1 is the open-loop gain, unstable where its phase reaches −180°. For a filter they mean nothing.</li>
+        <li>A narrow peak can fall between points: raise points / decade when the peak spans only a few of them.</li>
       </ul>
     </Panel>
   );
