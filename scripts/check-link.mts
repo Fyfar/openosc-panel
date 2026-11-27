@@ -5,12 +5,12 @@ import assert from 'node:assert/strict';
 import { Link, sleep } from '../src/link.ts';
 import { ctl, link, remote, runLoop, stopLoop } from '../src/io/core.ts';
 import { setMode } from '../src/io/index.ts'; // also: the store → SCPI subscription (drag coalescing)
-import { clearDmmData, dmmCsvParts, dmmLoop, dmmRec, flushDmm, logMatches, startDmmLog, stopDmmLog } from '../src/io/dmm.ts';
+import { clearDmmData, dmmCsvParts, dmmLoop, dmmRec, flushDmm, logMatches, setTrig, startDmmLog, stopDmmLog } from '../src/io/dmm.ts';
 import { REC_MAX } from '../src/recording.ts';
 import { emptyStats } from '../src/dsp.ts';
 import { scopeData, scopeLoop, scopeRun } from '../src/io/scope.ts';
 import { bodeStop, bodeSweep } from '../src/io/bode.ts';
-import { useDev } from '../src/store.ts';
+import { NO_TRIG, useDev } from '../src/store.ts';
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -401,11 +401,22 @@ const nulls = () => recValues().filter(Number.isNaN).length;
   const polls = sent();
   await sleep(400);
   assert.equal(sent(), polls, 'no meter polling in the generator view without logging');
+  await setMode('dmm');
+  setTrig({ start: { above: true, v: 5 } });
+  startDmmLog();
+  await setMode('gen');
+  const armedPolls = sent();
+  await sleep(400);
+  assert.ok(sent() > armedPolls, 'an armed trigger keeps polling the meter in the generator view');
+  m.value = '6';
+  await until(() => dmmState().logging, 'and starts logging there');
+  stopDmmLog();
+  useDev.setState({ trig: NO_TRIG });
   await stopLoop();
   await link.close();
   useDev.setState({ link: 'disconnected', mode: 'scope', profile: 'DS1052' });
   await freshDmm();
-  checks += 3;
+  checks += 4;
 }
 
 // --- the reading limit: logging stops at REC_MAX with the data kept, and starts again only after Clear
@@ -443,6 +454,134 @@ const nulls = () => recValues().filter(Number.isNaN).length;
   assert.equal(dmmState().logging, true, 'and works once it is gone');
   await freshDmm();
   checks += 3;
+}
+
+// --- the logging trigger: a start condition arms, a stop condition ends any run, Repeat re-arms only
+// after a reading outside the start condition, and everything that stops logging also disarms
+{
+  const { m, dev, VDC, RES } = fakeMeter();
+  // At least one reading of this value has been through the loop.
+  const feed = async (value: string, status = 0) => {
+    Object.assign(m, { value, status });
+    const to = m.seq + 2;
+    await until(() => (dmmState().reading?.seq ?? 0) >= to, `reading ${value}`);
+  };
+  // The recording with repeated values folded: one entry per value per run, NaN between runs.
+  const runs = () => recValues().filter((v, i, a) => i === 0 || !Object.is(v, a[i - 1]));
+  const idle = async () => { stopDmmLog(); useDev.setState({ trig: NO_TRIG }); await clearDmmData(); };
+  const state = () => [dmmState().armed, dmmState().logging];
+  useDev.setState({ reading: null });
+  await link.open(dev.port);
+  await freshDmm();
+  runLoop('dmm', dmmLoop);
+  await feed('0.2');
+
+  // The reset writes NO_TRIG, the very object already there: only counting writes sees it.
+  const setState = useDev.setState;
+  let trigWrites = 0;
+  useDev.setState = (...a: Parameters<typeof setState>) => { if (typeof a[0] === 'object' && 'trig' in a[0]) trigWrites++; return setState(...a); };
+  await feed('0.3');
+  useDev.setState = setState;
+  assert.deepEqual([trigWrites, dmmState().armed], [0, false], 'no condition: readings never write the trigger');
+
+  setTrig({ start: { above: true, v: 1 } });
+  startDmmLog();
+  assert.deepEqual(state(), [true, false], 'a start condition arms instead of logging');
+  setTrig({ start: { above: true, v: 5 } });
+  assert.equal(dmmState().trig.start?.v, 1, 'the start condition is locked while armed');
+  await feed('0.2');
+  await feed('NAN', 6);
+  assert.deepEqual([...state(), dmmRec.length], [true, false, 0], 'a reading below the value and OL start nothing');
+  await feed('1.2');
+  assert.deepEqual([...state(), dmmRec.v(0)], [false, true, 1.2], 'the crossing starts logging as its first reading');
+  setTrig({ start: null });
+  assert.ok(dmmState().trig.start, 'the start condition is locked while logging');
+  stopDmmLog();
+  assert.deepEqual(state(), [false, false], 'a manual stop disarms');
+  startDmmLog();
+  stopDmmLog();
+  const n = dmmRec.length;
+  await feed('1.3');
+  assert.deepEqual([...state(), dmmRec.length], [false, false, n], 'Disarm: a reading past the value starts nothing');
+  startDmmLog();
+  await feed('1.3');
+  assert.deepEqual(state(), [false, true], 'a value already past when arming starts logging');
+
+  await idle();
+  await feed('1.5');
+  setTrig({ stop: { above: false, v: 1 } });
+  startDmmLog();
+  assert.deepEqual(state(), [false, true], 'with only a stop condition Start logs at once');
+  await feed('1.5');
+  setTrig({ stop: { above: false, v: 1.2 } });
+  await feed('1.1');
+  assert.deepEqual([...state(), runs()], [false, false, [1.5, 1.1, NaN]], 'a cut-off moved during the run stops it, its reading recorded');
+
+  await idle();
+  await feed('0.2');
+  setTrig({ start: { above: true, v: 1 }, stop: { above: false, v: 0.5 }, repeat: true });
+  startDmmLog();
+  for (const v of ['1.2', '0.4', '0.2', '1.5']) await feed(v);
+  assert.deepEqual([dmmState().logging, runs()], [true, [1.2, 0.4, NaN, 1.5]], 'Repeat: two runs, a gap between them');
+
+  await idle();
+  await feed('3.5');
+  setTrig({ start: { above: false, v: 4.1 }, stop: { above: false, v: 3 }, repeat: true });
+  startDmmLog();
+  await feed('3.5');
+  await feed('2.9');
+  await feed('2.8');
+  assert.deepEqual(state(), [true, false], 'Repeat re-arms but waits: still past the start value');
+  await feed('4.2');
+  await feed('4.0');
+  assert.deepEqual([dmmState().logging, runs()], [true, [3.5, 2.9, NaN, 4.0]], 'the next run starts after a reading outside');
+
+  stopDmmLog();
+  setTrig({ repeat: false });
+  startDmmLog();
+  await feed('3.5');
+  await feed('2.9');
+  assert.deepEqual(state(), [false, false], 'one-shot: an automatic stop leaves the trigger idle');
+  const one = dmmRec.length;
+  await feed('3.5');
+  assert.equal(dmmRec.length, one, 'and a reading meeting the start condition starts nothing');
+
+  await feed('4.5');
+  startDmmLog();
+  await clearDmmData();
+  assert.deepEqual([...state(), dmmRec.length], [true, false, 0], 'Clear data keeps the trigger armed');
+
+  useDev.setState({ savedOffer: { func: 'VDC', fahrenheit: false, valid: 10, last: 1, known: true } });
+  stopDmmLog();
+  startDmmLog();
+  assert.equal(dmmState().armed, false, 'arming is refused while a saved recording is offered');
+  useDev.setState({ savedOffer: null, dstats: { ...emptyStats(), n: REC_MAX } });
+  startDmmLog();
+  assert.equal(dmmState().armed, false, 'and at the limit');
+  useDev.setState({ dstats: { ...emptyStats(), n: REC_MAX - 1 }, recorded: { func: 'VDC', fahrenheit: false, rangeMax: 25 } });
+  setTrig({ repeat: true });
+  startDmmLog();
+  await feed('3.5');
+  assert.deepEqual(state(), [false, false], 'the limit reached in a triggered run disarms, Repeat or not');
+
+  await idle();
+  setTrig({ start: { above: true, v: 1 } });
+  startDmmLog();
+  useDev.setState({ link: 'connected' });
+  useDev.setState({ link: 'disconnected' });
+  assert.equal(dmmState().armed, false, 'a lost connection disarms');
+
+  startDmmLog();
+  Object.assign(m, RES);
+  await until(() => !dmmState().armed, 'a reading of another function disarms');
+  assert.deepEqual(dmmState().trig, NO_TRIG, 'and clears the conditions');
+  Object.assign(m, VDC);
+  await until(() => dmmState().dmm.func === 'VDC', 'back on V DC');
+
+  await stopLoop();
+  await link.close();
+  await idle();
+  checks += 21;
 }
 
 // A fake from three tables: set-commands change state, `wave` queries are computed, `cfg` are fixed.

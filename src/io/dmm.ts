@@ -3,7 +3,7 @@ import { DMM_FUNCS, dmmBase, dmmScale, HOLD_MODES, type DmmFunc } from '../devic
 import { addStat, emptyStats } from '../dsp';
 import { sleep } from '../link';
 import { Recording, REC_MAX } from '../recording';
-import type { State } from '../store';
+import { NO_TRIG, type Cond, type State, type Trig } from '../store';
 import { alive, ctl, download, get, link, now, num, on, remote, set } from './core';
 
 type Dmm = State['dmm'];
@@ -154,7 +154,13 @@ function pushReading(f: string[]) {
   const reading = readingOf(f, get().fahrenheit);
   set({ reading });
   const func = BY_ID[+f[0]];
-  if (func && get().logging) record(func, reading.v, +f[5]);
+  if (!func) return;
+  if (!trigFits(get().trig, func, get().fahrenheit)) set({ trig: NO_TRIG, armed: false });
+  const { armed, trig } = get();
+  if (armed) watchStart(trig.start, reading.v);
+  if (!get().logging) return;
+  record(func, reading.v, +f[5]);
+  if (get().logging && meets(trig.stop, reading.v)) autoStop();
 }
 
 // Whether a reading of this function and temperature unit belongs with the recorded data.
@@ -191,17 +197,67 @@ export const atLimit = (s: State) => s.dstats.n >= REC_MAX;
 let persistAsked = false;
 
 // Refused at the limit, and while a saved recording is offered: a new one would overwrite it.
+const canStart = () => !atLimit(get()) && !get().savedOffer;
+
+// With a start condition this arms; otherwise it starts logging.
 export function startDmmLog() {
-  if (atLimit(get()) || get().savedOffer) return;
+  if (!canStart()) return;
   // Asked on a click: Firefox shows a prompt for it. A refusal changes nothing else.
   if (!persistAsked) { persistAsked = true; navigator.storage?.persist?.().catch(() => {}); }
-  set({ logging: true, ...(get().dstats.n ? {} : { recorded: null }) });
+  if (liveTrig(get()).start) arm(true);
+  else beginLog();
 }
 
+function beginLog() {
+  if (canStart()) set({ logging: true, armed: false, ...(get().dstats.n ? {} : { recorded: null }) });
+}
+
+// Also the disarm: every path that ends logging (button, function change, limit, lost link) comes here.
 export function stopDmmLog() {
+  if (get().armed) set({ armed: false });
   if (!get().logging) return;
   breakLine();
   set({ logging: false });
+}
+
+// ---------------------------------------------------------------- logging trigger
+
+const trigKey = (func: DmmFunc, fahrenheit: boolean) => `${func} ${dmmBase(func, fahrenheit)}`;
+
+// Conditions entered in another function or unit don't apply (and are cleared by its first reading).
+const trigFits = (t: Trig, func: DmmFunc, fahrenheit: boolean) => (!t.start && !t.stop) || t.key === trigKey(func, fahrenheit);
+
+// The trigger as the panel shows it: none while the meter measures something else.
+export const liveTrig = (s: State) => (trigFits(s.trig, s.dmm.func, s.fahrenheit) ? s.trig : NO_TRIG);
+
+// The start condition is locked while armed or logging; the stop condition and Repeat never are.
+export function setTrig(p: Partial<Omit<Trig, 'key'>>) {
+  const s = get();
+  if ('start' in p && (s.armed || s.logging)) return;
+  set({ trig: { ...liveTrig(s), ...p, key: trigKey(s.dmm.func, s.fahrenheit) } });
+}
+
+const meets = (c: Cond | null, v: number | null) => c !== null && v !== null && (c.above ? v > c.v : v < c.v);
+
+// False after a Repeat re-arm: the value may still be past the start value, and must leave it first.
+let outside = true;
+
+function arm(fresh: boolean) {
+  outside = fresh;
+  set({ armed: true });
+}
+
+// OL and blank (`v` null) meet nothing and leave `outside` as it is.
+function watchStart(start: Cond | null, v: number | null) {
+  if (v === null || !start) return;
+  if (!meets(start, v)) outside = true;
+  else if (outside) beginLog();
+}
+
+function autoStop() {
+  stopDmmLog();
+  const { trig } = get();
+  if (trig.repeat && trig.start) arm(false);
 }
 
 export async function clearDmmData() {
