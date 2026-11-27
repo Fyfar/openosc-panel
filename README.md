@@ -51,9 +51,15 @@ install, no backend. Your data never leaves your machine.
 
 ### Everywhere
 
-- The panel switches the device between its scope and multimeter USB modes for you, in about a
+- **Control the device from your computer.** The settings you'd otherwise dig for with the small
+  screen and buttons (timebase, volts per division, trigger, meter function and range, generator
+  shape and level) are a click away on a big screen, and changes made on the device's own
+  buttons show up in the panel too.
+- Lock the device's buttons while you work from the computer, and save a picture of the device's
+  own screen.
+- The panel switches the device between its scope and multimeter modes for you, in about a
   second.
-- SCPI console, device screenshots and a remote lock for the device's keys.
+- For advanced users: a console to send the firmware's text commands (SCPI) directly.
 - Install it as an app from the browser's address bar: no installer, and it works offline once
   you've opened it online.
 
