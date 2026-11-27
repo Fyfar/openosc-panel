@@ -41,7 +41,7 @@ export function Bode() {
   return (
     <div className="grid gap-4 xl:grid-cols-[1fr_320px]">
       <div className="min-w-0 space-y-4">
-        <ResponseChart pts={pts} progress={b.running ? b.progress : null} slow={b.running && b.at !== null && bodeSlow(b.at) ? b.at : null} />
+        <ResponseChart pts={pts} progress={b.running ? b.progress : null} slow={b.at !== null && bodeSlow(b.at) ? b.at : null} />
         <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
           <Stat label="−3 dB corner" value={f3 ? fmtHz(f3) : '—'} tone="text-ch1" />
           <Stat label="Phase at corner" value={ph3 !== null ? `${ph3.toFixed(1)}°` : '—'} tone="text-ch2" />
@@ -53,13 +53,14 @@ export function Bode() {
       <aside className="space-y-4">
         <Panel title="Sweep">
           <div className="space-y-3">
-            <Row label="Start"><Select label="Start frequency" value={b.start} options={startOpts} onChange={(start) => set({ start })} /></Row>
-            <Row label="Stop"><Select label="Stop frequency" value={b.stop} options={stopOpts} onChange={(stop) => set({ stop })} /></Row>
-            <Row label="Points / decade"><Select label="Points per decade" value={b.ppd} options={[5, 10, 20, 50].map((n) => ({ id: n, label: String(n) }))} onChange={(ppd) => set({ ppd })} /></Row>
+            {/* A sweep runs the plan it started with: Stop it to change the plan. */}
+            <fieldset disabled={b.running} className="space-y-3 disabled:opacity-40">
+              <Row label="Start"><Select label="Start frequency" value={b.start} options={startOpts} onChange={(start) => set({ start })} /></Row>
+              <Row label="Stop"><Select label="Stop frequency" value={b.stop} options={stopOpts} onChange={(stop) => set({ stop })} /></Row>
+              <Row label="Points / decade"><Select label="Points per decade" value={b.ppd} options={[5, 10, 20, 50].map((n) => ({ id: n, label: String(n) }))} onChange={(ppd) => set({ ppd })} /></Row>
+            </fieldset>
             <Row label="Est. time"><span className="font-mono">~{etaText(bodeEta(plan, model))}</span></Row>
-            <Btn tone={b.running ? 'danger' : 'accent'} className="w-full py-2" onClick={() => void (b.running ? io.bodeStop() : io.bodeSweep())}>
-              {b.running ? <><Square size={13} /> Stop sweep</> : <><Play size={13} /> Run sweep</>}
-            </Btn>
+            <RunButton running={b.running} stopping={b.stopping} />
             <Btn className="w-full" disabled={!pts.length || b.running} onClick={() => exportCsv(pts)}><Download size={13} /> Export CSV</Btn>
           </div>
         </Panel>
@@ -85,6 +86,16 @@ export function Bode() {
         <p className="px-1 text-[11px] text-muted">The device's own Bode analyzer can't run in Remote; this sweep drives the generator and scope from the browser.</p>
       </aside>
     </div>
+  );
+}
+
+// Stopping takes a moment: the point in progress ends, then the generator and scope are restored.
+function RunButton({ running, stopping }: { running: boolean; stopping: boolean }) {
+  if (!running) return <Btn tone="accent" className="w-full py-2" onClick={() => void io.bodeSweep()}><Play size={13} /> Run sweep</Btn>;
+  return (
+    <Btn tone="danger" className="w-full py-2" disabled={stopping} onClick={io.bodeStop}>
+      <Square size={13} /> {stopping ? 'Stopping…' : 'Stop sweep'}
+    </Btn>
   );
 }
 

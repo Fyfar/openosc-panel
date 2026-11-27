@@ -1,7 +1,7 @@
 // Self-check for the pure logic: typed frequency, DMM scaling, Bode maths/plan/restore,
 // scope measurements and generator command order. Run: `npm run check`.
 import assert from 'node:assert/strict';
-import { bodeEta, bodePlan, bodeSlow, dmmScale, fmtStable, fwAtLeast, genMaxHz, interleaveBlockers, parseHz, scaleFor, VDIV_MV } from '../src/device.ts';
+import { bodeEta, bodePlan, bodeSlow, dmmScale, fmtStable, fwAtLeast, genMaxHz, interleaveBlockers, parseHz, scaleFor, startsFreqEntry, VDIV_MV } from '../src/device.ts';
 import { addStat, emptyStats, FFT_WINDOWS, fftNotes, fftSpanHz, bodeTone, findPeak, histogram, spanAtLeast, unwrapPhase, measure, peakIn, peakNear, spectrum, spectrumOf, stdDev, yFloor, windowExtent, heldIdx, type FftWindow, type Frame } from '../src/dsp.ts';
 import { parseFrame, parseMeas, screenWindow } from '../src/io/scope.ts';
 import { pointCmds, rerange, scopeRestore, SWEEP_SCOPE } from '../src/io/bode.ts';
@@ -22,6 +22,17 @@ for (const [text, hz] of [
   ['1.0000 kHz', 1e3], ['.5k', 500], ['50', 50], ['1.2.3', null], ['abc', null], ['', null], ['0', null], ['-5', null],
 ] as const) {
   assert.equal(parseHz(text), hz, `parseHz("${text}")`);
+  checks++;
+}
+
+// --- startsFreqEntry: a digit or "." typed on the Generator view goes to the frequency field;
+// shortcuts (Cmd/Ctrl+1 switches browser tabs) and every other key stay where they are ------
+for (const [key, mods, starts] of [
+  ['0', {}, true], ['7', {}, true], ['.', {}, true],
+  ['k', {}, false], ['-', {}, false], [' ', {}, false], ['Enter', {}, false], ['Tab', {}, false], ['F1', {}, false],
+  ['1', { ctrlKey: true }, false], ['1', { metaKey: true }, false], ['1', { altKey: true }, false],
+] as const) {
+  assert.equal(startsFreqEntry({ key, ctrlKey: false, metaKey: false, altKey: false, ...mods }), starts, `startsFreqEntry("${key}", ${JSON.stringify(mods)})`);
   checks++;
 }
 

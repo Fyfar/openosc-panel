@@ -349,7 +349,8 @@ function trendOpts(kind: 'line' | 'hist', sc: Scale, manual: { lo: number; hi: n
 
 const range = ([lo, hi]: [number, number]) => ({ lo, hi });
 
-// Typed in the display unit; an unparseable or crossing value snaps back to the current one.
+// Typed in the display unit; an unparseable or crossing value snaps back to the current one. The
+// field shows rounded text, so left untouched it commits nothing.
 function YInput({ label, v, sc, onCommit, disabled }: { label: string; v: number; sc: Scale; onCommit: (x: number) => void; disabled?: boolean }) {
   const shown = (v / sc.div).toFixed(sc.dp);
   return (
@@ -364,7 +365,7 @@ function YInput({ label, v, sc, onCommit, disabled }: { label: string; v: number
         onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur(); }}
         onBlur={(e) => {
           const x = e.target.value.trim() === '' ? NaN : +e.target.value * sc.div;
-          if (Number.isFinite(x)) onCommit(x);
+          if (e.target.value !== shown && Number.isFinite(x)) onCommit(x);
           e.target.value = shown;
         }}
         className="w-24 rounded border border-border bg-canvas px-2 py-1 text-right font-mono disabled:opacity-40"

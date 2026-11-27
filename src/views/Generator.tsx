@@ -1,7 +1,7 @@
 import { clsx } from 'clsx';
 import { Info, Power } from 'lucide-react';
-import { useState } from 'react';
-import { ampLimit, fmtHz, genHalvesScope, genMaxHz, HALVED_NOTE, MODELS, parseHz, SHAPES, type Model, type Shape } from '../device';
+import { useEffect, useRef, useState, type RefObject } from 'react';
+import { ampLimit, fmtHz, genHalvesScope, genMaxHz, HALVED_NOTE, MODELS, parseHz, SHAPES, startsFreqEntry, type Model, type Shape } from '../device';
 import { useDev, type State } from '../store';
 import { Panel, Row, Seg, Toggle } from '../ui';
 
@@ -35,6 +35,21 @@ function applyShape(freq: number, next: { label: string; max: number }): { freq:
   return { freq: next.max, note: `${next.label} is limited to ${fmtHz(next.max)}: frequency lowered from ${fmtHz(freq)}.` };
 }
 
+// Typing a number anywhere on this view starts a frequency entry. Focusing during keydown, without
+// preventDefault, makes the browser type that same key into the field; its focus handler has
+// selected the old text, so the key replaces it.
+function useTypeToFocus(field: RefObject<HTMLInputElement | null>) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      // Fields that take digits themselves (the SCPI console) keep them; a range slider doesn't.
+      const typing = (e.target as Element).matches('input:not([type="range"]), textarea, select');
+      if (startsFreqEntry(e) && !typing && !useDev.getState().shot) field.current?.focus();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [field]);
+}
+
 type Gen = State['gen'];
 type SetGen = (p: Partial<Gen>) => void;
 
@@ -49,6 +64,9 @@ export function Generator() {
   const max = spec.maxHz[g.shape];
   const [note, setNote] = useState<string | null>(null);
   const [draft, setDraft] = useState<string | null>(null);
+  const freqField = useRef<HTMLInputElement>(null);
+  useTypeToFocus(freqField);
+  const shownOnFocus = useRef('');
   const over = g.freq > max;
   const clampFreq = (f: number) => Math.min(max, Math.max(spec.minHz, f));
 
@@ -59,8 +77,11 @@ export function Generator() {
     set({ shape: id, freq: r.freq });
   };
   const commitFreq = (text: string) => {
-    const f = parseHz(text);
     setDraft(null);
+    // The field shows 5 digits: applying it untouched would round the frequency, or undo a value
+    // that changed while the field was focused.
+    if (text === shownOnFocus.current) return;
+    const f = parseHz(text);
     if (f === null) setNote(`"${text.trim()}" is not a frequency: try 1k, 2.5 MHz or 500 mHz.`);
     else if (f < spec.minHz) setNote(`${fmtHz(f)} is below the ${fmtHz(spec.minHz)} minimum.`);
     else { setNote(f > max ? `${shape.label} is limited to ${fmtHz(max)}.` : null); set({ freq: clampFreq(f) }); }
@@ -96,9 +117,10 @@ export function Generator() {
         >
           <div className="flex flex-col items-center gap-4 py-4">
             <input
+              ref={freqField}
               aria-label="Frequency"
               value={draft ?? fmtHz(g.freq)}
-              onFocus={(e) => { setDraft(fmtHz(g.freq)); e.target.select(); }}
+              onFocus={(e) => { shownOnFocus.current = fmtHz(g.freq); setDraft(shownOnFocus.current); e.target.select(); }}
               onChange={(e) => setDraft(e.target.value)}
               onBlur={(e) => commitFreq(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && e.currentTarget.blur()}
