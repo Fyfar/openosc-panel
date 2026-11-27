@@ -31,9 +31,13 @@ install, no backend. Your data never leaves your machine.
   gain changes, reads off the −3 dB corner and roll-off, then puts your settings back.
 - **A generator you can type into.** `10k`, `2.5 MHz`, `500 mHz`. Six shapes, duty cycle,
   levels or amplitude, and it keeps running while you work in another view.
-- **Multimeter with a trend chart and CSV logging.** Press *Start logging* and the chart,
-  statistics and CSV fill from the same readings. A recording holds up to 1.8 million readings
-  (about a week) and survives a page reload or a browser crash: the panel offers to restore it.
+- **A week of multimeter logging that survives a crash.** Press *Start logging* and the
+  chart, statistics and CSV fill from the same readings: up to 1.8 million of them, about 7 days
+  of continuous logging, with the whole run on the chart and every spike and overload still
+  visible. The recording is saved in the browser as it grows, so a page reload, a tab or browser
+  crash, a pulled USB cable or a computer that loses power costs at most the last 5 seconds.
+  Open the panel again and it offers to restore the recording, then logging carries on from
+  there.
 - **One tab per instrument.** The device needs a different USB profile for scope and
   multimeter; the panel switches it for you in about a second.
 - **Full control when you need it:** a SCPI console, device screenshots and a remote lock for
@@ -73,7 +77,14 @@ The stock firmware has no remote control, so the panel can't connect to it. Two 
 
 - Scope and multimeter can't run at the same time: they are separate USB profiles on the
   device. The generator keeps running across the switch.
-- Nothing is saved between visits. Export what you want to keep.
+- The multimeter recording stays in this browser until you press **Clear data**. It is
+  saved every 5 seconds, so a crash or power cut loses at most the last 5 seconds, and nothing
+  is recorded while the computer is off or the panel is closed: a restored recording shows that
+  time as a gap. It lives in this browser profile only (not in a private window; clearing the
+  site's data deletes it), so export the CSV for anything you need to keep.
+- At 1.8 million readings logging stops. Export the CSV, then press **Clear data** to start a
+  new recording.
+- Settings, scope captures and Bode results are not saved between visits.
 - Each online launch loads the latest version. If a new one comes out while the panel is open,
   it asks first (**Update** / **Later**) and never reloads on its own, so an unsaved log is safe.
 - One device, one tab: the serial port is exclusive.
