@@ -217,7 +217,28 @@ const frame = (ch: 0 | 1, n: number, xinc: number, fn: (t: number) => number): F
   assert.ok(off(100 * Math.sqrt(3))(ol.gm!.f) < 0.03, `gain margin at ${ol.gm!.f}`);
   near(ol.pm!.v, 180 - 3 * deg(Math.atan(xg)), 1, 'open loop phase margin');
   assert.ok(off(100 * xg)(ol.pm!.f) < 0.03, `phase margin at ${ol.pm!.f}`);
-  checks += 11;
+
+  // Q = 2 at 1 kHz, peaking 6 dB: the −3 dB point is under the passband (DC) gain, where
+  // x⁴ + (1/Q² − 2)x² − 1 = 0, not under the peak (which the meter uses: 22 % low).
+  const q2 = (f: number) => 1 - (f / 1000) ** 2, s2 = (f: number) => f / 2000, bq = 1 / 4 - 2;
+  const xc = Math.sqrt((-bq + Math.sqrt(bq * bq + 4)) / 2);
+  const plp = bodeResults(sweep(p10, (f) => -10 * Math.log10(q2(f) ** 2 + s2(f) ** 2), (f) => -deg(Math.atan2(s2(f), q2(f)))));
+  assert.ok(plp.ref === 'passband' && off(1000 * xc)(plp.f2) < 0.02 && plp.f1 === null && plp.bw === null, `peaked low-pass ${JSON.stringify(plp)}`);
+  const php = bodeResults(sweep(p10, (f) => 40 * Math.log10(f / 1000) - 10 * Math.log10(q2(f) ** 2 + s2(f) ** 2), (f) => 180 - deg(Math.atan2(s2(f), q2(f)))));
+  assert.ok(off(1000 / xc)(php.f1) < 0.02 && php.f2 === null, `peaked high-pass f1 ${php.f1}`);
+
+  // A stopband flattening into the noise floor is no passband: deeper than 20 dB under the peak.
+  const floor = (pts: { f: number; db: number; ph: number }[]) => pts.map((p) => ({ ...p, db: Math.max(p.db, -50) }));
+  const lpFloor = bodeResults(floor(sweep(bodePlan(10, 1e6, 10), (f) => -10 * Math.log10(1 + (f / 1000) ** 2), () => 0)));
+  assert.ok(lpFloor.ref === 'passband' && off(1000)(lpFloor.f2) < 0.02, `low-pass into the floor: f2 ${lpFloor.f2}`);
+  const bpFloor = bodeResults(floor(sweep(bodePlan(0.01, 1e8, 10), (f) => -10 * Math.log10(1 + ((1 - x(f) ** 2) / x(f)) ** 2), () => 0)));
+  assert.ok(bpFloor.ref === 'peak' && off(1000 * (edge - 0.5))(bpFloor.f1) < 0.03 && off(1000 * (edge + 0.5))(bpFloor.f2) < 0.03, `band-pass into the floor ${JSON.stringify(bpFloor)}`);
+
+  // Roll-off: the slope over the last decade swept, not over the last few points.
+  const rcDb = (f: number) => -10 * Math.log10(1 + (f / 1000) ** 2);
+  near(bodeResults(lp(1000)).slope!, rcDb(100_000) - rcDb(10_000), 0.05, 'roll-off to 100 kHz');
+  near(bodeResults(sweep(bodePlan(10, 2000, 10), rcDb, () => 0)).slope!, rcDb(2000) - rcDb(200), 0.05, 'roll-off ending at 2 kHz');
+  checks += 17;
 }
 
 // --- bodeTone: −6 dB / −45° with DC, non-whole periods, generator 0.1 % off the request ----
