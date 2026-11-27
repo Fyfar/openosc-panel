@@ -211,6 +211,12 @@ export function parseHz(text: string): number | null {
   return f > 0 ? f : null;
 }
 
+// A keystroke that begins a typed frequency. Modified digits are browser shortcuts; Shift stays
+// allowed because some layouts need it for digits.
+export function startsFreqEntry(e: Pick<KeyboardEvent, 'key' | 'ctrlKey' | 'metaKey' | 'altKey'>): boolean {
+  return /^[\d.]$/.test(e.key) && !e.ctrlKey && !e.metaKey && !e.altKey;
+}
+
 const PREFIX: [number, string][] = [[1e6, 'M'], [1e3, 'k'], [1, ''], [1e-3, 'm'], [1e-6, 'µ'], [1e-9, 'n'], [1e-12, 'p']];
 // 5 digits: matches the firmware's range decimals on both models (dmm/ranges.cpp: ZT703S 2.5 V → 4
 // decimals, 25000 counts; ZT706S 6.6 V → 4 decimals, 66000 counts).

@@ -1001,14 +1001,20 @@ async function runBode(setup: (st: ReturnType<typeof fakeBode>['st']) => void, s
 
 {
   // Stop while a point waits for a record that never comes: the wait ends at once, nothing counts as skipped.
+  // Stop only asks: the sweep owns the device (panel and mode tabs locked) until it has restored it.
   const t0 = performance.now();
-  setTimeout(() => bodeStop(), 300);
+  let heldAfterStop: boolean | undefined;
+  setTimeout(() => { bodeStop(); heldAfterStop = useDev.getState().bode.running; }, 300);
   const r = await runBode((st) => (st.stuckAt = 2));
   assert.ok(performance.now() - t0 < 1500, `stop took ${Math.round(performance.now() - t0)} ms`);
+  assert.equal(heldAfterStop, true, 'still running right after Stop');
+  assert.equal(useDev.getState().bode.running, false, 'released once the sweep ended');
   assert.equal(r.error, null, 'a stopped point is not reported as skipped');
   assert.ok(r.sent.includes('ACQ:MDEP 262144'), 'restore sent after stop');
   assert.equal(r.ats.at(-1), null, 'stop: no point being measured');
-  checks += 4;
+  const again = await runBode(() => {});
+  assert.equal(again.points.length, 3, `a stop does not carry into the next sweep: ${again.points.length} points`);
+  checks += 7;
 }
 
 console.log(`check-link: ${checks} checks passed`);

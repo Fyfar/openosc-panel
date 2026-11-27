@@ -77,10 +77,13 @@ export function rerange(frames: Frame[], vdiv: number[], probe: number[]): numbe
 // records of a second or more that only means "not yet".
 const notYet = (e: unknown) => /preamble "NAN/.test(errText(e));
 
+// False once Stop was clicked: the sweep winds down while `bode.running` stays true.
+const sweeping = () => !get().bode.stopping;
+
 // Retries `read` while the device has no newer record yet; null once `until` (ms) has passed or the
 // user stopped the sweep (a 1 Hz point can otherwise wait minutes).
 async function untilRecord<T>(until: number, read: (timeout: number) => Promise<T>): Promise<T | null> {
-  while (performance.now() < until && get().bode.running) {
+  while (performance.now() < until && sweeping()) {
     try {
       return await read(Math.max(1500, until - performance.now()));
     } catch (e) {
@@ -171,11 +174,11 @@ export async function bodeSweep() {
     forgetWav();
     await link.run(['WAV:MODE RAW', 'WAV:FORM BYTE']);
     if (!(await ctl([`SOUR:FREQ ${freqs[0]}`, 'SOUR:FUNC SINusoid', 'OUTP ON', ...SWEEP_SCOPE, `CHAN1:SCAL ${vdiv[0]}`, `CHAN2:SCAL ${vdiv[1]}`]))) return;
-    for (let k = 0; k < freqs.length && get().bode.running; k++) {
+    for (let k = 0; k < freqs.length && sweeping(); k++) {
       get().patch('bode', { at: freqs[k] });
       const p = await sweepPoint(freqs[k], vdiv, probe, freqs[k - 1]);
       if (p) get().patch('bode', { points: [...get().bode.points, p] });
-      else if (get().bode.running) skipped++;
+      else if (sweeping()) skipped++;
       get().patch('bode', { progress: (k + 1) / freqs.length });
     }
   } catch (e) {
@@ -185,9 +188,10 @@ export async function bodeSweep() {
     await link.run(['WAV:SNAP']).catch(() => {});
     await ctl([...genRestore(g0, model), ...restore]);
     await readGen(true);
-    get().patch('bode', { running: false });
+    get().patch('bode', { running: false, stopping: false });
   }
   if (skipped) fail(`Bode: ${skipped} point(s) skipped: no clean CH1/CH2 frame pair, or the range never settled.`);
 }
 
-export const bodeStop = () => get().patch('bode', { running: false });
+// Only asks: `running` keeps the Bode panel and the mode tabs locked until the device is restored.
+export const bodeStop = () => get().patch('bode', { stopping: true });
