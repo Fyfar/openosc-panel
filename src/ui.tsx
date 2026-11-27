@@ -1,8 +1,37 @@
 import { clsx } from 'clsx';
 import { ChevronLeft, ChevronRight } from 'lucide-react';
-import { Children, type ReactNode } from 'react';
+import { Children, useRef, useState, type ReactNode, type RefObject } from 'react';
 
 export const CH_COLOR = ['#facc15', '#22d3ee'];
+
+// A typed number (parseSI notation): shows fmt(value), focus selects it, Enter or blur commits. Text left
+// as shown commits nothing: the field shows rounded digits, so applying them would change the value, or
+// undo one that changed while the field was focused.
+export function SiField({ value, fmt, onCommit, label, inputRef, disabled, className }: {
+  value: number;
+  fmt: (v: number) => string;
+  onCommit: (text: string) => void;
+  label: string;
+  inputRef?: RefObject<HTMLInputElement | null>;
+  disabled?: boolean;
+  className?: string;
+}) {
+  const [draft, setDraft] = useState<string | null>(null);
+  const shown = useRef('');
+  return (
+    <input
+      ref={inputRef}
+      aria-label={label}
+      disabled={disabled}
+      value={draft ?? fmt(value)}
+      onFocus={(e) => { shown.current = fmt(value); setDraft(shown.current); e.target.select(); }}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={(e) => { setDraft(null); if (e.target.value !== shown.current) onCommit(e.target.value); }}
+      onKeyDown={(e) => e.key === 'Enter' && e.currentTarget.blur()}
+      className={className}
+    />
+  );
+}
 
 // The division grid of the scope trace and the FFT: strokes the current path dotted.
 export function strokeGrid(g: CanvasRenderingContext2D, dpr: number) {
@@ -174,5 +203,19 @@ export function Stat({ label, value, tone }: { label: string; value: string; ton
       <div className="text-[11px] text-muted">{label}</div>
       <div className={clsx('font-mono text-sm font-semibold tabular-nums', tone ?? 'text-fg')}>{value}</div>
     </div>
+  );
+}
+
+export function Slider({ label, value, min, max, step, show, onChange, color }: {
+  label: string; value: number; min: number; max: number; step: number; show: string; onChange: (v: number) => void; color?: string;
+}) {
+  return (
+    <label className="block text-xs">
+      <div className="mb-1 flex justify-between">
+        <span className="text-muted">{label}</span>
+        <span className="font-mono tabular-nums" style={{ color }}>{show}</span>
+      </div>
+      <input type="range" min={min} max={max} step={step} value={value} onChange={(e) => onChange(+e.target.value)} onDoubleClick={() => onChange(0)} className="w-full" style={{ accentColor: color ?? '#3b82f6' }} />
+    </label>
   );
 }

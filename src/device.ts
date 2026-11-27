@@ -37,6 +37,23 @@ export const SHAPES: { id: Shape; label: string }[] = [
   { id: 'RAMP', label: 'Ramp' },
 ];
 
+// Scope trigger types (TRIG:MODE, firmware docs/SCOPE_TRIGGERS.md); all but Edge need FW.qualTrig.
+export type TrigType = 'EDGE' | 'PULS' | 'RUNT' | 'SLOP';
+export const TRIG_TYPES: { id: TrigType; label: string }[] = [
+  { id: 'EDGE', label: 'Edge' },
+  { id: 'PULS', label: 'Pulse' },
+  { id: 'RUNT', label: 'Runt' },
+  { id: 'SLOP', label: 'Rise/fall' },
+];
+// TRIG:WHEN. Any is offered for Runt only; the firmware also accepts it for Pulse (measured 0.21.19).
+export type TrigWhen = 'ANY' | 'LESS' | 'GRE' | 'INS' | 'OUTS';
+// Runt and Rise/fall trigger on a band (TRIG:LEV:LOW/HIGH), the others on TRIG:EDGE:LEV.
+export const isBand = (t: TrigType) => t === 'RUNT' || t === 'SLOP';
+export const TRIG_TIME = { min: 1e-9, max: 1 }; // TRIG:TIME:LOW/UPP, seconds (TriggerSettings)
+// The band level a Runt or Rise/fall trigger decides on (firmware docs/SCOPE_TRIGGERS.md): a positive runt
+// its low, a negative one its high; a rise its high, a fall its low.
+export const decidesHigh = (t: { type: TrigType; slope: 'POS' | 'NEG' }) => (t.type === 'SLOP') === (t.slope === 'POS');
+
 // Per-model limits, from OpenOSC 0.21.7 source (generator/waveform.hpp, generator/capabilities.hpp,
 // module_wave.cpp, acquisition/interleave.hpp) and the wiki's Supported Devices / Signal Generator.
 // Both boards share scope timebases, V/div steps, DMM functions and the SCPI dialects; DMM ranges
@@ -72,8 +89,13 @@ export function fwAtLeast(fw: string | undefined, min: string): boolean {
   for (let i = 0; i < b.length; i++) if ((a[i] ?? -1) !== b[i]) return (a[i] ?? -1) > b[i];
   return true;
 }
-// WAV:FRAM?, WAV:POIN:MODE PEAK, WAV:MEAS?, MMEM (firmware docs/SCPI_DESKTOP.md).
-export const DESKTOP_FW = '0.21.9';
+// The oldest firmware the panel supports and the first firmware of each gated feature.
+// desktop: WAV:FRAM?, WAV:POIN:MODE PEAK, WAV:MEAS?, MMEM (firmware docs/SCPI_DESKTOP.md).
+// dacCap: a limit, not a feature (genMaxHz). qualTrig: TRIG:MODE PULS/RUNT/SLOP and their settings.
+export const FW = { min: '0.21.4', dacCap: '0.21.8', desktop: '0.21.9', qualTrig: '0.21.19' } as const;
+export type FwFeature = keyof typeof FW;
+// Below the minimum or unreadable: no gated feature at all.
+export const fwHas = (fw: string | undefined, f: FwFeature) => fwAtLeast(fw, FW.min) && fwAtLeast(fw, FW[f]);
 
 // ZT703S from 0.21.8: on the 200 MHz profile (the only one with USB) a DAC update takes ≥ 32 timer
 // ticks, so a DAC shape plays at most 200 MHz / 32 / 28 points = 223.2 kHz (waveform.hpp
@@ -81,7 +103,7 @@ export const DESKTOP_FW = '0.21.9';
 const ZT703S_DAC_MAX = 223_214;
 export function genMaxHz(model: Model, fw: string | undefined): Record<Shape, number> {
   const m = MODELS[model].maxHz;
-  if (model !== 'ZT703S' || !fwAtLeast(fw, '0.21.8')) return m;
+  if (model !== 'ZT703S' || !fwHas(fw, 'dacCap')) return m;
   return { ...m, SIN: Math.min(m.SIN, ZT703S_DAC_MAX), POS: Math.min(m.POS, ZT703S_DAC_MAX) };
 }
 
@@ -202,13 +224,26 @@ export function fmtStable(v: number, unit: string, digits: number, prev?: number
   return { text: `${s} ${SI_PREFIX[(exp + 12) / 3]}${unit}`, exp };
 }
 
-// Typed frequency: "10k", "10 kHz", "2.5MHz", "1e3", "500 mHz". k/K is kilo; m is milli and
-// M is mega (case matters only there). Null when it isn't a positive number.
-export function parseHz(text: string): number | null {
-  const m = text.trim().match(/^(\d+(?:\.\d*)?(?:e[+-]?\d+)?|\.\d+)\s*([mkKM]?)\s*(?:hz)?$/i);
+// Powers of ten per SI prefix; both micro signs (U+00B5 micro, U+03BC Greek mu) and u.
+const PREFIX_EXP = new Map(Object.entries({ p: -12, n: -9, u: -6, 'µ': -6, 'μ': -6, m: -3, k: 3, K: 3, M: 6, G: 9 }));
+
+// Typed number: "50us", "50 µs", "1.2ms", "2e-6", "10 kHz", "-1.5 V". The unit is optional and
+// matched in any case; m is milli and M is mega (case matters only there). Null when it isn't one.
+export function parseSI(text: string, unit: string): number | null {
+  const m = text.trim().match(/^([+-]?(?:\d+(?:\.\d*)?|\.\d+))(?:[eE]([+-]?\d+))?\s*(.*)$/);
   if (!m) return null;
-  const f = parseFloat(m[1]) * ({ m: 1e-3, k: 1e3, K: 1e3, M: 1e6 }[m[2]] ?? 1);
-  return f > 0 ? f : null;
+  let rest = m[3];
+  if (rest.toLowerCase().endsWith(unit.toLowerCase())) rest = rest.slice(0, -unit.length).trim();
+  const p = rest === '' ? 0 : PREFIX_EXP.get(rest);
+  if (p === undefined) return null;
+  // Scaling the decimal exponent, not multiplying: 1.2 m is exactly 0.0012, not 0.0012000000000000001.
+  return parseFloat(`${m[1]}e${Number(m[2] ?? 0) + p}`);
+}
+
+// Typed frequency: "10k", "10 kHz", "2.5MHz", "1e3", "500 mHz". Null when it isn't a positive number.
+export function parseHz(text: string): number | null {
+  const f = parseSI(text, 'Hz');
+  return f !== null && f > 0 ? f : null;
 }
 
 // A keystroke that begins a typed frequency. Modified digits are browser shortcuts; Shift stays

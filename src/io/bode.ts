@@ -1,5 +1,5 @@
 // Bode: host-side sweep. Generator sine → DUT; CH1 = DUT input, CH2 = DUT output.
-import { bodeMaxHz, bodePlan, bodeTimebase, genMaxHz, MEM_DEPTHS, VDIV_MV, type Model } from '../device';
+import { bodeMaxHz, bodePlan, bodeTimebase, fwHas, genMaxHz, MEM_DEPTHS, TRIG_TYPES, VDIV_MV, type Model } from '../device';
 import { bodeTone, extent, type Frame } from '../dsp';
 import { sleep } from '../link';
 import type { State } from '../store';
@@ -7,14 +7,20 @@ import { ctl, errText, fail, get, link, nearest, num, on } from './core';
 import { readGen, SHAPE_CMD } from './gen';
 import { fetchChannel, forgetWav, wavRun } from './scope';
 
-// The sweep's scope setup, and what each point sends. Everything these touch (plus the
-// CHANn:SCAL re-ranging) must be put back by scopeRestore: scripts/check-logic.mts checks it.
-// AC: the ZT703S sine sits on ~1.3 V DC, which would waste half the ADC codes. ACQ:MDEP is points per
-// enabled channel (the firmware picks the smallest memory budget covering it), so it is set after both
-// channels are on: half the smallest budget per channel keeps a record about the 10 divisions.
-export const SWEEP_SCOPE = [
+// The sweep's scope setup, whatever the scope was left at, and what each point sends. Everything these
+// touch (plus the CHANn:SCAL re-ranging) must be put back by scopeRestore: scripts/check-logic.mts checks it.
+// TRIG:MODE EDGE goes first (qual: FW.qualTrig): in Runt or Rise/fall a V/div or offset change moves the
+// band's other level to the nearest code on the screen (firmware applyFollowing), so ranging would wreck
+// the user's band; in Edge it is left alone. AC: the ZT703S sine sits on ~1.3 V DC, which would waste half
+// the ADC codes. An edge at 0 V, rising, no noise reject: the AC-coupled CH1 sine crosses it every period,
+// so Auto never waits out its budget. ACQ:MDEP is points per enabled channel (the firmware picks the
+// smallest memory budget covering it), so it is set after both channels are on: half the smallest budget
+// per channel keeps a record about the 10 divisions.
+export const sweepScope = (qual: boolean) => [
+  ...(qual ? ['TRIG:MODE EDGE'] : []),
   'CHAN1:DISP ON', 'CHAN2:DISP ON', 'CHAN1:COUP AC', 'CHAN2:COUP AC', 'CHAN1:OFFS 0', 'CHAN2:OFFS 0',
-  'ACQ:ROLL OFF', `ACQ:MDEP ${MEM_DEPTHS[0] / 2}`, 'TIM:OFFS 0', 'TRIG:EDGE:SOUR CHAN1', 'TRIG:SWE AUTO', 'RUN',
+  'ACQ:ROLL OFF', `ACQ:MDEP ${MEM_DEPTHS[0] / 2}`, 'TIM:OFFS 0',
+  'TRIG:EDGE:SOUR CHAN1', 'TRIG:EDGE:SLOP POS', 'TRIG:EDGE:NREJ OFF', 'TRIG:EDGE:LEV 0', 'TRIG:SWE AUTO', 'RUN',
 ];
 // The timebase only when it moves (1-2-5 steps: every few points). Each command is a device pass, ~24 ms
 // outside the held-frame window; a fresh record is waited for anyway (freshPair).
@@ -22,10 +28,13 @@ export const pointCmds = (f: number, tb: number, lastTb?: number) => [`SOUR:FREQ
 
 const SAVE_Q = {
   tb: 'TIM:SCAL?', hoff: 'TIM:OFFS?', swe: 'TRIG:SWE?', stat: 'TRIG:STAT?', src: 'TRIG:EDGE:SOUR?',
+  slope: 'TRIG:EDGE:SLOP?', nrej: 'TRIG:EDGE:NREJ?', lev: 'TRIG:EDGE:LEV?',
   d1: 'CHAN1:DISP?', d2: 'CHAN2:DISP?', s1: 'CHAN1:SCAL?', s2: 'CHAN2:SCAL?', o1: 'CHAN1:OFFS?', o2: 'CHAN2:OFFS?',
   p1: 'CHAN1:PROB?', p2: 'CHAN2:PROB?', c1: 'CHAN1:COUP?', c2: 'CHAN2:COUP?', roll: 'ACQ:ROLL?', mdep: 'ACQ:MDEP?',
 };
-type Saved = Record<keyof typeof SAVE_Q, string>;
+// mode: TRIG:MODE?, read on FW.qualTrig only ('' before).
+type Saved = Record<keyof typeof SAVE_Q, string> & { mode: string };
+const TRIG_TYPE_IDS: string[] = TRIG_TYPES.map((t) => t.id);
 
 // Puts the scope back as it was before the sweep. Values the device didn't report are skipped.
 export function scopeRestore(s: Saved): string[] {
@@ -43,6 +52,10 @@ export function scopeRestore(s: Saved): string[] {
     ...val('CHAN1:SCAL', s.s1), ...val('CHAN2:SCAL', s.s2), ...val('CHAN1:OFFS', s.o1), ...val('CHAN2:OFFS', s.o2),
     ...val('TIM:SCAL', s.tb), ...val('TIM:OFFS', s.hoff),
     `TRIG:EDGE:SOUR CHAN${s.src.endsWith('2') ? 2 : 1}`,
+    `TRIG:EDGE:SLOP ${s.slope.toUpperCase().startsWith('NEG') ? 'NEG' : 'POS'}`, `TRIG:EDGE:NREJ ${on(s.nrej) ? 'ON' : 'OFF'}`,
+    // The raw level after the channels are back (it is in ADC codes), still in Edge; the type last, so the
+    // band's other level, untouched in Edge, keeps its codes and so its voltage.
+    ...val('TRIG:EDGE:LEV', s.lev), ...(TRIG_TYPE_IDS.includes(s.mode.toUpperCase()) ? [`TRIG:MODE ${s.mode.toUpperCase()}`] : []),
     // Single is the SING command, never TRIG:SWE SING (see scopeRun).
     ...(swe.startsWith('SING') ? ['SING'] : [`TRIG:SWE ${swe.startsWith('NORM') ? 'NORM' : 'AUTO'}`]),
     ...(s.stat.toUpperCase().startsWith('STOP') ? ['STOP'] : []),
@@ -155,6 +168,13 @@ async function sweepPoint(f: number, vdiv: number[], probe: number[], prevF?: nu
   return p;
 }
 
+// What the sweep changes, read before it starts; the trigger type only where the firmware has it.
+async function readSaved(qual: boolean): Promise<Saved> {
+  const keys = Object.keys(SAVE_Q) as (keyof typeof SAVE_Q)[];
+  const vals = await link.texts([...Object.values(SAVE_Q), ...(qual ? ['TRIG:MODE?'] : [])]);
+  return { ...Object.fromEntries(keys.map((k, i) => [k, vals[i]])), mode: qual ? vals[keys.length] : '' } as Saved;
+}
+
 export async function bodeSweep() {
   if (get().profile !== 'DS1052') return fail('Bode needs the scope profile.');
   const { model, gen: g0, bode: b } = get();
@@ -163,17 +183,17 @@ export async function bodeSweep() {
   let restore: string[] = [];
   let skipped = 0;
   try {
-    const keys = Object.keys(SAVE_Q) as (keyof Saved)[];
-    const vals = await link.texts(Object.values(SAVE_Q));
-    const saved = Object.fromEntries(keys.map((k, i) => [k, vals[i]])) as Saved;
+    const qual = fwHas(get().idn?.fw, 'qualTrig');
+    const saved = await readSaved(qual);
     restore = scopeRestore(saved);
-    // Both channels start on CH1's V/div: on the same signal they then range alike (different ranges
-    // disagree by up to 0.5 dB on a ZT703S).
-    const probe = [num(saved.p1) || 1, num(saved.p2) || 1], v1 = num(saved.s1) || probe[0];
-    const vdiv = [v1, nearest(VDIV_MV.map((m) => (m * probe[1]) / 1000), v1)];
+    // Both channels start at 1 V/div (× probe), not where the scope was left: on the same signal they then
+    // range alike (different ranges disagree by up to 0.5 dB on a ZT703S), and from there a small signal
+    // jumps straight to its range while a clipping one climbs a step per record.
+    const probe = [num(saved.p1) || 1, num(saved.p2) || 1];
+    const vdiv = probe.map((p) => nearest(VDIV_MV.map((m) => (m * p) / 1000), p));
     forgetWav();
     await link.run(['WAV:MODE RAW', 'WAV:FORM BYTE']);
-    if (!(await ctl([`SOUR:FREQ ${freqs[0]}`, 'SOUR:FUNC SINusoid', 'OUTP ON', ...SWEEP_SCOPE, `CHAN1:SCAL ${vdiv[0]}`, `CHAN2:SCAL ${vdiv[1]}`]))) return;
+    if (!(await ctl([`SOUR:FREQ ${freqs[0]}`, 'SOUR:FUNC SINusoid', 'OUTP ON', ...sweepScope(qual), `CHAN1:SCAL ${vdiv[0]}`, `CHAN2:SCAL ${vdiv[1]}`]))) return;
     for (let k = 0; k < freqs.length && sweeping(); k++) {
       get().patch('bode', { at: freqs[k] });
       const p = await sweepPoint(freqs[k], vdiv, probe, freqs[k - 1]);

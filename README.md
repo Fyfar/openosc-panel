@@ -7,7 +7,7 @@ install, no backend. Your data never leaves your machine.
 [![Build](https://img.shields.io/github/actions/workflow/status/Fyfar/openosc-panel/ci.yml?branch=main&label=build)](https://github.com/Fyfar/openosc-panel/actions/workflows/ci.yml)
 [![Version](https://img.shields.io/github/package-json/v/Fyfar/openosc-panel?label=version&color=3b82f6)](https://github.com/Fyfar/openosc-panel/blob/main/package.json)
 [![License: MIT](https://img.shields.io/badge/license-MIT-22c55e)](./LICENSE)
-![Firmware: OpenOSC 0.21+ only](https://img.shields.io/badge/firmware-OpenOSC%200.21%2B%20only-f59e0b)
+![Firmware: OpenOSC 0.21.4+ only](https://img.shields.io/badge/firmware-OpenOSC%200.21.4%2B%20only-f59e0b)
 ![Stack: Vite · React · TypeScript · Tailwind](https://img.shields.io/badge/stack-Vite%20·%20React%2019%20·%20TypeScript%20·%20Tailwind%20v4-3b82f6)
 
 ![OpenOSC Panel: oscilloscope, generator, Bode and multimeter for the ZOYI ZT703S on OpenOSC firmware, shown as the multimeter, oscilloscope and generator views](./images/hero.jpg)
@@ -38,13 +38,16 @@ install, no backend. Your data never leaves your machine.
   counter on each channel.
 - **An FFT you can measure on:** peak frequency and level, two markers for differences, and plain
   notes on the panel when a spectrum can't be trusted.
+- **Catch glitches and bad pulses** with Pulse width, Runt and Rise/fall triggers: set the
+  polarity, the levels and a time limit like `50us` (OpenOSC 0.21.19 or newer).
 - Export the full capture record as CSV, not just what's on screen.
 
 ### Bode plot
 
 - **One click sweeps the generator** and re-ranges each channel as the gain changes, then reads off
   the −3 dB corner and roll-off.
-- Puts your scope and generator settings back when it's done.
+- Sets the scope up for the sweep itself, whatever you left it at, and puts your scope and
+  generator settings back when it's done, trigger included.
 
 ### Generator
 
@@ -67,7 +70,8 @@ install, no backend. Your data never leaves your machine.
 
 ## What you need
 
-- A **ZOYI ZT703S** with **OpenOSC 0.21 or newer** (tested on 0.21.4 to 0.21.9). The
+- A **ZOYI ZT703S** with **OpenOSC 0.21.4 or newer** (tested on 0.21.4 to 0.21.19). Older or
+  unrecognised firmware gets a warning before connecting, and features it lacks stay off. The
   **ZT706S** should work too, but nobody has tried it on real hardware yet. Reports welcome.
 - **OpenOSC 0.21.9 or newer is recommended:** the scope updates about three times faster,
   short glitches stay visible on long captures, and the measurements come from the device

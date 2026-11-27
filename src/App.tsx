@@ -5,7 +5,7 @@ import {
 } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { useShallow } from 'zustand/react/shallow';
-import { fmtHz, SHAPES, SWITCH_MS, type Mode } from './device';
+import { fmtHz, FW, SHAPES, SWITCH_MS, type Mode } from './device';
 import * as io from './io';
 import { unsavedData, useDev } from './store';
 import { Btn } from './ui';
@@ -28,7 +28,7 @@ export function App() {
   const shot = useDev((s) => s.shot);
   const consoleOpen = useDev((s) => s.console);
 
-  if (link === 'disconnected' || link === 'connecting') return <><ConnectScreen /><ErrorToast /><UpdateToast /></>;
+  if (link === 'disconnected' || link === 'connecting') return <><ConnectScreen /><FwDialog /><ErrorToast /><UpdateToast /></>;
 
   return (
     <div className="flex h-dvh flex-col">
@@ -222,7 +222,7 @@ function ConnectScreen() {
           <h1 className="text-xl font-semibold">Connect your ZT703S or ZT706S</h1>
           <p className="mt-1 text-sm text-muted">Multimeter, oscilloscope, generator and Bode analysis in the browser, over USB. No drivers.</p>
           <ul className="mt-4 space-y-2 text-sm">
-            <li className="flex gap-2"><span className="text-success">✓</span> OpenOSC firmware 0.21 or newer</li>
+            <li className="flex gap-2"><span className="text-success">✓</span> OpenOSC firmware {FW.min} or newer</li>
             <li className="flex gap-2"><span className="text-success">✓</span> USB enabled: <span className="text-muted">Settings → Files &amp; USB</span></li>
             <li className="flex gap-2"><span className="text-success">✓</span> Performance profile 200/100 (USB is off in faster profiles)</li>
           </ul>
@@ -306,6 +306,31 @@ function ScreenshotDialog() {
         <div className="mt-3 flex justify-end gap-2">
           <Btn onClick={() => void take()}><RotateCcw size={13} /> Retake</Btn>
           <Btn tone="accent" onClick={save} disabled={!url}><Download size={13} /> Save PNG</Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Firmware below FW.min or unreadable: an explicit choice, no outside-click close.
+function FwDialog() {
+  const fw = useDev((s) => s.fwWarn);
+  if (fw === null) return null;
+  return (
+    <div className="fixed inset-0 z-30 flex items-center justify-center bg-black/60 p-4" role="alertdialog" aria-labelledby="fw-title">
+      <div className="max-w-md rounded-lg border border-amber/40 bg-panel p-5">
+        <h2 id="fw-title" className="flex items-center gap-2 text-sm font-semibold text-amber">
+          <ShieldAlert size={18} className="shrink-0" />
+          {fw ? `OpenOSC ${fw} is older than this panel supports` : 'Could not read the firmware version'}
+        </h2>
+        <p className="mt-3 text-sm">
+          This panel needs OpenOSC {FW.min} or newer. Some features may not work at all, or the whole panel may
+          misbehave. Features that need a newer firmware stay off.
+        </p>
+        <p className="mt-2 text-sm text-muted">Update the meter's firmware for reliable use.</p>
+        <div className="mt-4 flex justify-end gap-2">
+          <Btn onClick={() => io.answerFw(false)}>Disconnect</Btn>
+          <Btn tone="accent" onClick={() => io.answerFw(true)}>Connect anyway</Btn>
         </div>
       </div>
     </div>

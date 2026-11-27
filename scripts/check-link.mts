@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict';
 import { Link, sleep } from '../src/link.ts';
 import { ctl, link, remote, runLoop, stopLoop } from '../src/io/core.ts';
-import { setMode } from '../src/io/index.ts'; // also: the store → SCPI subscription (drag coalescing)
+import { answerFw, connect, disconnect, setMode } from '../src/io/index.ts'; // also: the store → SCPI subscription (drag coalescing)
 import { clearDmmData, dmmCsvParts, dmmLoop, dmmRec, flushDmm, logMatches, setTrig, startDmmLog, stopDmmLog } from '../src/io/dmm.ts';
 import { REC_MAX } from '../src/recording.ts';
 import { emptyStats } from '../src/dsp.ts';
@@ -52,7 +52,8 @@ function fakePort(answer: (cmd: string) => Answer) {
     close: async () => {},
     getInfo: () => ({}),
   };
-  return { port: port as unknown as SerialPort, written, seen };
+  // drop: the cable is pulled (the reader errors, as Web Serial's does).
+  return { port: port as unknown as SerialPort, written, seen, drop: () => out.error(new Error('device lost')) };
 }
 
 let checks = 0;
@@ -840,6 +841,30 @@ await withScope({ fft: true, fw: '0.21.7' }, async (s) => {
   checks++;
 });
 
+// --- qualified trigger settings: read only from 0.21.19; older firmware's reads leave them alone ----
+{
+  const trig = () => useDev.getState().scope.trig;
+  const QUAL = /TRIG:(MODE|WHEN|TIME|LEV:)|TRIG:POL/;
+  const settingsRead = (s: Fake) => s.dev.written.filter((c) => c === 'TRIG:EDGE:SOUR?').length;
+  useDev.setState((st) => ({ scope: { ...st.scope, trig: { ...st.scope.trig, type: 'RUNT', lvLow: 0.25 } } }));
+  await withScope({ fft: false, fw: '0.21.14' }, async (s) => {
+    await until(() => settingsRead(s) >= 2, '0.21.14: settings read twice');
+    assert.ok(!s.dev.written.some((c) => QUAL.test(c)), '0.21.14 never gets a qualified trigger command');
+    assert.deepEqual([trig().type, trig().lvLow], ['RUNT', 0.25], 'a settings read keeps the fields it does not read');
+    checks += 2;
+  });
+  const cfg = {
+    'TRIG:MODE?': 'SLOP', 'TRIG:WHEN?': 'INS', 'TRIG:TIME:LOW?': '2.5e-4', 'TRIG:TIME:UPP?': '4e-4',
+    'TRIG:LEV:LOW?': '5.03974798322e-1', 'TRIG:LEV:HIGH?': '2.01589919329e+0', 'TRIG:EDGE:SLOP?': 'NEG',
+  };
+  await withScope({ fft: false, fw: '0.21.19', cfg }, async () => {
+    await until(() => trig().type === 'SLOP', '0.21.19 reads the trigger type');
+    const t = trig();
+    assert.deepEqual([t.when, t.tLow, t.tUpp, t.lvLow, t.lvHigh, t.slope], ['INS', 2.5e-4, 4e-4, 0.503974798322, 2.01589919329, 'NEG']);
+    checks++;
+  });
+}
+
 // --- Single, then waiting for a trigger (no frames, so no full settings read): the loop still
 // learns the device is in Single, and Run restores Auto first instead of re-arming another single
 {
@@ -912,6 +937,7 @@ function fakeBode() {
     'TRIG:SWE?': 'AUTO', 'TRIG:STAT?': 'TD', 'TRIG:EDGE:SOUR?': 'CHAN1', 'CHAN1:DISP?': '1', 'CHAN2:DISP?': '0',
     'CHAN2:SCAL?': '2', 'CHAN1:OFFS?': '0', 'CHAN2:OFFS?': '0', 'CHAN1:PROB?': '1', 'CHAN2:PROB?': '1',
     'CHAN1:COUP?': 'DC', 'CHAN2:COUP?': 'DC', 'ACQ:ROLL?': '1', 'ACQ:MDEP?': '2.58048e+5',
+    'TRIG:EDGE:SLOP?': 'POS', 'TRIG:EDGE:NREJ?': '1', 'TRIG:EDGE:LEV?': '1.44375e+0', 'TRIG:MODE?': 'RUNT',
   };
   const data = () => {
     const f = st.freq * 1.001, ch = st.src, yinc = st.vd[ch - 1] / 25, amp = st.amp[ch - 1], ph = ch === 1 ? 0 : -Math.PI / 4;
@@ -935,10 +961,10 @@ function fakeBode() {
   return { dev, st };
 }
 const near = (got: number, want: number, tol: number, what: string) => assert.ok(Math.abs(got - want) <= tol, `${what}: got ${got}, want ${want} ± ${tol}`);
-async function runBode(setup: (st: ReturnType<typeof fakeBode>['st']) => void, storeTb = 15) {
+async function runBode(setup: (st: ReturnType<typeof fakeBode>['st']) => void, storeTb = 15, fw = '0.21.14') {
   const { dev, st } = fakeBode();
   setup(st);
-  useDev.setState({ idn: { model: 'DS1052', serial: 'T', fw: '0.21.14' }, model: 'ZT703S', profile: 'DS1052', error: null });
+  useDev.setState({ idn: { model: 'DS1052', serial: 'T', fw }, model: 'ZT703S', profile: 'DS1052', error: null });
   useDev.getState().patch('scope', { tb: storeTb });
   useDev.getState().patch('bode', { start: 1000, stop: 10_000, ppd: 2 }); // 1 k, 3.16 k, 10 k
   const ats: (number | null)[] = []; // every frequency the view was told is being measured
@@ -958,7 +984,8 @@ async function runBode(setup: (st: ReturnType<typeof fakeBode>['st']) => void, s
   }
   [1000, 10 ** 3.5, 10_000].forEach((f, i) => near(r.points[i].f, f * 1.001, f * 1e-4, 'Bode point at the played frequency'));
   assert.ok(r.st.star.every((a) => a === '1'), `whole records only: WAV:STAR ${r.st.star.join(',')}`);
-  assert.ok(r.sent.includes('CHAN2:SCAL 0.5'), 'CH2 (0.5 V on 1 V/div after starting from CH1\'s V/div) ranged down');
+  assert.ok(r.sent.includes('CHAN2:SCAL 0.5'), 'CH2 (0.5 V on the 1 V/div start) ranged down');
+  assert.ok(!r.sent.some((c) => c.startsWith('TRIG:MODE')), '0.21.14: no TRIG:MODE, setup or restore');
   const tail = r.sent.slice(r.sent.lastIndexOf('WAV:DATA?'));
   for (const c of ['ACQ:ROLL ON', 'ACQ:MDEP 262144', 'CHAN1:COUP DC', 'CHAN2:DISP OFF', 'CHAN2:SCAL 2']) assert.ok(tail.includes(c), `restored ${c}`);
   const sweep = r.sent.slice(0, r.sent.lastIndexOf('WAV:SNAP')); // before the restore
@@ -970,7 +997,21 @@ async function runBode(setup: (st: ReturnType<typeof fakeBode>['st']) => void, s
 
   const fast = await runBode((st) => (st.nanAt = 2), 6); // Scope screen last at 1 µs/div
   assert.deepEqual(fast.points, r.points, 'the Scope screen\'s timebase changes nothing');
-  checks++;
+  // Whatever V/div the scope was left at, the sweep starts from its own and measures the same.
+  for (const left of ['0.02', '10']) {
+    const other = await runBode((st) => { st.nanAt = 2; st.saved = left; });
+    assert.deepEqual(other.points, r.points, `scope left at ${left} V/div changes nothing`);
+  }
+  checks += 4;
+
+  // 0.21.19 left in Runt: Edge before any channel change, Runt back after the channels and the level.
+  const runt = await runBode((st) => (st.nanAt = 2), 15, '0.21.19');
+  const setup = runt.sent.slice(0, runt.sent.indexOf('WAV:SNAP')), back = runt.sent.slice(runt.sent.lastIndexOf('WAV:SNAP'));
+  const first = (list: string[], re: RegExp) => list.findIndex((c) => re.test(c));
+  assert.ok(first(setup, /^TRIG:MODE EDGE$/) >= 0 && first(setup, /^TRIG:MODE EDGE$/) < first(setup, /^CHAN\d:(SCAL|OFFS) /), 'Edge before the first channel change');
+  assert.ok(first(back, /^TRIG:MODE RUNT$/) > back.findLastIndex((c) => /^CHAN\d:(SCAL|OFFS) /.test(c)), 'Runt restored after the channels');
+  assert.ok(back.includes('TRIG:EDGE:LEV 1.44375'), 'the edge level restored');
+  assert.deepEqual(runt.points, r.points, 'same result as on 0.21.14');
 }
 {
   const r = await runBode((st) => (st.stuckAt = 3)); // SOUR:FREQ #1 is the setup, #3 the 2nd point
@@ -994,8 +1035,8 @@ async function runBode(setup: (st: ReturnType<typeof fakeBode>['st']) => void, s
   // 10 steps + the measurement) must not use up the first point.
   const silent = await runBode((st) => (st.amp[1] = 0.001)); // grounded or deep-stopband CH2: 1 V → 20 mV/div
   assert.equal(silent.points.length, 3, `silent CH2: ${silent.points.length} points, ${silent.error}`);
-  const climb = await runBode((st) => { st.saved = '0.02'; st.amp = [30, 15]; }); // Scope left at 20 mV/div, 60 Vpp input
-  assert.equal(climb.points.length, 3, `starting at 20 mV/div: ${climb.points.length} points, ${climb.error}`);
+  const climb = await runBode((st) => (st.amp = [30, 15])); // 60 Vpp input: climbs from the 1 V/div start to 10 V/div
+  assert.equal(climb.points.length, 3, `60 Vpp input: ${climb.points.length} points, ${climb.error}`);
   checks += 2;
 }
 
@@ -1015,6 +1056,64 @@ async function runBode(setup: (st: ReturnType<typeof fakeBode>['st']) => void, s
   const again = await runBode(() => {});
   assert.equal(again.points.length, 3, `a stop does not carry into the next sweep: ${again.points.length} points`);
   checks += 7;
+}
+
+// --- firmware below FW.min or unreadable: nothing after identification until the user answers -----
+{
+  const ID_BATCH = ['*IDN?', '*CLS', 'SOUR:VOLT?', 'SYST:ERR?'];
+  const meter = (fw: string) => {
+    const dev = fakePort((c) => (c === '*IDN?' ? `OpenOSC,DS1052,TEST0001,${fw}` : c === 'SYST:ERR?' ? '-241,"Hardware missing"' : c.includes('?') ? '0' : null));
+    (dev.port as unknown as { getInfo: () => SerialPortInfo }).getInfo = () => ({ usbVendorId: 0x0483, usbProductId: 0x572a });
+    Object.defineProperty(navigator, 'serial', { configurable: true, value: { getPorts: async () => [dev.port], requestPort: async () => dev.port } });
+    return dev;
+  };
+  // gen mode on the scope profile: connect reads the generator but starts no instrument loop.
+  const connectTo = (fw: string) => {
+    const dev = meter(fw);
+    useDev.setState({ link: 'disconnected', mode: 'gen', fwWarn: null, error: null });
+    return { dev, done: connect() };
+  };
+  const until = async (f: () => boolean) => { for (let i = 0; i < 200 && !f(); i++) await sleep(5); };
+  const within = (p: Promise<unknown>, what: string) => Promise.race([p, sleep(3000).then(() => assert.fail(`${what}: connect never returned`))]);
+
+  const old = connectTo('0.20.9');
+  await until(() => useDev.getState().fwWarn !== null);
+  assert.equal(useDev.getState().fwWarn, '0.20.9', 'dialog names the firmware');
+  await sleep(50);
+  assert.deepEqual(old.dev.written, ID_BATCH, 'nothing sent past identification while the dialog waits');
+  answerFw(true);
+  await old.done;
+  assert.equal(useDev.getState().link, 'connected', 'Connect anyway connects');
+  assert.ok(old.dev.written.includes('SYST:REM?'), 'and starts talking to the meter');
+  await disconnect();
+  checks += 4;
+
+  const declined = connectTo('');
+  await until(() => useDev.getState().fwWarn !== null);
+  assert.equal(useDev.getState().fwWarn, '', 'unreadable version asks too');
+  answerFw(false);
+  await declined.done;
+  assert.equal(useDev.getState().link, 'disconnected', 'Disconnect closes');
+  assert.deepEqual(declined.dev.written, ID_BATCH, 'Disconnect sends nothing more');
+  checks += 3;
+
+  const pulled = connectTo('0.21.3');
+  await until(() => useDev.getState().fwWarn !== null);
+  pulled.dev.drop();
+  await within(pulled.done, 'cable pulled at the dialog');
+  assert.equal(useDev.getState().fwWarn, null, 'a lost cable closes the dialog');
+  assert.equal(useDev.getState().link, 'disconnected');
+  answerFw(true); // a late click on a dialog that is gone
+  await sleep(50);
+  assert.deepEqual(pulled.dev.written, ID_BATCH, 'a late Connect anyway starts nothing');
+  checks += 3;
+
+  const fine = connectTo('0.21.19');
+  await fine.done;
+  assert.equal(useDev.getState().fwWarn, null, 'supported firmware: no dialog');
+  assert.equal(useDev.getState().link, 'connected');
+  await disconnect();
+  checks += 2;
 }
 
 console.log(`check-link: ${checks} checks passed`);

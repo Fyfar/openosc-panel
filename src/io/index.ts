@@ -2,7 +2,7 @@
 // SCPI sync subscription, and system commands. Instruments live in ./dmm ./scope ./gen ./bode,
 // shared plumbing (link, ctl, remote, loop control) in ./core. Timings measured on a real ZT703S
 // are cited inline.
-import { PROFILE_OF, type Mode, type Profile } from '../device';
+import { fwHas, PROFILE_OF, type Mode, type Profile } from '../device';
 import { matches, sleep, VID } from '../link';
 import { useDev, type State } from '../store';
 import { applying, ctl, current, errText, fail, get, type Key, lastSent, link, localAt, now, on, runLoop, set, stopLoop } from './core';
@@ -73,7 +73,23 @@ async function openPort(port: SerialPort) {
   set({ idn: { model, serial, fw }, model: err.startsWith('-241') ? 'ZT703S' : 'ZT706S', profile: model === 'XDM1041' ? 'XDM1041' : 'DS1052' });
 }
 
+// Below FW.min or an unreadable version: the user decides before anything polls the meter.
+let fwAnswer: ((ok: boolean) => void) | null = null;
+function askFw(fw: string | undefined): Promise<boolean> {
+  if (fwHas(fw, 'min')) return Promise.resolve(true);
+  set({ fwWarn: fw ?? '' });
+  return new Promise((resolve) => { fwAnswer = resolve; });
+}
+
+export function answerFw(ok: boolean) {
+  const resolve = fwAnswer;
+  fwAnswer = null;
+  set({ fwWarn: null });
+  resolve?.(ok);
+}
+
 function onLinkClosed() {
+  answerFw(false); // a cable pulled while the firmware dialog is open: that connect never starts
   if (switching) return;
   void stopLoop();
   set({ link: 'disconnected' });
@@ -102,6 +118,7 @@ export async function connect() {
   try {
     await pickPort();
     skipGranted = false;
+    if (!(await askFw(get().idn?.fw))) return await closeUnused();
     const remoteOn = on(await link.q('SYST:REM?').catch(() => '0'));
     const { profile, mode } = get();
     const fits = PROFILE_OF[mode] === null || PROFILE_OF[mode] === profile;
@@ -114,6 +131,13 @@ export async function connect() {
     if (/No port selected/i.test(m)) return;
     fail(skipGranted ? `Connect failed: ${m}.` : `Connect failed: ${m}. On Linux add yourself to the dialout group; check Settings → Files & USB on the device.`);
   }
+}
+
+// Declined at the firmware dialog. A lost cable already closed the link (and toasted): setting
+// expectClose then would swallow the next real disconnect's toast.
+async function closeUnused() {
+  if (!link.closed) { expectClose = true; await link.close(); }
+  set({ link: 'disconnected' });
 }
 
 export async function disconnect() {
