@@ -39,10 +39,13 @@ export type State = {
   ranges: number[]; // SI maxima from SYST:DMM:RANG:LIST?
   fahrenheit: boolean; // SYST:DMM:TEMP:UNIT?
   reading: { v: number | null; over: boolean; blank: boolean; sec: number | null; seq: number } | null;
-  hist: { t: number[]; v: (number | null)[] }; // recorded readings; null = OL, blank or pause gap
-  dstats: DmmStats; // of every recorded reading, not capped like `hist`
+  recRev: number; // moves on every change of the recording (io/dmm.ts `dmmRec`, kept out of the store)
+  dstats: DmmStats; // of every recorded reading
   recorded: { func: DmmFunc; fahrenheit: boolean; rangeMax?: number } | null; // what the recording holds
   logged: number;
+  // A recording found in storage at page load, not restored or discarded yet (io/saved.ts).
+  savedOffer: { func: DmmFunc; fahrenheit: boolean; valid: number; last: number; known: boolean } | null;
+  saveState: { kind: 'idle' } | { kind: 'saved'; at: number } | { kind: 'off'; why: 'unavailable' | 'full' | 'other-tab' | 'failed' };
   junctionNeeded: boolean; // CONF:TEMP was refused: Type K has no cold junction configured
 
   scope: {
@@ -100,11 +103,13 @@ export const useDev = create<State>((set) => ({
   ranges: [],
   fahrenheit: false,
   reading: null,
-  hist: { t: [], v: [] },
+  recRev: 0,
   dstats: emptyStats(),
   recorded: null,
   junctionNeeded: false,
   logged: 0,
+  savedOffer: null,
+  saveState: { kind: 'idle' },
 
   scope: {
     sweep: 'AUTO',

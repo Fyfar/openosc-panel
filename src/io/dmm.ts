@@ -2,6 +2,7 @@
 import { DMM_FUNCS, dmmBase, dmmScale, HOLD_MODES, type DmmFunc } from '../device';
 import { addStat, emptyStats } from '../dsp';
 import { sleep } from '../link';
+import { Recording, REC_MAX } from '../recording';
 import type { State } from '../store';
 import { alive, ctl, download, get, link, now, num, on, remote, set } from './core';
 
@@ -34,7 +35,8 @@ let discardNext = false;
 let lastFunc = '';
 // Outlives the loop: a view change restarts it, and the reading it finds must not be recorded again.
 let lastSeq = NaN;
-const dmmLog: [t: number, func: DmmFunc, v: number, unit: string][] = [];
+// The recording: chart, statistics and CSV all read it. The store only sees `recRev` move.
+export const dmmRec = new Recording();
 const UNIT_Q = 'SYST:DMM:TEMP:UNIT?';
 
 export async function flushDmm(a: Dmm, b: Dmm) {
@@ -159,7 +161,7 @@ export const logMatches = (r: State['recorded'], func: DmmFunc, fahrenheit: bool
 
 // A recording holds one function and unit: a reading of any other ends it. `v` null = OL or blank.
 function record(func: DmmFunc, v: number | null, range: number) {
-  const { recorded, fahrenheit, ranges, dmm, hist: h, dstats } = get();
+  const { recorded, fahrenheit, ranges, dmm, recRev, dstats } = get();
   if (!logMatches(recorded, func, fahrenheit)) return stopDmmLog();
   // This reading's own range (the store's is from the previous poll): one stale coarse LSD would
   // coarsen the histogram for the whole recording.
@@ -168,29 +170,34 @@ function record(func: DmmFunc, v: number | null, range: number) {
     set({ recorded: recorded ?? { func, fahrenheit, rangeMax } });
     return breakLine();
   }
-  const t = Date.now() / 1000;
-  dmmLog.push([t, func, v, dmmBase(func, fahrenheit)]);
-  // ponytail: copy-on-push, 20k cap (~1.8 h at 3 readings/s); chunked store when "all" must be unbounded.
+  dmmRec.push(Date.now() / 1000, v);
   set({
     recorded: { func, fahrenheit, rangeMax },
-    hist: { t: [...h.t, t].slice(-20000), v: [...h.v, v].slice(-20000) },
+    recRev: recRev + 1,
     dstats: addStat(dstats, v, dmmScale(func, rangeMax).lsd),
-    logged: dmmLog.length,
+    logged: dmmRec.valid,
   });
+  if (dmmRec.valid >= REC_MAX) stopDmmLog();
 }
 
-// One gap per run of OL, blank or paused. The last value is repeated at the gap's start first: a stepped
-// line only reaches the next point, so the reading before the gap would otherwise draw no step at all.
+// One gap per run of OL, blank or paused (the chart draws the held step to it).
 function breakLine() {
-  const h = get().hist, last = h.v.at(-1), t = Date.now() / 1000;
-  if (last != null) set({ hist: { t: [...h.t, t, t], v: [...h.v, last, null] } });
+  if (dmmRec.gap(Date.now() / 1000)) set({ recRev: get().recRev + 1 });
 }
 
 function clearReading() {
   set({ reading: null, junctionNeeded: false });
 }
 
+export const atLimit = (s: State) => s.logged >= REC_MAX;
+
+let persistAsked = false;
+
+// Refused at the limit, and while a saved recording is offered: a new one would overwrite it.
 export function startDmmLog() {
+  if (atLimit(get()) || get().savedOffer) return;
+  // Asked on a click: Firefox shows a prompt for it. A refusal changes nothing else.
+  if (!persistAsked) { persistAsked = true; navigator.storage?.persist?.().catch(() => {}); }
   set({ logging: true, ...(get().logged ? {} : { recorded: null }) });
 }
 
@@ -201,17 +208,18 @@ export function stopDmmLog() {
 }
 
 export async function clearDmmData() {
-  dmmLog.length = 0;
-  set({ logged: 0, recorded: null, hist: { t: [], v: [] }, dstats: emptyStats() });
+  dmmRec.clear();
+  set({ logged: 0, recorded: null, recRev: get().recRev + 1, dstats: emptyStats() });
   await ctl(['SYST:DMM:STAT:RES']);
 }
 
-// One row per reading with its own function and unit: a log can span function changes.
-export function dmmLogCsv(): string {
-  const rows = dmmLog.map(([t, func, v, unit]) => `${new Date(t * 1000).toISOString()},${DMM_FUNCS.find((x) => x.id === func)!.label},${v},${unit}`);
-  return `time,function,value,unit\n${rows.join('\n')}\n`;
+// A recording holds one function and unit (`record`), so every row carries the same two.
+export function dmmCsvParts(): string[] {
+  const r = get().recorded;
+  if (!r) return dmmRec.csvParts('', '');
+  return dmmRec.csvParts(DMM_FUNCS.find((x) => x.id === r.func)!.label, dmmBase(r.func, r.fahrenheit));
 }
 
 export function exportDmmLog() {
-  download(`dmm-${Date.now()}.csv`, new Blob([dmmLogCsv()], { type: 'text/csv' }));
+  download(`dmm-${Date.now()}.csv`, new Blob(dmmCsvParts(), { type: 'text/csv' }));
 }

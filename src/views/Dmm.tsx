@@ -1,11 +1,12 @@
 import { clsx } from 'clsx';
 import { Download, Pause, Play, Trash2 } from 'lucide-react';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type RefObject } from 'react';
 import uPlot from 'uplot';
 import { DMM_FUNCS, dmmBase, dmmScale, HOLD_MODES, scaleFor, type DmmFunc } from '../device';
 import { heldIdx, histogram, stdDev, windowExtent, yFloor } from '../dsp';
 import * as io from '../io';
 import { AXIS, legendIn, legendValue, Plot } from '../Plot';
+import { decimate, REC_MAX, type Trace } from '../recording';
 import { useDev } from '../store';
 import { Btn, Panel, Seg, Stat, Toggle } from '../ui';
 
@@ -85,6 +86,8 @@ export function Dmm() {
             <Meta label="Samples" value={n.toLocaleString('en')} />
           </div>
         </Panel>
+
+        <SavedNotice />
 
         <Trend sc={recordedSc} />
 
@@ -170,27 +173,34 @@ function Statistics({ sc }: { sc: Scale }) {
 }
 
 function Trend({ sc }: { sc: Scale }) {
-  const hist = useDev((s) => s.hist);
+  const recRev = useDev((s) => s.recRev);
   const dstats = useDev((s) => s.dstats);
   const center = useDev((s) => s.reading?.v ?? 0);
   const [kind, setKind] = useState<'line' | 'hist'>('line');
   const [win, setWin] = useState(60);
   const [manual, setManual] = useManualY();
   const legend = useRef<HTMLDivElement>(null);
-  const { end, x0, x1 } = useTimeWindow(hist.t, win);
+  const { end, x0, x1 } = useTimeWindow(win);
+  // `recRev` is the recording's change signal: `io.dmmRec` itself keeps its identity.
+  const trace = useMemo(() => decimate(io.dmmRec, x0, x1), [recRev, x0, x1]);
+  const gaps = useRef(trace.gaps);
+  gaps.current = trace.gaps;
   const width = dstats.lsd || sc.lsd;
   const bins = useMemo(() => (kind === 'hist' ? histogram(dstats.counts, width, center) : []), [kind, dstats, width, center]);
   const hdp = Math.max(0, Math.round(-Math.log10(width / sc.div)));
 
   // Rebuilt only when the axis format changes: `sc` is a new object on every reading.
-  const opts = useMemo(() => ({ ...trendOpts(kind, sc, manual, hdp), legend: legendIn(legend) }), [kind, sc.div, sc.dp, sc.lsd, manual, hdp]);
+  const opts = useMemo(
+    () => ({ ...trendOpts(kind, sc, manual, hdp), legend: legendIn(legend), ...(kind === 'line' ? { hooks: { draw: [gapTicks(gaps)] } } : {}) }),
+    [kind, sc.div, sc.dp, sc.lsd, manual, hdp],
+  );
   const data = useMemo<uPlot.AlignedData>(
     () => (kind === 'hist'
       ? [bins.map((b) => b.value), bins.map((b) => (b.kind === 'in' ? b.count : null)), bins.map((b) => (b.kind === 'in' ? null : b.count))]
       // The last reading holds until now: a stepped line ends at its last point, so without this tail
       // HOLD or a slow function (large CAP) scrolls the trace out of a short window.
-      : hist.v.at(-1) != null && end > hist.t.at(-1)! ? [[...hist.t, end], [...hist.v, hist.v.at(-1)!]] : [hist.t, hist.v]),
-    [kind, bins, hist, end],
+      : trace.v.at(-1) != null && end > trace.t.at(-1)! ? [[...trace.t, end], [...trace.v, trace.v.at(-1)!]] : [trace.t, trace.v]),
+    [kind, bins, trace, end],
   );
 
   const setY = (lo: number, hi: number) => { if (lo < hi) setManual({ lo, hi }); };
@@ -208,11 +218,11 @@ function Trend({ sc }: { sc: Scale }) {
     >
       <div className="relative">
         <Plot opts={opts} data={data} x={kind === 'line' ? [x0, x1] : undefined} className="h-64" />
-        <ChartNotes manual={kind === 'line' ? manual : null} x0={x0} x1={x1} sc={sc} />
+        <ChartNotes manual={kind === 'line' ? manual : null} trace={trace} x0={x0} x1={x1} sc={sc} />
       </div>
       {kind === 'line' ? (
         <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2">
-          <div className="w-36"><Toggle label="Auto Y" on={!manual} onChange={(auto) => setManual(auto ? null : range(yAuto(...windowExtent(hist.t, hist.v, x0, x1), sc.lsd)))} /></div>
+          <div className="w-36"><Toggle label="Auto Y" on={!manual} onChange={(auto) => setManual(auto ? null : range(yAuto(...windowExtent(trace.t, trace.v, x0, x1), sc.lsd)))} /></div>
           {manual && <YInput label="Min" v={manual.lo} sc={sc} onCommit={(lo) => setY(lo, manual.hi)} />}
           {manual && <YInput label="Max" v={manual.hi} sc={sc} onCommit={(hi) => setY(manual.lo, hi)} />}
         </div>
@@ -223,23 +233,41 @@ function Trend({ sc }: { sc: Scale }) {
   );
 }
 
+// An amber tick at the bottom of the plot for each gap (OL, blank, pause): on a wide window a short one
+// is narrower than a pixel, so the line's own break can't show it.
+const gapTicks = (gaps: RefObject<number[]>) => (u: uPlot) => {
+  const { ctx, bbox } = u, dpr = devicePixelRatio, bottom = bbox.top + bbox.height;
+  ctx.save();
+  ctx.strokeStyle = '#f59e0b';
+  ctx.lineWidth = Math.max(1, dpr);
+  ctx.beginPath();
+  for (const t of gaps.current) {
+    const x = Math.round(u.valToPos(t, 'x', true));
+    if (x < bbox.left || x > bbox.left + bbox.width) continue;
+    ctx.moveTo(x, bottom);
+    ctx.lineTo(x, bottom - 6 * dpr);
+  }
+  ctx.stroke();
+  ctx.restore();
+};
+
 // The line view's x window. A bounded one starts at the first reading while it fills (the trace grows
 // rightward), then rolls with the clock while logging (also when HOLD stops new readings). Not logging,
 // it ends at the last point.
-function useTimeWindow(t: number[], win: number) {
+function useTimeWindow(win: number) {
   const logging = useDev((s) => s.logging);
+  useDev((s) => s.recRev);
   const now = useNow(1000);
-  const last = t.at(-1);
-  const end = !logging && last !== undefined ? last : Math.max(now, last ?? 0), t0 = t[0] ?? end;
+  const r = io.dmmRec, last = r.length ? r.t(r.length - 1) : undefined;
+  const end = !logging && last !== undefined ? last : Math.max(now, last ?? 0), t0 = r.length ? r.t(0) : end;
   const x0 = win ? Math.max(t0, end - win) : t0, x1 = win ? x0 + win : Math.max(end, t0 + 10);
   return { end, x0, x1 };
 }
 
 // Text over the plot: how to fill an empty chart, and which side of a manual Y range cuts readings off.
-function ChartNotes({ manual, x0, x1, sc }: { manual: { lo: number; hi: number } | null; x0: number; x1: number; sc: Scale }) {
-  const hist = useDev((s) => s.hist);
+function ChartNotes({ manual, trace, x0, x1, sc }: { manual: { lo: number; hi: number } | null; trace: Trace; x0: number; x1: number; sc: Scale }) {
   const logging = useDev((s) => s.logging);
-  if (!hist.t.length) {
+  if (!io.dmmRec.length) {
     return logging ? null : (
       <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center pr-3 pb-6 pl-18">
         <p className="rounded-md border border-border bg-panel px-3 py-2 text-center text-sm text-muted">Press "Start logging" to chart readings and collect statistics</p>
@@ -247,7 +275,7 @@ function ChartNotes({ manual, x0, x1, sc }: { manual: { lo: number; hi: number }
     );
   }
   if (!manual) return null;
-  const [lo, hi] = windowExtent(hist.t, hist.v, x0, x1);
+  const [lo, hi] = windowExtent(trace.t, trace.v, x0, x1);
   const value = (x: number) => `${(x / sc.div).toFixed(sc.dp)} ${sc.unit}`;
   const label = 'pointer-events-none absolute right-2 z-10 rounded border border-amber/50 bg-panel px-2 py-0.5 font-mono text-[11px] text-amber';
   return (
@@ -419,16 +447,24 @@ function LogPanel() {
   const recorded = useDev((s) => s.recorded);
   const func = useDev((s) => s.dmm.func);
   const fahrenheit = useDev((s) => s.fahrenheit);
+  const full = useDev(io.atLimit);
+  const offered = useDev((s) => s.savedOffer !== null);
   // Data of another function or unit stays until cleared: nothing can be added to it.
   const other = !logging && logged > 0 && !io.logMatches(recorded, func, fahrenheit) ? recorded : null;
+  const blocked = offered
+    ? 'Restore or discard the saved recording first.'
+    : full
+    ? `The limit of ${REC_MAX.toLocaleString('en')} readings is reached. Export the CSV, then press "Clear data" to start a new recording.`
+    : other && `The data is from ${funcName(other.func, other.fahrenheit)}. Switch back to it, or press "Clear data" to record something else.`;
   return (
     <Panel title="Logging">
       <div className="space-y-2">
         <Row2 label="Logged rows" value={logged.toLocaleString('en')} />
-        <Btn tone={logging ? 'danger' : 'success'} className="w-full" disabled={!!other} onClick={logging ? io.stopDmmLog : io.startDmmLog}>
+        <SaveStatus />
+        <Btn tone={logging ? 'danger' : 'success'} className="w-full" disabled={!logging && !!blocked} onClick={logging ? io.stopDmmLog : io.startDmmLog}>
           {logging ? <><Pause size={13} /> Stop logging</> : <><Play size={13} /> Start logging</>}
         </Btn>
-        {other && <p className="text-[11px] text-amber">The data is from {funcName(other.func, other.fahrenheit)}. Switch back to it, or press "Clear data" to record something else.</p>}
+        {!logging && blocked && <p className="text-[11px] text-amber">{blocked}</p>}
         <div className="grid grid-cols-2 gap-2">
           <Btn disabled={!logged} onClick={io.exportDmmLog}><Download size={13} /> CSV</Btn>
           {/* Also resets the meter's own statistics, so it works with nothing recorded. */}
@@ -436,6 +472,36 @@ function LogPanel() {
         </div>
       </div>
     </Panel>
+  );
+}
+
+const NOT_SAVED = { unavailable: 'storage unavailable', full: 'storage full', 'other-tab': 'another tab holds the saved recording', failed: 'storage error' };
+
+// Whether the recording would survive a reload.
+function SaveStatus() {
+  const st = useDev((s) => s.saveState);
+  if (st.kind !== 'off') return <Row2 label="Saved" value={st.kind === 'saved' ? CLOCK(new Date(st.at)) : '—'} />;
+  return <p className="text-[11px] text-amber">Not saved: {NOT_SAVED[st.why]}. A reload loses this recording.</p>;
+}
+
+// A recording found in storage when the page opened: nothing comes back without a choice.
+function SavedNotice() {
+  const offer = useDev((s) => s.savedOffer);
+  const [busy, setBusy] = useState(false);
+  if (!offer) return null;
+  const run = (action: () => Promise<void>) => () => { setBusy(true); void action().finally(() => setBusy(false)); };
+  return (
+    <div className="flex flex-wrap items-center gap-x-4 gap-y-2 rounded-md border border-accent/50 bg-panel px-4 py-3 text-sm">
+      <p className="min-w-0 flex-1">
+        {offer.known
+          ? <>Saved recording: <b>{funcName(offer.func, offer.fahrenheit)}</b>, {offer.valid.toLocaleString('en')} readings, last at {new Date(offer.last * 1000).toLocaleString()}.</>
+          : 'A recording saved by another version of the app cannot be restored.'}
+      </p>
+      <div className="flex gap-2">
+        {offer.known && <Btn tone="success" disabled={busy} onClick={run(io.restoreSaved)}>{busy ? 'Restoring…' : 'Restore'}</Btn>}
+        <Btn tone="danger" disabled={busy} onClick={run(io.discardSaved)}>Discard</Btn>
+      </div>
+    </div>
   );
 }
 

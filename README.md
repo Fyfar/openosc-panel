@@ -32,7 +32,8 @@ install, no backend. Your data never leaves your machine.
 - **A generator you can type into.** `10k`, `2.5 MHz`, `500 mHz`. Six shapes, duty cycle,
   levels or amplitude, and it keeps running while you work in another view.
 - **Multimeter with a trend chart and CSV logging.** Press *Start logging* and the chart,
-  statistics and CSV fill from the same readings.
+  statistics and CSV fill from the same readings. A recording holds up to 1.8 million readings
+  (about a week) and survives a page reload or a browser crash: the panel offers to restore it.
 - **One tab per instrument.** The device needs a different USB profile for scope and
   multimeter; the panel switches it for you in about a second.
 - **Full control when you need it:** a SCPI console, device screenshots and a remote lock for
