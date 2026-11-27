@@ -1,12 +1,13 @@
 import { Download, Loader2, Play, Square } from 'lucide-react';
-import { useEffect, useMemo, useReducer, useRef, useState } from 'react';
-import type uPlot from 'uplot';
+import { clsx } from 'clsx';
+import { useEffect, useMemo, useReducer, useRef, useState, type RefObject } from 'react';
+import uPlot from 'uplot';
 import { bodeEta, bodeMaxHz, bodePlan, bodeSlow, fmtHz } from '../device';
-import { spanAtLeast, unwrapPhase } from '../dsp';
+import { bodeResults, spanAtLeast, unwrapPhase, wrap180, type BodePt, type BodeResults } from '../dsp';
 import * as io from '../io';
 import { AXIS, Plot, legendIn, legendValue } from '../Plot';
 import { useDev } from '../store';
-import { Btn, Panel, Row, Select, Stat } from '../ui';
+import { Btn, Panel, Row, Seg, Select, Stat } from '../ui';
 
 export function Bode() {
   const b = useDev((s) => s.bode);
@@ -18,21 +19,7 @@ export function Bode() {
   const sineMax = bodeMaxHz(model, amp, fw); // same ceiling as io.bodeSweep
   const plan = useMemo(() => bodePlan(b.start, Math.min(b.stop, sineMax), b.ppd), [b.start, b.stop, b.ppd, sineMax]);
 
-  // -3 dB point by linear interpolation in log-frequency.
-  const f3 = useMemo(() => {
-    const i = pts.findIndex((p) => p.db <= -3);
-    if (i < 1) return null;
-    const a = pts[i - 1], c = pts[i];
-    return a.f * (c.f / a.f) ** ((-3 - a.db) / (c.db - a.db));
-  }, [pts]);
-  const ph3 = useMemo(() => {
-    if (!f3) return null;
-    const i = pts.findIndex((p) => p.f >= f3);
-    if (i < 1) return null;
-    const a = pts[i - 1], c = pts[i], t = Math.log(f3 / a.f) / Math.log(c.f / a.f);
-    return a.ph + t * (c.ph - a.ph);
-  }, [pts, f3]);
-  const slope = pts.length > 3 ? (pts.at(-1)!.db - pts.at(-4)!.db) / Math.log10(pts.at(-1)!.f / pts.at(-4)!.f) : null;
+  const res = useMemo(() => bodeResults(pts), [pts]);
 
   const set = (p: Partial<typeof b>) => patch('bode', p);
   const startOpts = [1, 10, 100, 1000].map((f) => ({ id: f, label: fmtHz(f, true) }));
@@ -41,13 +28,8 @@ export function Bode() {
   return (
     <div className="grid gap-4 xl:grid-cols-[1fr_320px]">
       <div className="min-w-0 space-y-4">
-        <ResponseChart pts={pts} progress={b.running ? b.progress : null} slow={b.at !== null && bodeSlow(b.at) ? b.at : null} />
-        <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-          <Stat label="−3 dB corner" value={f3 ? fmtHz(f3) : '—'} tone="text-ch1" />
-          <Stat label="Phase at corner" value={ph3 !== null ? `${ph3.toFixed(1)}°` : '—'} tone="text-ch2" />
-          <Stat label="Roll-off (last decade)" value={slope ? `${slope.toFixed(1)} dB/dec` : '—'} />
-          <Stat label="Points" value={`${pts.length} / ${plan.length}`} />
-        </div>
+        <ResponseChart pts={pts} res={res} progress={b.running ? b.progress : null} slow={b.at !== null && bodeSlow(b.at) ? b.at : null} />
+        <Results pts={pts} res={res} planned={plan.length} />
       </div>
 
       <aside className="space-y-4">
@@ -99,14 +81,34 @@ function RunButton({ running, stopping }: { running: boolean; stopping: boolean 
   );
 }
 
-type Point = { f: number; db: number; ph: number };
+type Point = BodePt;
+// A/B cursor lines as point indices (a line keeps its point as the sweep appends), clamped when read.
+type Cur = { a: number; b: number; drag: 'a' | 'b' | null };
+const at = (i: number, n: number) => Math.min(i, n - 1);
 
 // The gain/phase chart. uPlot's live legend sits in the panel header: the hovered point's values.
-function ResponseChart({ pts, progress, slow }: { pts: Point[]; progress: number | null; slow: number | null }) {
+// f0/f1/f2 tags and the A/B lines are painted by uPlot's draw hook; A/B are dragged on uPlot's overlay.
+function ResponseChart({ pts, res, progress, slow }: { pts: Point[]; res: BodeResults; progress: number | null; slow: number | null }) {
   const legend = useRef<HTMLDivElement>(null);
+  const cursors = useDev((s) => s.bodeCursors);
+  const setView = useDev((s) => s.set);
+  const plot = useRef<uPlot | null>(null);
+  const marks = useRef(res); // read by the draw hook, so new results need no plot rebuild
+  const cur = useRef<Cur>({ a: 0, b: Math.max(0, pts.length - 1), drag: null }); // A first, B last
+  const onMove = useRef(() => {}); // the readout re-renders on a drag (set by CursorReadout)
+  useEffect(() => { marks.current = res; plot.current?.redraw(false); }, [res]);
+  const toggle = (on: boolean) => {
+    cur.current = { a: 0, b: Math.max(0, pts.length - 1), drag: null };
+    setView({ bodeCursors: on });
+  };
   const opts = useMemo<Omit<uPlot.Options, 'width' | 'height'>>(() => ({
     legend: legendIn(legend),
-    cursor: { y: false },
+    cursor: { y: false, drag: { x: !cursors } }, // with cursors on, a drag moves a line instead of zooming
+    hooks: {
+      ready: [(u) => { plot.current = u; if (cursors) bindCursors(u, cur.current, () => onMove.current()); }],
+      draw: [(u) => drawMarks(u, marks.current, cursors ? cur.current : null)],
+      destroy: [() => { plot.current = null; }],
+    },
     scales: { x: { time: false, distr: 3, log: 10 }, db: { range: (_u, mn, mx) => spanAtLeast(mn, mx, 6) }, ph: { range: (_u, mn, mx) => spanAtLeast(mn, mx, 90) } },
     axes: [
       { ...AXIS, values: (_u, t) => t.map((v) => (v == null ? '' : fmtHz(v, true))) },
@@ -114,11 +116,18 @@ function ResponseChart({ pts, progress, slow }: { pts: Point[]; progress: number
       { ...AXIS, scale: 'ph', side: 1, size: 48, grid: { show: false }, values: (_u, t) => t.map((v) => (v == null ? '' : `${v}°`)) },
     ],
     series: SERIES,
-  }), []);
+  }), [cursors]);
   const data = useMemo<uPlot.AlignedData>(() => [pts.map((p) => p.f), pts.map((p) => p.db), pts.map((p) => p.ph)], [pts]);
+  const right = (
+    <div className="flex items-center gap-3">
+      <div ref={legend} className="head-legend font-mono text-xs" />
+      <Seg size="xs" value={cursors ? 'ON' : 'OFF'} options={[{ id: 'OFF', label: 'No cursors' }, { id: 'ON', label: 'Cursors A B' }]} onChange={(v) => toggle(v === 'ON')} />
+    </div>
+  );
   return (
-    <Panel title="Frequency response" right={<div ref={legend} className="head-legend font-mono text-xs" />}>
-      <Plot opts={opts} data={data} className="h-[clamp(300px,52vh,620px)]" />
+    <Panel title="Frequency response" right={right}>
+      <Plot opts={opts} data={data} className={clsx('h-[clamp(300px,52vh,620px)]', cursors && 'cursor-ew-resize')} />
+      {cursors && <CursorReadout pts={pts} cur={cur} onMove={onMove} />}
       {progress !== null && (
         <div className="mt-3 h-1 overflow-hidden rounded-full bg-surface">
           <div className="h-full bg-accent transition-all" style={{ width: `${progress * 100}%` }} />
@@ -146,6 +155,97 @@ function SlowPoint({ f }: { f: number }) {
     </p>
   );
 }
+
+// The meter's result set (labels as on its Results page), then roll-off and progress. '—': not crossed.
+function Results({ pts, res, planned }: { pts: Point[]; res: BodeResults; planned: number }) {
+  const notch = res.centre?.notch;
+  const atHz = (v: string, f: number) => `${v} @ ${fmtHz(f, true)}`;
+  const slope = pts.length > 3 ? (pts.at(-1)!.db - pts.at(-4)!.db) / Math.log10(pts.at(-1)!.f / pts.at(-4)!.f) : null;
+  return (
+    <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+      <Stat label={notch ? 'Notch (f0)' : 'Peak (f0)'} value={res.centre ? atHz(`${res.centre.db.toFixed(2)} dB`, res.centre.f) : '—'} tone="text-ch1" />
+      <Stat label={notch ? 'f1 (notch −3 dB)' : 'f1 (−3 dB below)'} value={hzOrDash(res.f1)} />
+      <Stat label={notch ? 'f2 (notch −3 dB)' : 'f2 (−3 dB above)'} value={hzOrDash(res.f2)} />
+      <Stat label={notch ? 'Notch width' : 'Bandwidth'} value={hzOrDash(res.bw)} />
+      <Stat label="Gain margin" value={res.gm ? atHz(`${res.gm.v.toFixed(1)} dB`, res.gm.f) : '—'} />
+      <Stat label="Phase margin" value={res.pm ? atHz(`${res.pm.v.toFixed(1)}°`, res.pm.f) : '—'} tone="text-ch2" />
+      <Stat label="Roll-off (last decade)" value={slope ? `${slope.toFixed(1)} dB/dec` : '—'} />
+      <Stat label="Points" value={`${pts.length} / ${planned}`} />
+    </div>
+  );
+}
+
+const TAG = '#8b949e', LINE = '#3b82f6'; // axis grey, accent
+
+// Vertical marks on the plot area: the analysis' f0/f1/f2 (dotted, top row) and the A/B lines (solid,
+// second row). Canvas pixels throughout (valToPos with `true`, bbox, pxRatio).
+function drawMarks(u: uPlot, res: BodeResults, cur: Cur | null) {
+  const f = u.data[0], n = f.length;
+  const marks = [{ f: res.centre?.f, label: 'f0', solid: false }, { f: res.f1, label: 'f1', solid: false }, { f: res.f2, label: 'f2', solid: false }];
+  if (cur && n) marks.push({ f: f[at(cur.a, n)], label: 'A', solid: true }, { f: f[at(cur.b, n)], label: 'B', solid: true });
+  const { ctx, bbox } = u, px = uPlot.pxRatio, right = bbox.left + bbox.width;
+  ctx.save();
+  ctx.font = `${10 * px}px "Geist Mono Variable", monospace`;
+  ctx.lineWidth = px;
+  for (const m of marks) {
+    if (m.f == null) continue;
+    const x = Math.round(u.valToPos(m.f, 'x', true)), w = ctx.measureText(m.label).width;
+    if (x < bbox.left || x > right) continue;
+    ctx.strokeStyle = ctx.fillStyle = m.solid ? LINE : TAG;
+    ctx.setLineDash(m.solid ? [] : [2 * px, 3 * px]);
+    ctx.beginPath();
+    ctx.moveTo(x, bbox.top);
+    ctx.lineTo(x, bbox.top + bbox.height);
+    ctx.stroke();
+    ctx.fillText(m.label, x + 3 * px + w > right ? x - 3 * px - w : x + 3 * px, bbox.top + (m.solid ? 24 : 12) * px);
+  }
+  ctx.restore();
+}
+
+// Press grabs the nearer line (CSS pixels on the overlay), drag moves it; uPlot's posToIdx snaps it to
+// the nearest measured point. Listeners go with the overlay when uPlot is destroyed.
+function bindCursors(u: uPlot, cur: Cur, moved: () => void) {
+  const el = u.over, n = () => u.data[0].length;
+  const xOf = (i: number) => u.valToPos(u.data[0][at(i, n())], 'x');
+  const move = (e: PointerEvent) => {
+    if (!cur.drag) return;
+    cur[cur.drag] = u.posToIdx(e.offsetX);
+    u.redraw(false);
+    moved();
+  };
+  const end = () => { cur.drag = null; };
+  el.style.touchAction = 'none';
+  el.addEventListener('pointerdown', (e) => {
+    if (!n()) return;
+    cur.drag = Math.abs(xOf(cur.a) - e.offsetX) <= Math.abs(xOf(cur.b) - e.offsetX) ? 'a' : 'b';
+    el.setPointerCapture(e.pointerId);
+    move(e);
+  });
+  el.addEventListener('pointermove', move);
+  el.addEventListener('pointerup', end);
+  el.addEventListener('pointercancel', end);
+}
+
+// A, B and B − A (the meter's BodeDelta: phase difference wrapped). Re-renders on a drag tick only.
+function CursorReadout({ pts, cur, onMove }: { pts: Point[]; cur: RefObject<Cur>; onMove: RefObject<() => void> }) {
+  const [, tick] = useReducer((n: number) => n + 1, 0);
+  useEffect(() => { onMove.current = tick; }, [onMove]);
+  if (!pts.length) return null;
+  const a = pts[at(cur.current.a, pts.length)], b = pts[at(cur.current.b, pts.length)];
+  const point = (p: Point) => `${fmtHz(p.f, true)} · ${p.db.toFixed(2)} dB · ${p.ph.toFixed(1)}°`;
+  const df = b.f - a.f;
+  return (
+    <div className="mt-2 flex flex-wrap gap-x-5 gap-y-1 font-mono text-xs tabular-nums">
+      <span><b className="text-accent">A</b> {point(a)}</span>
+      <span><b className="text-accent">B</b> {point(b)}</span>
+      <span><b className="text-muted">Δ B−A</b> {sign(df)}{fmtHz(Math.abs(df), true)} · {sign(b.db - a.db)}{Math.abs(b.db - a.db).toFixed(2)} dB · {signed(wrap180(b.ph - a.ph))}°</span>
+    </div>
+  );
+}
+
+const sign = (v: number) => (v < 0 ? '-' : '+');
+const signed = (v: number) => `${sign(v)}${Math.abs(v).toFixed(1)}`;
+const hzOrDash = (f: number | null) => (f === null ? '—' : fmtHz(f, true));
 
 // Series with their live-legend labels and values.
 const SERIES: uPlot.Series[] = [

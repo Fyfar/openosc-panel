@@ -2,7 +2,7 @@
 // scope measurements and generator command order. Run: `npm run check`.
 import assert from 'node:assert/strict';
 import { bodeEta, bodePlan, bodeSlow, decidesHigh, dmmScale, fmtStable, fwAtLeast, fwHas, genMaxHz, interleaveBlockers, parseHz, parseSI, scaleFor, startsFreqEntry, VDIV_MV, type TrigType } from '../src/device.ts';
-import { addStat, emptyStats, FFT_WINDOWS, fftNotes, fftSpanHz, bodeTone, findPeak, histogram, spanAtLeast, unwrapPhase, measure, peakIn, peakNear, spectrum, spectrumOf, stdDev, yFloor, windowExtent, heldIdx, type FftWindow, type Frame } from '../src/dsp.ts';
+import { addStat, bodeResults, emptyStats, FFT_WINDOWS, fftNotes, fftSpanHz, bodeTone, findPeak, histogram, spanAtLeast, unwrapPhase, measure, peakIn, peakNear, spectrum, spectrumOf, stdDev, yFloor, windowExtent, heldIdx, type FftWindow, type Frame } from '../src/dsp.ts';
 import { parseFrame, parseMeas, screenWindow, trigDiff } from '../src/io/scope.ts';
 import { pointCmds, rerange, scopeRestore, sweepScope } from '../src/io/bode.ts';
 import { dmmDiff } from '../src/io/dmm.ts';
@@ -171,6 +171,53 @@ const frame = (ch: 0 | 1, n: number, xinc: number, fn: (t: number) => number): F
   assert.ok(!bodeSlow(p10[11]) && !bodeSlow(p50[51]), `${p10[11]} and ${p50[51]} Hz are not slow`);
   assert.ok(bodeSlow(1), '1 Hz is slow');
   checks += 3;
+}
+
+// --- bodeResults: the meter's rules, on responses whose answers are known in closed form ----
+{
+  const wrap = (d: number) => d - 360 * Math.ceil((d - 180) / 360);
+  // Points as the sweep stores them: phase wrapped to (-180, 180].
+  const sweep = (fs: number[], db: (f: number) => number, ph: (f: number) => number) => fs.map((f) => ({ f, db: db(f), ph: wrap(ph(f)) }));
+  const deg = (r: number) => (r * 180) / Math.PI;
+  const p10 = bodePlan(10, 100_000, 10);
+  const lp = (fc: number, k = 0) => sweep(p10, (f) => k - 10 * Math.log10(1 + (f / fc) ** 2), (f) => -deg(Math.atan(f / fc)));
+  const off = (want: number) => (got: number | null) => Math.abs((got ?? NaN) / want - 1);
+
+  const rc = bodeResults(lp(1000));
+  assert.equal(rc.centre?.f, 10, 'low-pass: the peak is the first point');
+  assert.ok(off(1000)(rc.f2) < 0.02, `low-pass f2 ${rc.f2}`);
+  assert.ok(rc.f1 === null && rc.bw === null && rc.gm === null && rc.pm === null, 'low-pass: no f1, bandwidth or margins');
+
+  const gain = bodeResults(lp(1000, 20));
+  assert.ok(off(1000)(gain.f2) < 0.02, `+20 dB low-pass: f2 at +17 dB, got ${gain.f2}`);
+
+  const hp = bodeResults(sweep(p10, (f) => 10 * Math.log10((f / 1000) ** 2 / (1 + (f / 1000) ** 2)), (f) => 90 - deg(Math.atan(f / 1000))));
+  assert.ok(off(1000)(hp.f1) < 0.02 && hp.f2 === null && hp.bw === null, `high-pass f1 ${hp.f1}, f2 ${hp.f2}`);
+
+  // Second order, Q = 1 at 1 kHz: the band-pass's 3 dB points and the notch's are the same pair.
+  const x = (f: number) => f / 1000, edge = Math.sqrt(1.25);
+  const bp = bodeResults(sweep(p10, (f) => 6 - 10 * Math.log10(1 + ((1 - x(f) ** 2) / x(f)) ** 2), (f) => 90 - deg(Math.atan2(x(f), 1 - x(f) ** 2))));
+  assert.ok(off(1000 * (edge - 0.5))(bp.f1) < 0.03 && off(1000 * (edge + 0.5))(bp.f2) < 0.03, `band-pass f1 ${bp.f1}, f2 ${bp.f2}`);
+  assert.ok(bp.centre?.notch === false && off(1000)(bp.bw) < 0.03, `band-pass bandwidth ${bp.bw}`);
+
+  const nx = (f: number) => f / 1100; // off the plan's grid, so no point sits in the null
+  const notch = bodeResults(sweep(p10, (f) => 20 * Math.log10(Math.abs(1 - nx(f) ** 2) / Math.hypot(1 - nx(f) ** 2, nx(f))), () => 0));
+  assert.ok(notch.centre?.notch && off(1100 * (edge - 0.5))(notch.f1) < 0.03 && off(1100 * (edge + 0.5))(notch.f2) < 0.03, `notch ${JSON.stringify(notch)}`);
+
+  const dip = bodeResults([0, 0, -4, 0, 0].map((db, i) => ({ f: 10 ** (i + 1), db, ph: 0 })));
+  assert.ok(dip.centre && !dip.centre.notch && dip.centre.f === 10, 'a 4 dB dip in a passband is not a notch');
+
+  const above = lp(1000).filter((p) => p.f > 2000), part = bodeResults(above);
+  assert.ok(part.centre?.f === above[0].f && part.f1 === null, 'partial sweep above the corner: peak at its first point, no f1');
+
+  // 4 / (1 + j f/100)^3: phase −180° at √3·100 Hz with |H| = 0.5 (GM 6.02 dB); 0 dB at x = √(4^(2/3) − 1).
+  const p20 = bodePlan(10, 100_000, 20), xg = Math.sqrt(4 ** (2 / 3) - 1);
+  const ol = bodeResults(sweep(p20, (f) => 20 * Math.log10(4) - 30 * Math.log10(1 + (f / 100) ** 2), (f) => -3 * deg(Math.atan(f / 100))));
+  near(ol.gm!.v, 20 * Math.log10(2), 0.5, 'open loop gain margin');
+  assert.ok(off(100 * Math.sqrt(3))(ol.gm!.f) < 0.03, `gain margin at ${ol.gm!.f}`);
+  near(ol.pm!.v, 180 - 3 * deg(Math.atan(xg)), 1, 'open loop phase margin');
+  assert.ok(off(100 * xg)(ol.pm!.f) < 0.03, `phase margin at ${ol.pm!.f}`);
+  checks += 11;
 }
 
 // --- bodeTone: −6 dB / −45° with DC, non-whole periods, generator 0.1 % off the request ----
