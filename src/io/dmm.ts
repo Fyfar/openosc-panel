@@ -37,6 +37,8 @@ let lastFunc = '';
 let lastSeq = NaN;
 // The recording: chart, statistics and CSV all read it. The store only sees `recRev` move.
 export const dmmRec = new Recording();
+// Spread into the `set()` of every change to `dmmRec`, or the chart keeps drawing the old one.
+export const recChanged = () => ({ recRev: get().recRev + 1 });
 const UNIT_Q = 'SYST:DMM:TEMP:UNIT?';
 
 export async function flushDmm(a: Dmm, b: Dmm) {
@@ -161,7 +163,7 @@ export const logMatches = (r: State['recorded'], func: DmmFunc, fahrenheit: bool
 
 // A recording holds one function and unit: a reading of any other ends it. `v` null = OL or blank.
 function record(func: DmmFunc, v: number | null, range: number) {
-  const { recorded, fahrenheit, ranges, dmm, recRev, dstats } = get();
+  const { recorded, fahrenheit, ranges, dmm, dstats } = get();
   if (!logMatches(recorded, func, fahrenheit)) return stopDmmLog();
   // This reading's own range (the store's is from the previous poll): one stale coarse LSD would
   // coarsen the histogram for the whole recording.
@@ -171,25 +173,20 @@ function record(func: DmmFunc, v: number | null, range: number) {
     return breakLine();
   }
   dmmRec.push(Date.now() / 1000, v);
-  set({
-    recorded: { func, fahrenheit, rangeMax },
-    recRev: recRev + 1,
-    dstats: addStat(dstats, v, dmmScale(func, rangeMax).lsd),
-    logged: dmmRec.valid,
-  });
-  if (dmmRec.valid >= REC_MAX) stopDmmLog();
+  set({ ...recChanged(), recorded: { func, fahrenheit, rangeMax }, dstats: addStat(dstats, v, dmmScale(func, rangeMax).lsd) });
+  if (atLimit(get())) stopDmmLog();
 }
 
 // One gap per run of OL, blank or paused (the chart draws the held step to it).
 function breakLine() {
-  if (dmmRec.gap(Date.now() / 1000)) set({ recRev: get().recRev + 1 });
+  if (dmmRec.gap(Date.now() / 1000)) set(recChanged());
 }
 
 function clearReading() {
   set({ reading: null, junctionNeeded: false });
 }
 
-export const atLimit = (s: State) => s.logged >= REC_MAX;
+export const atLimit = (s: State) => s.dstats.n >= REC_MAX;
 
 let persistAsked = false;
 
@@ -198,7 +195,7 @@ export function startDmmLog() {
   if (atLimit(get()) || get().savedOffer) return;
   // Asked on a click: Firefox shows a prompt for it. A refusal changes nothing else.
   if (!persistAsked) { persistAsked = true; navigator.storage?.persist?.().catch(() => {}); }
-  set({ logging: true, ...(get().logged ? {} : { recorded: null }) });
+  set({ logging: true, ...(get().dstats.n ? {} : { recorded: null }) });
 }
 
 export function stopDmmLog() {
@@ -209,14 +206,14 @@ export function stopDmmLog() {
 
 export async function clearDmmData() {
   dmmRec.clear();
-  set({ logged: 0, recorded: null, recRev: get().recRev + 1, dstats: emptyStats() });
+  set({ ...recChanged(), recorded: null, dstats: emptyStats() });
   await ctl(['SYST:DMM:STAT:RES']);
 }
 
 // A recording holds one function and unit (`record`), so every row carries the same two.
 export function dmmCsvParts(): string[] {
   const r = get().recorded;
-  if (!r) return dmmRec.csvParts('', '');
+  if (!r) return []; // nothing recorded (the CSV button is disabled then)
   return dmmRec.csvParts(DMM_FUNCS.find((x) => x.id === r.func)!.label, dmmBase(r.func, r.fahrenheit));
 }
 

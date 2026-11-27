@@ -7,7 +7,7 @@ import { heldIdx, histogram, stdDev, windowExtent, yFloor } from '../dsp';
 import * as io from '../io';
 import { AXIS, legendIn, legendValue, Plot } from '../Plot';
 import { decimate, REC_MAX, type Trace } from '../recording';
-import { useDev } from '../store';
+import { useDev, type SaveOff } from '../store';
 import { Btn, Panel, Seg, Stat, Toggle } from '../ui';
 
 // In the meter's key order: F1 V, F2 Ω → •)) → →| → ⊣⊢, F3 A, F4 mV → Type K (mA with the probe in
@@ -256,10 +256,10 @@ const gapTicks = (gaps: RefObject<number[]>) => (u: uPlot) => {
 // it ends at the last point.
 function useTimeWindow(win: number) {
   const logging = useDev((s) => s.logging);
-  useDev((s) => s.recRev);
+  useDev((s) => s.recRev); // re-read io.dmmRec when the recording changes
   const now = useNow(1000);
-  const r = io.dmmRec, last = r.length ? r.t(r.length - 1) : undefined;
-  const end = !logging && last !== undefined ? last : Math.max(now, last ?? 0), t0 = r.length ? r.t(0) : end;
+  const { first, last } = io.dmmRec;
+  const end = !logging && last !== undefined ? last : Math.max(now, last ?? 0), t0 = first ?? end;
   const x0 = win ? Math.max(t0, end - win) : t0, x1 = win ? x0 + win : Math.max(end, t0 + 10);
   return { end, x0, x1 };
 }
@@ -441,7 +441,7 @@ function RangePanel() {
 }
 
 function LogPanel() {
-  const logged = useDev((s) => s.logged);
+  const logged = useDev((s) => s.dstats.n);
   const logging = useDev((s) => s.logging);
   const link = useDev((s) => s.link);
   const recorded = useDev((s) => s.recorded);
@@ -475,7 +475,7 @@ function LogPanel() {
   );
 }
 
-const NOT_SAVED = { unavailable: 'storage unavailable', full: 'storage full', 'other-tab': 'another tab holds the saved recording', failed: 'storage error' };
+const NOT_SAVED: Record<SaveOff, string> = { unavailable: 'storage unavailable', full: 'storage full', 'other-tab': 'another tab holds the saved recording', failed: 'storage error' };
 
 // Whether the recording would survive a reload.
 function SaveStatus() {

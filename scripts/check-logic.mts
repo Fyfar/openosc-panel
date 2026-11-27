@@ -449,7 +449,7 @@ const s0 = useDev.getInitialState();
 for (const [s, want, what] of [
   [s0, false, 'fresh state'],
   [{ ...s0, logging: true }, false, 'logging armed, no rows yet'],
-  [{ ...s0, logged: 1 }, true, 'DMM log rows'],
+  [{ ...s0, dstats: { ...s0.dstats, n: 1 } }, true, 'DMM recorded readings'],
   [{ ...s0, bode: { ...s0.bode, running: true } }, true, 'Bode sweep running'],
   [{ ...s0, bode: { ...s0.bode, points: [{ f: 1, db: 0, ph: 0 }] } }, true, 'Bode result'],
 ] as const) {
@@ -464,7 +464,7 @@ for (const [s, want, what] of [
   assert.equal(r.gap(2500), true, 'a gap after a value');
   assert.equal(r.gap(2501), false, 'never two gaps in a row');
   r.push(2400, 5); // the clock stepped back
-  assert.deepEqual([r.length, r.valid, r.chunkCount], [1502, 1501, 2], 'across a chunk boundary');
+  assert.deepEqual([r.length, r.valid, r.chunks.length], [1502, 1501, 2], 'across a chunk boundary');
   assert.ok(Number.isNaN(r.v(1500)) && r.t(1500) === 2500 && r.v(1499) === 1499 % 7, 'the gap is one entry, no repeated value');
   assert.equal(r.t(1501), 2500, 'a timestamp never goes back');
   const g = r.gen;
@@ -474,7 +474,7 @@ for (const [s, want, what] of [
   assert.ok(Number.isNaN(copy.v(1500)) && copy.gen !== 0, 'load keeps gaps and moves gen');
   assert.equal(r.chunk(1).t.length, 1502 - 1024, 'the tail is saved at its length');
   r.clear();
-  assert.deepEqual([r.length, r.valid, r.chunkCount, r.gen !== g], [0, 0, 0, true], 'clear empties and moves gen');
+  assert.deepEqual([r.length, r.valid, r.chunks.length, r.gen !== g], [0, 0, 0, true], 'clear empties and moves gen');
   assert.equal(REC_MAX, 1_800_000);
   checks += 9;
 }

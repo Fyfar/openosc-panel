@@ -29,7 +29,8 @@ export class Recording {
 
   t(i: number) { return this.chunks[i >> SHIFT].t[i & (CHUNK - 1)]; }
   v(i: number) { return this.chunks[i >> SHIFT].v[i & (CHUNK - 1)]; }
-  get chunkCount() { return this.chunks.length; }
+  get first(): number | undefined { return this.length ? this.t(0) : undefined; }
+  get last(): number | undefined { return this.length ? this.t(this.length - 1) : undefined; }
 
   // Ties keep the earlier minimum and the later maximum, as `decimate` scans.
   push(time: number, v: number) {
@@ -74,12 +75,13 @@ export class Recording {
   // The CSV in one string per chunk: a 1.8 M-row log never becomes one string.
   csvParts(label: string, unit: string) {
     const parts = ['time,function,value,unit\n'];
-    for (let k = 0; k < this.chunks.length; k++) {
-      const { t, v } = this.chunk(k);
+    this.chunks.forEach(({ t, v }, k) => {
       let s = '';
-      for (let j = 0; j < t.length; j++) if (!Number.isNaN(v[j])) s += `${new Date(t[j] * 1000).toISOString()},${label},${v[j]},${unit}\n`;
+      for (let j = 0; j < Math.min(CHUNK, this.length - k * CHUNK); j++) {
+        if (!Number.isNaN(v[j])) s += `${new Date(t[j] * 1000).toISOString()},${label},${v[j]},${unit}\n`;
+      }
       parts.push(s);
-    }
+    });
     return parts;
   }
 }
@@ -121,7 +123,6 @@ class Column {
     const pts: Point[] = [];
     this.values((t, v) => pts.push([t, v]));
     for (const g of this.g2 === this.g1 ? [this.g1] : [this.g1, this.g2]) {
-      if (g < 0) continue;
       if (g > 0 && !Number.isNaN(r.v(g - 1))) pts.push([r.t(g), r.v(g - 1)]);
       pts.push([r.t(g), null]);
     }
@@ -131,9 +132,8 @@ class Column {
 
 // What the trend draws for [x0, x1] in `cols` columns, plus the reading held into it from before x0:
 // every reading in a sparse column, the real min and max of a full one (a transient is never smoothed
-// away). A block wholly inside one column is read from its summary: ~3 ms for 1.8 M readings, 4x
-// faster than reading them all. The ~77 k readings at column edges are still scanned; a summary tree
-// would cut that, not worth it at 3 calls/s.
+// away). A block wholly inside one column is read from its summary; the readings at column edges are
+// still scanned (a summary tree would remove that, not needed at a few calls per second).
 export function decimate(r: Recording, x0: number, x1: number, cols = 1200): Trace {
   const out: Trace = { t: [], v: [], gaps: [] }, end = find(r, x1);
   const w = x1 > x0 ? (x1 - x0) / cols : 1;
@@ -158,7 +158,7 @@ export function decimate(r: Recording, x0: number, x1: number, cols = 1200): Tra
 }
 
 type Mark = { gen: number; length: number };
-export type FlushPlan = { clear: boolean; from: number | null }; // from: first chunk to write, null = none
+type FlushPlan = { clear: boolean; from: number | null }; // from: first chunk to write, null = none
 
 // What one flush writes, given what storage holds (`saved`, length 0 = nothing) and the recording now.
 export function flushPlan(saved: Mark, rec: Mark & { valid: number }): FlushPlan | null {
