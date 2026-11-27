@@ -21,30 +21,41 @@ install, no backend. Your data never leaves your machine.
 
 ## Features
 
-- **The scope on your monitor.** Both channels live, edge trigger, Run/Stop/Single, Auto
-  setup, Roll, time and level cursors. The same measurements as the device's own readouts
-  (frequency, Vpp, amplitude, RMS, duty and more), plus the hardware frequency counter on
-  each channel. Export the full capture record as CSV.
-- **An FFT you can measure on.** Peak frequency and level, two markers for differences, four
-  windows, and plain notes on the panel when a spectrum can't be trusted.
-- **Bode plots in one click.** The panel sweeps the generator, re-ranges each channel as the
-  gain changes, reads off the −3 dB corner and roll-off, then puts your settings back.
-- **A generator you can type into.** `10k`, `2.5 MHz`, `500 mHz`. Six shapes, duty cycle,
-  levels or amplitude, and it keeps running while you work in another view.
-- **A week of multimeter logging that survives a crash.** Press *Start logging* and the
-  chart, statistics and CSV fill from the same readings: up to 1.8 million of them, about 7 days
-  of continuous logging, with the whole run on the chart and every spike and overload still
-  visible. The recording is saved in the browser as it grows, so a page reload, a tab or browser
-  crash, a pulled USB cable or a computer that loses power costs at most the last 5 seconds.
-  Open the panel again and it offers to restore the recording, then logging carries on from
-  there.
-- **One tab per instrument.** The device needs a different USB profile for scope and
-  multimeter; the panel switches it for you in about a second.
-- **Full control when you need it:** a SCPI console, device screenshots and a remote lock for
-  the device's keys.
-- **Install it as an app** from the browser's address bar if you like. Nothing to download:
-  no `.exe`, `.dmg` or installer file. The browser adds it in one click, it opens in its own
-  window and works offline once you've opened it online.
+### Multimeter
+
+- **Up to a week of continuous logging**, 1.8 million readings, with the whole run on the chart
+  and every spike and overload still visible.
+- **Your measurements are safe.** After a page reload, a tab or browser crash or a power cut, the
+  panel offers to restore the recording and you carry on logging.
+- Trend chart, histogram and statistics describe exactly the readings you logged; one click
+  exports them as CSV.
+
+### Oscilloscope
+
+- The device's own measurements (frequency, Vpp, RMS, duty and more) and the hardware frequency
+  counter on each channel.
+- **An FFT you can measure on:** peak frequency and level, two markers for differences, and plain
+  notes on the panel when a spectrum can't be trusted.
+- Export the full capture record as CSV, not just what's on screen.
+
+### Bode plot
+
+- **One click sweeps the generator** and re-ranges each channel as the gain changes, then reads off
+  the −3 dB corner and roll-off.
+- Puts your scope and generator settings back when it's done.
+
+### Generator
+
+- Type frequencies the way you say them: `10k`, `2.5 MHz`, `500 mHz`.
+- Keeps running while you work in another view.
+
+### Everywhere
+
+- The panel switches the device between its scope and multimeter USB modes for you, in about a
+  second.
+- SCPI console, device screenshots and a remote lock for the device's keys.
+- Install it as an app from the browser's address bar: no installer, and it works offline once
+  you've opened it online.
 
 ## What you need
 
@@ -77,13 +88,8 @@ The stock firmware has no remote control, so the panel can't connect to it. Two 
 
 - Scope and multimeter can't run at the same time: they are separate USB profiles on the
   device. The generator keeps running across the switch.
-- The multimeter recording stays in this browser until you press **Clear data**. It is
-  saved every 5 seconds, so a crash or power cut loses at most the last 5 seconds, and nothing
-  is recorded while the computer is off or the panel is closed: a restored recording shows that
-  time as a gap. It lives in this browser profile only (not in a private window; clearing the
-  site's data deletes it), so export the CSV for anything you need to keep.
-- At 1.8 million readings logging stops. Export the CSV, then press **Clear data** to start a
-  new recording.
+- The multimeter recording is kept until you press **Clear data**. At 1.8 million readings
+  logging stops: export the CSV, then clear to start a new one.
 - Settings, scope captures and Bode results are not saved between visits.
 - Each online launch loads the latest version. If a new one comes out while the panel is open,
   it asks first (**Update** / **Later**) and never reloads on its own, so an unsaved log is safe.
